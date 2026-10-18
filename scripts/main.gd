@@ -38,7 +38,9 @@ const LIVES_MAX := 10
 const RESUME_BACKOFF := 0.10    # al continuar, la canción retoma este tiempo antes de la tecla
 const GRACE_AFTER_CONTINUE := 1.0
 const HIT_LATE := 0.28      # segundos de margen para tocar una tecla tarde
-const NAV_H := 150.0        # alto de la barra inferior
+const NAV_H := 170.0        # alto de la barra inferior (en el centro, donde está más alta)
+const NAV_BULGE := 34.0     # cuánto más baja es la barra en los bordes: forma de "panza"
+const PROGRESS_FILE := "progreso.cfg"   # récords, listas y favoritas, dentro de la carpeta de canciones
 const TAB_HOME := 0
 const TAB_MUSIC := 1
 const TAB_FILES := 2
@@ -127,6 +129,9 @@ var scroll_vel := 0.0        # inercia del desplazamiento (px/s)
 var drag_ms := 0
 var home_records: Array = []
 var home_dirty := true
+var home_tex: Texture2D = null   # imagen de la última canción jugada (cabecera de Inicio)
+var home_tex_path := ""
+var progress_merged := false   # ya se leyó progreso.cfg en esta sesión (evita pisarlo con datos vacíos)
 var favorites: Dictionary = {}   # id de canción -> true
 var thumb_cache: Dictionary = {} # ruta de imagen -> Texture2D (o null si no se pudo leer)
 var thumb_budget := 1            # miniaturas que se pueden decodificar por fotograma
@@ -208,6 +213,8 @@ func _ready() -> void:
 	_setup_search()
 	_setup_name_edit()
 	_load_settings()
+	if _merge_progress_file():
+		_save_settings()
 	_refresh_library()
 	_resize()
 
@@ -1019,7 +1026,11 @@ func _set_library_dir(path: String) -> void:
 		_show_status("Android no deja usar esa carpeta. Se usa la de por defecto: %s" % library_dir, true, 8.0)
 		return
 	library_dir = path
+	progress_merged = false
+	_merge_progress_file()
+	progress_merged = true
 	_save_settings()
+	_apply_filter()
 	_show_status("Carpeta de canciones: %s" % path, false)
 
 func _osz_files(dir: String) -> Array:
@@ -1049,11 +1060,88 @@ func _backup_copy(src: String, backup_dir: String, id: String, name: String) -> 
 		out.close()
 	return FileAccess.file_exists(target)
 
+func _progress_path() -> String:
+	return library_dir.path_join(PROGRESS_FILE) if library_dir != "" else ""
+
+## Copia de los récords, listas y favoritas en la carpeta de canciones (junto a
+## "Por importar" e "Importadas"), para recuperarlos al reinstalar la app.
+func _save_progress_file() -> void:
+	var path := _progress_path()
+	if path == "" or not DirAccess.dir_exists_absolute(library_dir):
+		return
+	if not progress_merged:
+		progress_merged = true
+		_merge_progress_file()   # antes de escribir, une lo que ya había en el archivo
+	var cfg := ConfigFile.new()
+	for key in bests:
+		cfg.set_value("best", key, bests[key])
+	cfg.set_value("library", "playlists", playlists)
+	cfg.set_value("library", "favorites", favorites.keys())
+	cfg.set_value("library", "last_id", String(last_played.get("id", "")))
+	cfg.set_value("library", "last_version", String(last_played.get("version", "")))
+	cfg.save(path)
+
+## Une lo que haya en progreso.cfg con lo actual (nunca baja un récord). true si cambió algo.
+func _merge_progress_file() -> bool:
+	var path := _progress_path()
+	if path == "" or not FileAccess.file_exists(path):
+		return false
+	var cfg := ConfigFile.new()
+	if cfg.load(path) != OK:
+		return false
+	var changed := false
+	if cfg.has_section("best"):
+		for key in cfg.get_section_keys("best"):
+			var v = cfg.get_value("best", key)
+			if not (v is Dictionary):
+				continue
+			if not bests.has(key):
+				bests[key] = v
+				changed = true
+				continue
+			var cur: Dictionary = bests[key]
+			var merged: Dictionary = cur.duplicate()
+			if String(key).ends_with("|inf"):
+				for f in ["stars", "crowns", "laps", "score"]:
+					merged[f] = maxi(int(cur.get(f, 0)), int(v.get(f, 0)))
+			else:
+				merged = (v if int(v.get("score", 0)) > int(cur.get("score", 0)) else cur).duplicate()
+				merged["rank"] = maxi(int(cur.get("rank", 0)), int(v.get("rank", 0)))
+			if JSON.stringify(merged, "", true) != JSON.stringify(cur, "", true):
+				bests[key] = merged
+				changed = true
+	var pl = cfg.get_value("library", "playlists", [])
+	if pl is Array:
+		for p in pl:
+			if not (p is Dictionary and p.has("name") and p.get("refs") is Array):
+				continue
+			var found := -1
+			for i in playlists.size():
+				if String(playlists[i].name) == String(p.name):
+					found = i
+			if found < 0:
+				playlists.append({"name": String(p.name), "refs": (p.refs as Array).duplicate()})
+				changed = true
+			else:
+				for r in p.refs:
+					if not playlists[found].refs.has(r):
+						playlists[found].refs.append(r)
+						changed = true
+	var fav_list = cfg.get_value("library", "favorites", [])
+	if fav_list is Array:
+		for fid in fav_list:
+			if not favorites.has(String(fid)):
+				favorites[String(fid)] = true
+				changed = true
+	if String(last_played.get("id", "")) == "" and String(cfg.get_value("library", "last_id", "")) != "":
+		last_played = {"id": String(cfg.get_value("library", "last_id", "")), "version": String(cfg.get_value("library", "last_version", ""))}
+		changed = true
+	return changed
+
 ## Comprueba el permiso de archivos y crea las carpetas de trabajo. false si no hay acceso.
 func _library_access_ok() -> bool:
 	if library_dir == "":
 		library_dir = _default_library_dir()
-		_save_settings()
 	# En Android 11+ la app puede crear la carpeta sin permiso, pero sin "acceso a todos
 	# los archivos" no ve los .osz que no creó ella (los tuyos ni los de una instalación previa).
 	if OS.has_feature("android") and not perm_asked:
@@ -1110,6 +1198,7 @@ func _export_library() -> void:
 	if not _library_access_ok():
 		syncing = false
 		return
+	_save_settings()   # guarda la carpeta (une antes progreso.cfg si ya existía)
 	var backup := library_dir.path_join(BACKUP_NAME)
 	var have := "\n".join(_osz_files(backup))
 	var todo: Array = []
@@ -1147,6 +1236,10 @@ func _sync_folder() -> void:
 		return
 	var inbox := library_dir.path_join(INBOX_NAME)
 	var backup := library_dir.path_join(BACKUP_NAME)
+	progress_merged = true
+	if _merge_progress_file():   # tras reinstalar: recupera récords, listas y favoritas
+		_apply_filter()
+	_save_settings()
 	var backup_files := _osz_files(backup)
 	var inbox_files := _osz_files(inbox)
 	var total := backup_files.size() + inbox_files.size()
@@ -1233,38 +1326,60 @@ func _go_tab(i: int) -> void:
 	home_dirty = true
 
 func _draw_nav_icon(i: int, c: Vector2, s: float, col: Color) -> void:
+	var lw := s * 0.28
 	match i:
 		0:
 			draw_colored_polygon(PackedVector2Array([c + Vector2(-s, -s * 0.05), c + Vector2(0, -s), c + Vector2(s, -s * 0.05)]), col)
 			draw_rect(Rect2(c.x - s * 0.7, c.y - s * 0.05, s * 1.4, s * 0.95), col)
 		1:
 			draw_circle(c + Vector2(-s * 0.4, s * 0.55), s * 0.42, col)
-			draw_line(c + Vector2(s * 0.0, s * 0.55), c + Vector2(s * 0.0, -s * 0.85), col, 7.0)
-			draw_line(c + Vector2(0, -s * 0.85), c + Vector2(s * 0.75, -s * 0.4), col, 7.0)
+			draw_line(c + Vector2(s * 0.0, s * 0.55), c + Vector2(s * 0.0, -s * 0.85), col, lw)
+			draw_line(c + Vector2(0, -s * 0.85), c + Vector2(s * 0.75, -s * 0.4), col, lw)
 		2:
 			draw_rect(Rect2(c.x - s, c.y - s * 0.4, s * 2.0, s * 1.25), col)
 			draw_rect(Rect2(c.x - s, c.y - s * 0.75, s * 0.9, s * 0.4), col)
 		_:
-			draw_arc(c, s * 0.62, 0.0, TAU, 32, col, 8.0)
+			draw_arc(c, s * 0.62, 0.0, TAU, 32, col, lw)
 			for k in 8:
 				var a := k * TAU / 8.0
-				draw_line(c + Vector2(cos(a), sin(a)) * s * 0.8, c + Vector2(cos(a), sin(a)) * s * 1.05, col, 9.0)
+				draw_line(c + Vector2(cos(a), sin(a)) * s * 0.8, c + Vector2(cos(a), sin(a)) * s * 1.05, col, lw * 1.1)
+
+## Altura del borde superior de la barra en la posición x: más alta en el centro.
+func _nav_curve_y(x: float) -> float:
+	var t := (x - viewport_size.x / 2.0) / (viewport_size.x / 2.0)
+	return viewport_size.y - NAV_H + NAV_BULGE * t * t
 
 func _draw_nav() -> void:
 	draw_set_transform(Vector2.ZERO)
-	var y0 := viewport_size.y - NAV_H
-	draw_rect(Rect2(0, y0, viewport_size.x, NAV_H), Color(0.05, 0.09, 0.17))
-	draw_rect(Rect2(0, y0, viewport_size.x, 3), Color(0.14, 0.22, 0.34))
+	var w := viewport_size.x
+	var top := PackedVector2Array()
+	var steps := 36
+	for k in steps + 1:
+		var px := w * k / steps
+		top.append(Vector2(px, _nav_curve_y(px)))
+	var body := top.duplicate()
+	body.append(Vector2(w, viewport_size.y + 2.0))
+	body.append(Vector2(0, viewport_size.y + 2.0))
+	draw_colored_polygon(body, Color(0.05, 0.09, 0.17))
+	draw_polyline(top, Color(0.2, 0.3, 0.45), 4.0)
 	var labels := ["Inicio", "Música", "Archivos", "Ajustes"]
+	var colors := [Color(0.22, 0.5, 0.95), Color(0.95, 0.36, 0.58), Color(0.97, 0.6, 0.2), Color(0.2, 0.75, 0.45)]
 	var active := _nav_active()
 	for i in 4:
 		var r := _nav_rect(i)
+		var cx := r.get_center().x
+		var ytop := _nav_curve_y(cx)
 		var on := i == active
+		var rad := 44.0 if on else 38.0
+		var cc := Vector2(cx, ytop + 58.0 - (8.0 if on else 0.0))
+		var base: Color = colors[i]
+		draw_circle(cc + Vector2(0, 5), rad, Color(0, 0, 0, 0.25))
+		draw_circle(cc, rad, base)
+		draw_arc(cc, rad - 5.0, PI * 1.12, PI * 1.88, 16, Color(1, 1, 1, 0.35), 5.0)
 		if on:
-			_panel(Rect2(r.position.x + 14, r.position.y + 14, r.size.x - 28, r.size.y - 28), Color(0.04, 0.65, 0.88), 28)
-		var col := Color.WHITE if on else Color(0.62, 0.75, 0.88)
-		_draw_nav_icon(i, Vector2(r.get_center().x, y0 + 55), 26.0, col)
-		_text_centered(labels[i], r.get_center().x, y0 + 118, 28, col)
+			draw_arc(cc, rad + 3.0, 0.0, TAU, 40, Color.WHITE, 5.0)
+		_draw_nav_icon(i, cc, 18.0 if on else 16.0, base.lerp(Color.WHITE, 0.85))
+		_text_centered(labels[i], cx, ytop + 58.0 + 38.0 + 30.0, 28, Color.WHITE if on else Color(0.72, 0.8, 0.9))
 
 # --- Listas de reproducción -------------------------------------------------
 
@@ -1627,21 +1742,25 @@ func _rebuild_home() -> void:
 		home_records.append({"entry": e, "level": clampi(lvl, 0, DIFFICULTY_LEVELS.size() - 1), "inf": inf, "b": b})
 	home_records.sort_custom(func(a, b): return int(a.b.get("score", 0)) > int(b.b.get("score", 0)))
 
+const HOME_ROWS_Y := 975.0
+const HOME_ROW_H := 120.0
+const HOME_ROW_STEP := 134.0
+
 func _home_row_count() -> int:
-	var avail := viewport_size.y - NAV_H - top_inset - 570.0
-	return clampi(int(avail / 148.0), 1, 8)
+	var avail := viewport_size.y - NAV_H - top_inset - HOME_ROWS_Y - 10.0
+	return clampi(int(avail / HOME_ROW_STEP), 1, 8)
 
 func _home_tap(pos: Vector2) -> void:
 	pos.y -= top_inset
 	var x := 55.0
 	var cw := viewport_size.x - 110.0
 	var le := _find_entry(String(last_played.get("id", "")), String(last_played.get("version", "")))
-	if not le.is_empty() and Rect2(x, 240, cw, CARD_H).has_point(pos):
+	if not le.is_empty() and (Rect2(0, -top_inset, viewport_size.x, 620.0 + top_inset).has_point(pos) or Rect2(viewport_size.x / 2.0 - 220.0, 770, 440, 100).has_point(pos)):
 		_select_song(le)
 		return
 	var n := mini(_home_row_count(), home_records.size())
 	for i in n:
-		if Rect2(x, 570 + i * 148.0, cw, 132).has_point(pos):
+		if Rect2(x, HOME_ROWS_Y + i * HOME_ROW_STEP, cw, HOME_ROW_H).has_point(pos):
 			var rec: Dictionary = home_records[i]
 			diff_level = int(rec.level)
 			if rec.inf:
@@ -1658,45 +1777,78 @@ func _draw_home() -> void:
 	var cw := w - 110.0
 	var muted := Color(0.62, 0.75, 0.88)
 	var ink := Color(0.12, 0.22, 0.31)
-	draw_set_transform(Vector2(0, top_inset))
-	_text("TILES FOSS", Vector2(55, 105), 58, Color.WHITE)
-	_text("Última canción jugada", Vector2(55, 215), 32, muted)
+	var navy := Color(0.025, 0.05, 0.1)
 	var le := _find_entry(String(last_played.get("id", "")), String(last_played.get("version", "")))
+	var hero_h := 620.0 + top_inset
+	# Imagen de la última canción (horizontal) ocupando la parte de arriba.
 	if le.is_empty():
-		_text("Aún no has jugado ninguna canción.", Vector2(55, 300), 28, muted)
+		draw_rect(Rect2(0, 0, w, hero_h), Color(0.08, 0.16, 0.3))
 	else:
-		var lg := {"id": le.get("set_id", "demo"), "title": le.title, "artist": le.artist, "creator": "", "entries": [le]}
-		_draw_card(lg, x, 240, cw, "plain")
-	_text("Tus mejores récords", Vector2(55, 520), 32, muted)
+		var path := String(le.get("bg_path", ""))
+		if path != home_tex_path:
+			home_tex_path = path
+			home_tex = OsuImporter.load_image(path, 1280) if path != "" else null
+		if home_tex != null:
+			_draw_cover(home_tex, Rect2(0, 0, w, hero_h))
+		else:
+			draw_rect(Rect2(0, 0, w, hero_h), _badge_color(le).darkened(0.3))
+	# Degradados: arriba para leer el título y abajo para fundir con el fondo.
+	var bands := 20
+	for k in bands:
+		var f := float(k) / bands
+		draw_rect(Rect2(0, k * 9.0, w, 10.0), Color(navy.r, navy.g, navy.b, 0.55 * (1.0 - f)))
+	var fade := 240.0
+	for k in bands:
+		var f2 := float(k + 1) / bands
+		draw_rect(Rect2(0, hero_h - fade + k * fade / bands, w, fade / bands + 1.0), Color(navy.r, navy.g, navy.b, 0.98 * pow(f2, 1.7)))
+	var title_pos := Vector2(55, 105 + top_inset)
+	draw_string_outline(_font(), title_pos, "TILES FOSS", HORIZONTAL_ALIGNMENT_LEFT, -1, 58, 10, Color(0.02, 0.05, 0.12, 0.9))
+	draw_string(_font(), title_pos, "TILES FOSS", HORIZONTAL_ALIGNMENT_LEFT, -1, 58, Color.WHITE)
+	draw_set_transform(Vector2(0, top_inset))
+	if le.is_empty():
+		_text_centered("Aún no has jugado ninguna canción", w / 2, 690, 40, Color.WHITE)
+		_text_centered("Elígela en la pestaña Música.", w / 2, 740, 28, muted)
+	else:
+		_text_centered(_fit(String(le.title), w - 100, 52), w / 2, 690, 52, Color.WHITE)
+		_text_centered(_fit("%s · %s" % [le.artist, le.version], w - 100, 28), w / 2, 738, 28, muted)
+		var box := _box(Color(1, 1, 1, 0.10), 50)
+		box.border_width_left = 4
+		box.border_width_right = 4
+		box.border_width_top = 4
+		box.border_width_bottom = 4
+		box.border_color = Color(1, 1, 1, 0.6)
+		draw_style_box(box, Rect2(w / 2.0 - 220.0, 770, 440, 100))
+		_text_centered("Jugar", w / 2, 840, 54, Color.WHITE)
+	_text("Tus mejores récords", Vector2(55, 945), 32, muted)
 	if home_records.is_empty():
-		_text("Juega en modo Vidas o Infinito para guardar récords.", Vector2(55, 600), 28, muted)
+		_text(_fit("Juega en modo Vidas o Infinito para guardar récords.", cw, 28), Vector2(55, HOME_ROWS_Y + 55), 28, muted)
 	var n := mini(_home_row_count(), home_records.size())
 	for i in n:
 		var rec: Dictionary = home_records[i]
 		var e: Dictionary = rec.entry
 		var b: Dictionary = rec.b
-		var y := 570.0 + i * 148.0
-		_panel(Rect2(x, y, cw, 132), Color(0.97, 0.98, 1), 24)
+		var y := HOME_ROWS_Y + i * HOME_ROW_STEP
+		_panel(Rect2(x, y, cw, HOME_ROW_H), Color(0.97, 0.98, 1), 24)
 		if rec.inf:
-			_panel(Rect2(x, y, 120, 132), Color(0.5, 0.38, 0.92), 24)
+			_panel(Rect2(x, y, 110, HOME_ROW_H), Color(0.5, 0.38, 0.92), 24)
 			var n_cr := int(b.get("crowns", 0))
 			var n_st := int(b.get("stars", 0))
 			var kind := "crown" if n_cr > 0 else "star"
 			var cnt := mini(n_cr if n_cr > 0 else n_st, 3)
-			_text_centered("INF", x + 60, y + 52, 30, Color(1, 1, 1, 0.85))
+			_text_centered("INF", x + 55, y + 46, 28, Color(1, 1, 1, 0.85))
 			for k in cnt:
-				_draw_award(kind, Vector2(x + 60 + (k - (cnt - 1) / 2.0) * 34.0, y + 92), 13.0, true)
+				_draw_award(kind, Vector2(x + 55 + (k - (cnt - 1) / 2.0) * 32.0, y + 84), 12.0, true)
 		else:
-			_panel(Rect2(x, y, 120, 132), RANK_COLORS[int(b.get("rank", 0))], 24)
-			_text_centered(String(RANKS[int(b.get("rank", 0))]), x + 60, y + 86, 56, Color.WHITE)
-		_text(_fit(String(e.title), cw - 145 - 230, 34), Vector2(x + 145, y + 58), 34, ink)
+			_panel(Rect2(x, y, 110, HOME_ROW_H), RANK_COLORS[int(b.get("rank", 0))], 24)
+			_text_centered(String(RANKS[int(b.get("rank", 0))]), x + 55, y + 78, 52, Color.WHITE)
+		_text(_fit(String(e.title), cw - 135 - 230, 32), Vector2(x + 135, y + 52), 32, ink)
 		var sub := "%s · %s" % [e.version, DIFFICULTY_LEVELS[int(rec.level)].name]
 		if rec.inf:
 			sub += " · Infinito"
-		_text(_fit(sub, cw - 145 - 230, 24), Vector2(x + 145, y + 102), 24, Color(0.42, 0.52, 0.62))
+		_text(_fit(sub, cw - 135 - 230, 23), Vector2(x + 135, y + 92), 23, Color(0.42, 0.52, 0.62))
 		var score_txt := str(int(b.get("score", 0)))
-		var sw := _font().get_string_size(score_txt, HORIZONTAL_ALIGNMENT_LEFT, -1, 38).x
-		_text(score_txt, Vector2(x + cw - 30 - sw, y + 80), 38, Color(0.02, 0.55, 0.8))
+		var sw := _font().get_string_size(score_txt, HORIZONTAL_ALIGNMENT_LEFT, -1, 36).x
+		_text(score_txt, Vector2(x + cw - 28 - sw, y + 74), 36, Color(0.02, 0.55, 0.8))
 	draw_set_transform(Vector2.ZERO)
 
 # --- Archivos (importar, carpeta y exportar) ---------------------------------------
@@ -1749,7 +1901,8 @@ func _draw_files() -> void:
 	_text(_fit("Guarda un .osz de cada canción en \"Importadas\" (%d en la biblioteca)." % n_songs, cw - 80, 24), Vector2(x + 40, 1135), 24, muted)
 	_text(_fit("Así no las pierdes si desinstalas la app.", cw - 80, 24), Vector2(x + 40, 1175), 24, muted)
 	_button(Rect2(x + 40, 1200, cw - 80, 100), "Exportando..." if syncing else "Exportar canciones", accent)
-	_text("Los mapas importados antes de los fondos hay que importarlos otra vez para que traigan su imagen.", Vector2(55, 1400), 22, muted)
+	_text(_fit("Récords, listas y favoritas se guardan en %s dentro de la carpeta." % PROGRESS_FILE, cw, 22), Vector2(55, 1375), 22, muted)
+	_text(_fit("Los mapas importados antes de los fondos hay que importarlos otra vez.", cw, 22), Vector2(55, 1415), 22, muted)
 	if status_time > 0.0:
 		_text(_fit(status_text, cw, 26), Vector2(55, 1460), 26, Color(1, 0.45, 0.45) if status_error else Color(0.5, 0.95, 0.75))
 	draw_set_transform(Vector2.ZERO)
@@ -1799,7 +1952,6 @@ func _draw_card(g: Dictionary, x: float, y: float, w: float, kind: String) -> vo
 		draw_colored_polygon(PackedVector2Array([pc + Vector2(-14, -22), pc + Vector2(-14, 22), pc + Vector2(22, 0)]), Color(0.04, 0.65, 0.88))
 
 func _draw_music() -> void:
-	var bg := Color(0.025, 0.05, 0.1)
 	var muted := Color(0.62, 0.75, 0.88)
 	var x := 55.0
 	var w := viewport_size.x - 110.0
@@ -1825,7 +1977,7 @@ func _draw_music() -> void:
 	elif music_tab == 0 and groups.size() == 1 and not search_open:
 		_text("Importa un mapa de osu! (.osz) en la pestaña Archivos.", Vector2(x, LIST_TOP + CARD_H + CARD_GAP + 70.0 - scroll_y), 28, muted)
 	# La cabecera tapa las tarjetas que suben por debajo.
-	draw_rect(Rect2(0, 0, viewport_size.x, LIST_TOP - 22), bg)
+	_background_rect(Rect2(0, 0, viewport_size.x, LIST_TOP - 22))
 	draw_set_transform(Vector2(0, top_inset))
 	var title := "MÚSICA"
 	if music_tab == 2 and open_playlist >= 0 and open_playlist < playlists.size():
@@ -1851,7 +2003,7 @@ func _draw_music() -> void:
 
 func _draw_library() -> void:
 	thumb_budget = 2
-	draw_rect(Rect2(Vector2.ZERO, viewport_size), Color(0.025, 0.05, 0.1))
+	_background()
 	if tab == TAB_HOME:
 		_draw_home()
 	elif tab == TAB_FILES:
@@ -2024,6 +2176,7 @@ func _save_settings() -> void:
 	for key in bests:
 		cfg.set_value("best", key, bests[key])
 	cfg.save(SETTINGS_PATH)
+	_save_progress_file()
 
 # --- Puntaje y rangos ----------------------------------------------------
 
@@ -2469,6 +2622,19 @@ func _draw_results() -> void:
 	if run_lives > 0 and not best.is_empty():
 		_text_centered("Mejor: %s · %d" % [RANKS[int(best.rank)], int(best.score)], w / 2, 1215, 32, muted)
 	_button(Rect2(110, 1400, w - 220, 135), "REPETIR", Color(0.02, 0.68, 0.88)); _button(Rect2(110, 1570, w - 220, 120), "CANCIONES", Color(0.17, 0.25, 0.37))
+
+## Mismo fondo que _background() pero solo dentro de un rectángulo (para tapar la lista bajo la cabecera).
+func _background_rect(r: Rect2) -> void:
+	draw_rect(r, Color(0.025, 0.05, 0.1))
+	var rect_poly := PackedVector2Array([r.position, Vector2(r.end.x, r.position.y), r.end, Vector2(r.position.x, r.end.y)])
+	var center := Vector2(viewport_size.x * 0.75, viewport_size.y * 0.22)
+	for i in range(10):
+		var rad := 700.0 - i * 50.0
+		var circle := PackedVector2Array()
+		for k in 48:
+			circle.append(center + Vector2(cos(k * TAU / 48.0), sin(k * TAU / 48.0)) * rad)
+		for piece in Geometry2D.intersect_polygons(circle, rect_poly):
+			draw_colored_polygon(piece, Color(0, 0.58, 0.95, 0.025))
 
 func _background() -> void:
 	draw_rect(Rect2(Vector2.ZERO,viewport_size),Color(0.025,0.05,0.1))
