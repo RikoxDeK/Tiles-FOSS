@@ -38,6 +38,11 @@ const LIVES_MAX := 10
 const RESUME_BACKOFF := 0.10    # al continuar, la canción retoma este tiempo antes de la tecla
 const GRACE_AFTER_CONTINUE := 1.0
 const HIT_LATE := 0.28      # segundos de margen para tocar una tecla tarde
+const NAV_H := 150.0        # alto de la barra inferior
+const TAB_HOME := 0
+const TAB_MUSIC := 1
+const TAB_FILES := 2
+const SORT_MODES := ["Título", "Artista", "Recientes", "Dificultades"]
 const CARD_H := 190.0
 const CARD_GAP := 24.0
 const DEMO_ENTRY := {"demo": true, "title": "Tiles FOSS Demo", "artist": "Mapa de prueba", "version": "Normal", "badge": "DEMO"}
@@ -107,7 +112,21 @@ var show_bg := true          # ajuste: mostrar la imagen de fondo del mapa
 var bg_vis := 0.30           # ajuste: cuánto se ve la imagen (0.1 - 0.7)
 var bg_texture: Texture2D = null
 var show_thumbs := true      # ajuste: miniaturas en las canciones de la biblioteca
-var fav_only := false        # pestaña "Favoritas" activa
+var fav_only := false        # (sin uso: ahora se usa music_tab)
+var tab := TAB_HOME          # pestaña de la barra inferior (0 Inicio, 1 Música, 2 Archivos)
+var music_tab := 0           # dentro de Música: 0 Todas, 1 Favoritas, 2 Listas
+var open_playlist := -1      # lista abierta (-1 = se ven todas las listas)
+var sort_mode := 0           # índice en SORT_MODES
+var playlists: Array = []    # [{"name": String, "refs": ["set_id|version", ...]}]
+var last_played: Dictionary = {}
+var overlay := ""            # ventana abierta: "sort", "addto" o "newlist"
+var newlist_then_add := false
+var delete_armed := false
+var name_edit: LineEdit
+var scroll_vel := 0.0        # inercia del desplazamiento (px/s)
+var drag_ms := 0
+var home_records: Array = []
+var home_dirty := true
 var favorites: Dictionary = {}   # id de canción -> true
 var thumb_cache: Dictionary = {} # ruta de imagen -> Texture2D (o null si no se pudo leer)
 var thumb_budget := 1            # miniaturas que se pueden decodificar por fotograma
@@ -187,6 +206,7 @@ func _ready() -> void:
 	add_child(folder_dialog)
 	get_window().files_dropped.connect(_on_files_dropped)
 	_setup_search()
+	_setup_name_edit()
 	_load_settings()
 	_refresh_library()
 	_resize()
@@ -197,13 +217,18 @@ func _notification(what: int) -> void:
 
 ## Botón "atrás" de Android: retrocede una pantalla en vez de cerrar el juego.
 func _go_back() -> void:
+	if overlay != "":
+		_close_overlay()
+		return
 	match screen:
 		Screen.GAME:
 			if life_menu or resume_pending or finished:
 				return
 			_set_paused(not paused)
-		Screen.PREPARE, Screen.SETTINGS:
+		Screen.PREPARE:
 			_stop_audio()
+			screen = Screen.LIBRARY
+		Screen.SETTINGS:
 			screen = Screen.LIBRARY
 		Screen.RESULTS:
 			open_group = {}
@@ -211,8 +236,14 @@ func _go_back() -> void:
 		Screen.LIBRARY:
 			if not open_group.is_empty():
 				open_group = {}
-			elif search_open:
+			elif tab == TAB_MUSIC and search_open:
 				_close_search()
+			elif tab == TAB_MUSIC and music_tab == 2 and open_playlist >= 0:
+				open_playlist = -1
+				_apply_filter()
+			elif tab != TAB_HOME:
+				tab = TAB_HOME
+				home_dirty = true
 			else:
 				get_tree().quit()
 
@@ -237,8 +268,17 @@ func _process(delta: float) -> void:
 		_update_notes()
 	if previewing and (screen != Screen.PREPARE or not player.playing):
 		previewing = false
+	if screen == Screen.LIBRARY and tab == TAB_MUSIC and press_id == -999 and absf(scroll_vel) > 12.0:
+		scroll_y += scroll_vel * delta
+		scroll_vel *= exp(-3.0 * delta)   # frena poco a poco: desplazamiento con inercia
+		if _clamp_scroll():
+			scroll_vel = 0.0
+	elif press_id == -999:
+		scroll_vel = 0.0
+	if name_edit != null:
+		name_edit.visible = overlay == "newlist"
 	if search_edit != null:
-		search_edit.visible = screen == Screen.LIBRARY and search_open and open_group.is_empty()
+		search_edit.visible = screen == Screen.LIBRARY and tab == TAB_MUSIC and search_open and open_group.is_empty() and overlay == ""
 	if judgement_time > 0.0:
 		judgement_time -= delta
 	if combo_pop > 0.0:
@@ -494,12 +534,18 @@ func _pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
 	if not pressed:
 		active_inputs.erase(input_id)
 		return
+	if screen == Screen.PREPARE and overlay != "":
+		_overlay_tap(pos)
+		return
+	if screen == Screen.SETTINGS and _nav_tap(pos):
+		return
 	if screen == Screen.PREPARE or screen == Screen.RESULTS or screen == Screen.SETTINGS:
 		pos.y -= ui_off
 	if screen == Screen.PREPARE:
 		if Rect2(100, 1640, viewport_size.x - 200, 145).has_point(pos): _start_game()
 		elif Rect2(35, 45, 180, 95).has_point(pos): _stop_audio(); screen = Screen.LIBRARY
 		elif Rect2(viewport_size.x - 365, 45, 330, 95).has_point(pos): _toggle_preview()
+		elif Rect2(235, 45, viewport_size.x - 620, 95).has_point(pos): overlay = "addto"
 		elif Rect2(100, 800, 190, 110).has_point(pos): _adjust_diff(-1)
 		elif Rect2(viewport_size.x - 290, 800, 190, 110).has_point(pos): _adjust_diff(1)
 		elif Rect2(100, 950, 190, 120).has_point(pos): _adjust_speed(-SPEED_STEP)
@@ -536,15 +582,10 @@ func _pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
 		active_inputs[input_id] = lane
 		_try_hit(lane, input_id)
 	elif screen == Screen.SETTINGS:
-		if Rect2(35, 45, 180, 95).has_point(pos): screen = Screen.LIBRARY
-		elif Rect2(80, 330, viewport_size.x - 160, 180).has_point(pos):
+		if Rect2(80, 330, viewport_size.x - 160, 180).has_point(pos):
 			show_bg = not show_bg; _reload_bg(); _save_settings()
 		elif Rect2(80, 870, viewport_size.x - 160, 180).has_point(pos):
 			show_thumbs = not show_thumbs; _save_settings()
-		elif Rect2(130, 1300, (viewport_size.x - 300.0) / 2.0, 100).has_point(pos):
-			folder_dialog.popup_centered_ratio(0.85)
-		elif Rect2(130 + (viewport_size.x - 300.0) / 2.0 + 40, 1300, (viewport_size.x - 300.0) / 2.0, 100).has_point(pos):
-			_sync_folder()
 		elif show_bg and Rect2(130, 690, 170, 110).has_point(pos): _adjust_bg(-0.05)
 		elif show_bg and Rect2(viewport_size.x - 300, 690, 170, 110).has_point(pos): _adjust_bg(0.05)
 	elif screen == Screen.RESULTS:
@@ -566,6 +607,9 @@ func _assign_tap_heights() -> void:
 func _start_game() -> void:
 	_stop_audio()
 	screen = Screen.GAME
+	if not current_song.is_empty():
+		last_played = {"id": String(current_song.get("set_id", "demo")), "version": String(current_song.get("version", ""))}
+		_save_settings()
 	infinite_run = infinite_mode and lives_mode
 	lap = 1; lap_factor = 1.0; award_idx = 0; stars = 0; crowns = 0
 	banner_time = 0.0; lap_banner_time = 0.0; bg_blend = 0.0
@@ -777,6 +821,7 @@ func _refresh_library() -> void:
 	entries.append_array(OsuImporter.scan_library())
 	groups = _group_entries(entries)
 	open_group = {}
+	home_dirty = true
 	_apply_filter()
 
 ## Agrupa las dificultades de un mismo .osz (misma carpeta) en una sola canción.
@@ -786,10 +831,14 @@ func _group_entries(entries: Array) -> Array:
 	for e in entries:
 		var id: String = e.get("set_id", "demo")
 		if not by_id.has(id):
-			var g := {"id": id, "title": e.title, "artist": e.artist, "creator": e.get("creator", ""), "entries": []}
+			var g := {"id": id, "title": e.title, "artist": e.artist, "creator": e.get("creator", ""), "entries": [], "mtime": 0}
 			by_id[id] = g
 			out.append(g)
 		by_id[id].entries.append(e)
+	for g in out:
+		for e in g.entries:
+			if not e.get("demo", false) and e.has("osu_path"):
+				g.mtime = maxi(int(g.mtime), int(FileAccess.get_modified_time(String(e.osu_path))))
 	# Dentro de cada canción: por modo y de menor a mayor (el tamaño del .osu
 	# sirve de aproximación a la dificultad: más notas, archivo más grande).
 	for g in out:
@@ -801,15 +850,41 @@ func _group_entries(entries: Array) -> Array:
 
 func _apply_filter() -> void:
 	var words := search_query.strip_edges().to_lower().split(" ", false)
-	var base: Array = groups
-	if fav_only:
-		base = groups.filter(func(g): return favorites.has(g.id))
-	if words.is_empty():
-		view_groups = base
+	if music_tab == 2:
+		view_groups = _playlist_view()
 	else:
-		view_groups = base.filter(func(g): return _group_matches(g, words))
+		var base: Array = groups
+		if music_tab == 1:
+			base = groups.filter(func(g): return favorites.has(g.id))
+		if not words.is_empty():
+			base = base.filter(func(g): return _group_matches(g, words))
+		view_groups = _sorted(base)
 	scroll_y = 0.0
+	scroll_vel = 0.0
 	_clamp_scroll()
+
+func _sorted(base: Array) -> Array:
+	var out: Array = base.duplicate()
+	match sort_mode:
+		1:
+			out.sort_custom(func(a, b):
+				if a.artist != b.artist:
+					return String(a.artist).naturalnocasecmp_to(String(b.artist)) < 0
+				return String(a.title).naturalnocasecmp_to(String(b.title)) < 0)
+		2:
+			out.sort_custom(func(a, b): return int(a.get("mtime", 0)) > int(b.get("mtime", 0)))
+		3:
+			out.sort_custom(func(a, b):
+				if a.entries.size() != b.entries.size():
+					return a.entries.size() > b.entries.size()
+				return String(a.title).naturalnocasecmp_to(String(b.title)) < 0)
+		_:
+			out.sort_custom(func(a, b): return String(a.title).naturalnocasecmp_to(String(b.title)) < 0)
+	# El mapa de prueba siempre al final.
+	var demo: Array = out.filter(func(g): return g.id == "demo")
+	out = out.filter(func(g): return g.id != "demo")
+	out.append_array(demo)
+	return out
 
 func _toggle_favorite(id: String) -> void:
 	if favorites.has(id):
@@ -974,10 +1049,8 @@ func _backup_copy(src: String, backup_dir: String, id: String, name: String) -> 
 		out.close()
 	return FileAccess.file_exists(target)
 
-func _sync_folder() -> void:
-	if syncing:
-		return
-	syncing = true
+## Comprueba el permiso de archivos y crea las carpetas de trabajo. false si no hay acceso.
+func _library_access_ok() -> bool:
 	if library_dir == "":
 		library_dir = _default_library_dir()
 		_save_settings()
@@ -991,9 +1064,8 @@ func _sync_folder() -> void:
 		if not has_all:
 			perm_asked = true
 			OS.request_permissions()
-			_show_status("Concede \"acceso a todos los archivos\" a la app y vuelve a pulsar Recargar.", true, 12.0)
-			syncing = false
-			return
+			_show_status("Concede \"acceso a todos los archivos\" a la app y vuelve a pulsar el botón.", true, 12.0)
+			return false
 	var inbox := library_dir.path_join(INBOX_NAME)
 	var backup := library_dir.path_join(BACKUP_NAME)
 	DirAccess.make_dir_recursive_absolute(inbox)
@@ -1001,9 +1073,80 @@ func _sync_folder() -> void:
 	if not DirAccess.dir_exists_absolute(inbox) or not DirAccess.dir_exists_absolute(backup):
 		if OS.has_feature("android"):
 			OS.request_permissions()
-		_show_status("Sin acceso a la carpeta. Concede \"acceso a todos los archivos\" a la app y pulsa Recargar otra vez.", true, 10.0)
+		_show_status("Sin acceso a la carpeta. Concede \"acceso a todos los archivos\" a la app y pulsa el botón otra vez.", true, 10.0)
+		return false
+	return true
+
+## Id de 10 caracteres hexadecimales entre corchetes al final del nombre ("título [id].osz").
+func _id_from_name(file_name: String) -> String:
+	var a := file_name.rfind("[")
+	var b := file_name.rfind("]")
+	if a < 0 or b <= a:
+		return ""
+	var id := file_name.substr(a + 1, b - a - 1)
+	return id if id.length() == 10 and id.is_valid_hex_number() else ""
+
+func _zip_dir(dir: String, target: String) -> bool:
+	var zp := ZIPPacker.new()
+	if zp.open(target) != OK:
+		return false
+	var any := false
+	for f in DirAccess.get_files_at(dir):
+		var bytes := FileAccess.get_file_as_bytes(dir.path_join(f))
+		if bytes.is_empty():
+			continue
+		zp.start_file(f)
+		zp.write_file(bytes)
+		zp.close_file()
+		any = true
+	zp.close()
+	return any and FileAccess.file_exists(target)
+
+## Guarda en "Importadas" un .osz de cada canción que todavía no tenga copia.
+func _export_library() -> void:
+	if syncing:
+		return
+	syncing = true
+	if not _library_access_ok():
 		syncing = false
 		return
+	var backup := library_dir.path_join(BACKUP_NAME)
+	var have := "\n".join(_osz_files(backup))
+	var todo: Array = []
+	var total := 0
+	for g in groups:
+		if g.id == "demo":
+			continue
+		total += 1
+		if not have.contains("[%s]" % g.id):
+			todo.append(g)
+	var done := 0
+	var failed := 0
+	for g in todo:
+		_show_status("Exportando %d/%d..." % [done + 1, todo.size()], false, 60.0)
+		await get_tree().process_frame
+		var osz_name := "%s [%s].osz" % [OsuImporter.safe_name(String(g.title)), g.id]
+		if _zip_dir(OsuImporter.SONGS_DIR.path_join(String(g.id)), backup.path_join(osz_name)):
+			done += 1
+		else:
+			failed += 1
+	var msg := "Exportadas %d canciones nuevas (%d ya tenían copia)" % [done, total - todo.size()]
+	if failed > 0:
+		msg += ", %d con error" % failed
+	if total == 0:
+		msg = "No hay canciones importadas para exportar."
+	_show_status(msg, failed > 0, 8.0)
+	syncing = false
+
+func _sync_folder() -> void:
+	if syncing:
+		return
+	syncing = true
+	if not _library_access_ok():
+		syncing = false
+		return
+	var inbox := library_dir.path_join(INBOX_NAME)
+	var backup := library_dir.path_join(BACKUP_NAME)
 	var backup_files := _osz_files(backup)
 	var inbox_files := _osz_files(inbox)
 	var total := backup_files.size() + inbox_files.size()
@@ -1015,10 +1158,12 @@ func _sync_folder() -> void:
 	for f in backup_files:
 		done += 1
 		var bpath := backup.path_join(f)
-		if not DirAccess.dir_exists_absolute(OsuImporter.SONGS_DIR.path_join(FileAccess.get_md5(bpath).substr(0, 10))):
+		var fid := _id_from_name(f)
+		var rid := fid if fid != "" else FileAccess.get_md5(bpath).substr(0, 10)
+		if not DirAccess.dir_exists_absolute(OsuImporter.SONGS_DIR.path_join(rid)):
 			_show_status("Restaurando %d/%d..." % [done, total], false, 60.0)
 			await get_tree().process_frame
-			if OsuImporter.import_osz(bpath).ok:
+			if OsuImporter.import_osz(bpath, fid).ok:
 				restored += 1
 			else:
 				failed += 1
@@ -1060,28 +1205,317 @@ func _on_files_dropped(files: PackedStringArray) -> void:
 func _show_status(text: String, is_error: bool, seconds := 6.0) -> void:
 	status_text = text; status_error = is_error; status_time = seconds
 
+# --- Barra inferior (Inicio / Música / Archivos / Ajustes) ----------------
+
+func _nav_rect(i: int) -> Rect2:
+	var cw := viewport_size.x / 4.0
+	return Rect2(i * cw, viewport_size.y - NAV_H, cw, NAV_H)
+
+func _nav_active() -> int:
+	return 3 if screen == Screen.SETTINGS else tab
+
+func _nav_tap(pos: Vector2) -> bool:
+	for i in 4:
+		if _nav_rect(i).has_point(pos):
+			_go_tab(i)
+			return true
+	return false
+
+func _go_tab(i: int) -> void:
+	open_group = {}
+	overlay = ""
+	scroll_vel = 0.0
+	if i == 3:
+		screen = Screen.SETTINGS
+		return
+	screen = Screen.LIBRARY
+	tab = i
+	home_dirty = true
+
+func _draw_nav_icon(i: int, c: Vector2, s: float, col: Color) -> void:
+	match i:
+		0:
+			draw_colored_polygon(PackedVector2Array([c + Vector2(-s, -s * 0.05), c + Vector2(0, -s), c + Vector2(s, -s * 0.05)]), col)
+			draw_rect(Rect2(c.x - s * 0.7, c.y - s * 0.05, s * 1.4, s * 0.95), col)
+		1:
+			draw_circle(c + Vector2(-s * 0.4, s * 0.55), s * 0.42, col)
+			draw_line(c + Vector2(s * 0.0, s * 0.55), c + Vector2(s * 0.0, -s * 0.85), col, 7.0)
+			draw_line(c + Vector2(0, -s * 0.85), c + Vector2(s * 0.75, -s * 0.4), col, 7.0)
+		2:
+			draw_rect(Rect2(c.x - s, c.y - s * 0.4, s * 2.0, s * 1.25), col)
+			draw_rect(Rect2(c.x - s, c.y - s * 0.75, s * 0.9, s * 0.4), col)
+		_:
+			draw_arc(c, s * 0.62, 0.0, TAU, 32, col, 8.0)
+			for k in 8:
+				var a := k * TAU / 8.0
+				draw_line(c + Vector2(cos(a), sin(a)) * s * 0.8, c + Vector2(cos(a), sin(a)) * s * 1.05, col, 9.0)
+
+func _draw_nav() -> void:
+	draw_set_transform(Vector2.ZERO)
+	var y0 := viewport_size.y - NAV_H
+	draw_rect(Rect2(0, y0, viewport_size.x, NAV_H), Color(0.05, 0.09, 0.17))
+	draw_rect(Rect2(0, y0, viewport_size.x, 3), Color(0.14, 0.22, 0.34))
+	var labels := ["Inicio", "Música", "Archivos", "Ajustes"]
+	var active := _nav_active()
+	for i in 4:
+		var r := _nav_rect(i)
+		var on := i == active
+		if on:
+			_panel(Rect2(r.position.x + 14, r.position.y + 14, r.size.x - 28, r.size.y - 28), Color(0.04, 0.65, 0.88), 28)
+		var col := Color.WHITE if on else Color(0.62, 0.75, 0.88)
+		_draw_nav_icon(i, Vector2(r.get_center().x, y0 + 55), 26.0, col)
+		_text_centered(labels[i], r.get_center().x, y0 + 118, 28, col)
+
+# --- Listas de reproducción -------------------------------------------------
+
+func _ref(e: Dictionary) -> String:
+	return "%s|%s" % [e.get("set_id", "demo"), e.get("version", "")]
+
+func _entry_by_ref(ref: String) -> Dictionary:
+	for g in groups:
+		for e in g.entries:
+			if _ref(e) == ref:
+				return e
+	return {}
+
+func _find_entry(set_id: String, version: String) -> Dictionary:
+	return _entry_by_ref("%s|%s" % [set_id, version])
+
+func _group_of(set_id: String) -> Dictionary:
+	for g in groups:
+		if g.id == set_id:
+			return g
+	return {}
+
+func _set_music_tab(i: int) -> void:
+	music_tab = i
+	open_playlist = -1
+	delete_armed = false
+	_apply_filter()
+
+func _playlist_view() -> Array:
+	var words := search_query.strip_edges().to_lower().split(" ", false)
+	var out: Array = []
+	if open_playlist < 0 or open_playlist >= playlists.size():
+		open_playlist = -1
+		for i in playlists.size():
+			var pname := String(playlists[i].name)
+			var ok := true
+			for wd in words:
+				if not pname.to_lower().contains(wd):
+					ok = false
+			if ok:
+				var n: int = playlists[i].refs.size()
+				out.append({"playlist_idx": i, "id": "pl%d" % i, "title": pname, "artist": "1 canción" if n == 1 else "%d canciones" % n, "creator": "", "entries": []})
+		return out
+	for ref in playlists[open_playlist].refs:
+		var e := _entry_by_ref(String(ref))
+		if e.is_empty():
+			continue
+		var g := {"id": e.get("set_id", "demo"), "title": e.title, "artist": e.artist, "creator": e.get("creator", ""), "entries": [e], "in_playlist": true}
+		if words.is_empty() or _group_matches(g, words):
+			out.append(g)
+	return out
+
+func _create_playlist(pname: String) -> int:
+	playlists.append({"name": pname, "refs": []})
+	_save_settings()
+	return playlists.size() - 1
+
+func _toggle_in_playlist(pi: int, e: Dictionary) -> void:
+	var refs: Array = playlists[pi].refs
+	var r := _ref(e)
+	if refs.has(r):
+		refs.erase(r)
+	else:
+		refs.append(r)
+	_save_settings()
+
+func _setup_name_edit() -> void:
+	name_edit = LineEdit.new()
+	name_edit.placeholder_text = "Nombre de la lista"
+	name_edit.max_length = 40
+	name_edit.visible = false
+	name_edit.add_theme_font_size_override("font_size", 38)
+	name_edit.add_theme_color_override("font_color", Color(0.12, 0.22, 0.31))
+	name_edit.add_theme_color_override("font_placeholder_color", Color(0.5, 0.6, 0.7))
+	name_edit.add_theme_color_override("caret_color", Color(0.02, 0.62, 0.86))
+	for style_name in ["normal", "focus", "read_only"]:
+		var box := _box(Color(0.88, 0.94, 1), 22)
+		box.content_margin_left = 26.0
+		box.content_margin_right = 20.0
+		name_edit.add_theme_stylebox_override(style_name, box)
+	name_edit.text_submitted.connect(func(_t): _commit_newlist())
+	add_child(name_edit)
+
+func _open_newlist(then_add: bool) -> void:
+	newlist_then_add = then_add
+	overlay = "newlist"
+	name_edit.text = ""
+	name_edit.grab_focus.call_deferred()
+
+func _commit_newlist() -> void:
+	var pname := name_edit.text.strip_edges()
+	if pname == "":
+		return
+	var pi := _create_playlist(pname)
+	if newlist_then_add and not current_song.is_empty():
+		_toggle_in_playlist(pi, current_song)
+	name_edit.release_focus()
+	overlay = "addto" if newlist_then_add else ""
+	if music_tab == 2 and open_playlist < 0:
+		_apply_filter()
+
+func _close_overlay() -> void:
+	name_edit.release_focus()
+	if overlay == "newlist" and newlist_then_add:
+		overlay = "addto"
+	else:
+		overlay = ""
+
+func _overlay_layout() -> Dictionary:
+	var px := 80.0
+	var pw := viewport_size.x - 160.0
+	var rows: Array = []
+	var extra := {}
+	var h := 0.0
+	var py := 0.0
+	if overlay == "sort":
+		var n_sort := SORT_MODES.size()
+		h = 160.0 + n_sort * 114.0 + 10.0
+		py = (viewport_size.y - h) / 2.0
+		for i in n_sort:
+			rows.append(Rect2(px + 30, py + 140 + i * 114.0, pw - 60, 100))
+	elif overlay == "addto":
+		var n_pl := mini(playlists.size(), 6)
+		h = 160.0 + (n_pl + 1) * 114.0 + 120.0
+		py = (viewport_size.y - h) / 2.0
+		for i in n_pl:
+			rows.append(Rect2(px + 30, py + 140 + i * 114.0, pw - 60, 100))
+		extra["new"] = Rect2(px + 30, py + 140 + n_pl * 114.0, pw - 60, 100)
+		extra["close"] = Rect2(px + 30, py + h - 110, pw - 60, 90)
+	else:
+		h = 440.0
+		py = (viewport_size.y - h) / 2.0 - 120.0
+		var bw := (pw - 90.0) / 2.0
+		extra["edit"] = Rect2(px + 40, py + 150, pw - 80, 100)
+		extra["cancel"] = Rect2(px + 30, py + 300, bw, 100)
+		extra["ok"] = Rect2(px + 60 + bw, py + 300, bw, 100)
+	return {"panel": Rect2(px, py, pw, h), "rows": rows, "extra": extra}
+
+func _draw_overlay() -> void:
+	draw_set_transform(Vector2.ZERO)
+	draw_rect(Rect2(Vector2.ZERO, viewport_size), Color(0, 0, 0, 0.62))
+	var lay := _overlay_layout()
+	var panel: Rect2 = lay.panel
+	var ink := Color(0.12, 0.22, 0.31)
+	var soft := Color(0.88, 0.94, 1)
+	var accent := Color(0.04, 0.65, 0.88)
+	_panel(panel, Color(0.97, 0.98, 1), 34)
+	var title := "Ordenar por"
+	if overlay == "addto":
+		title = "Añadir a lista"
+	elif overlay == "newlist":
+		title = "Nueva lista"
+	_text(title, Vector2(panel.position.x + 40, panel.position.y + 86), 44, ink)
+	if overlay == "sort":
+		for i in lay.rows.size():
+			var r: Rect2 = lay.rows[i]
+			_panel(r, accent if i == sort_mode else soft, 22)
+			_text(SORT_MODES[i], Vector2(r.position.x + 36, r.get_center().y + 13), 36, Color.WHITE if i == sort_mode else ink)
+	elif overlay == "addto":
+		if not current_song.is_empty():
+			_text(_fit("%s · %s" % [current_song.get("title", ""), current_song.get("version", "")], panel.size.x - 80, 26), Vector2(panel.position.x + 40, panel.position.y + 124), 26, Color(0.42, 0.52, 0.62))
+		for i in lay.rows.size():
+			var r2: Rect2 = lay.rows[i]
+			var has: bool = playlists[i].refs.has(_ref(current_song))
+			_panel(r2, soft, 22)
+			_text(_fit(String(playlists[i].name), r2.size.x - 160, 36), Vector2(r2.position.x + 36, r2.get_center().y + 13), 36, ink)
+			if has:
+				var cc := Vector2(r2.end.x - 60, r2.get_center().y)
+				draw_polyline(PackedVector2Array([cc + Vector2(-20, 0), cc + Vector2(-6, 16), cc + Vector2(22, -16)]), Color(0.1, 0.7, 0.45), 9.0)
+		var ex: Dictionary = lay.extra
+		_button(ex["new"], "+ Nueva lista", accent)
+		_button(ex["close"], "Listo", Color(0.17, 0.25, 0.37))
+		if playlists.size() > 6:
+			_text("Solo se muestran las 6 primeras listas.", Vector2(panel.position.x + 40, panel.end.y - 125), 22, Color(0.42, 0.52, 0.62))
+	else:
+		var ex2: Dictionary = lay.extra
+		var er: Rect2 = ex2["edit"]
+		name_edit.position = er.position
+		name_edit.size = er.size
+		_button(ex2["cancel"], "Cancelar", Color(0.17, 0.25, 0.37))
+		_button(ex2["ok"], "Crear", accent)
+
+func _overlay_tap(pos: Vector2) -> void:
+	var lay := _overlay_layout()
+	var panel: Rect2 = lay.panel
+	var ex: Dictionary = lay.extra
+	if overlay == "sort":
+		for i in lay.rows.size():
+			if lay.rows[i].has_point(pos):
+				sort_mode = i
+				_save_settings()
+				_apply_filter()
+				overlay = ""
+				return
+		if not panel.has_point(pos):
+			overlay = ""
+	elif overlay == "addto":
+		for i in lay.rows.size():
+			if lay.rows[i].has_point(pos):
+				_toggle_in_playlist(i, current_song)
+				return
+		if ex["new"].has_point(pos):
+			_open_newlist(true)
+		elif ex["close"].has_point(pos) or not panel.has_point(pos):
+			overlay = ""
+	else:
+		if ex["cancel"].has_point(pos) or not panel.has_point(pos):
+			_close_overlay()
+		elif ex["ok"].has_point(pos):
+			_commit_newlist()
+
+# --- Biblioteca: lista de canciones con desplazamiento suave ------------------
+
+func _list_bottom() -> float:
+	return viewport_size.y - NAV_H
+
 func _library_pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
 	if pressed:
-		press_id = input_id; press_pos = pos; dragged = false
+		press_id = input_id; press_pos = pos; dragged = false; scroll_vel = 0.0
+		drag_ms = Time.get_ticks_msec()
 	elif input_id == press_id:
 		press_id = -999
 		if not dragged:
 			_library_tap(pos)
+		elif Time.get_ticks_msec() - drag_ms > 90:
+			scroll_vel = 0.0   # soltó el dedo parado: sin inercia
 
 func _library_drag(pos: Vector2, relative: Vector2, input_id: int) -> void:
-	if screen != Screen.LIBRARY or input_id != press_id or not open_group.is_empty():
+	if screen != Screen.LIBRARY or input_id != press_id or not open_group.is_empty() or overlay != "" or tab != TAB_MUSIC:
 		return
 	if not dragged and pos.distance_to(press_pos) > 24.0:
 		dragged = true
 	if dragged:
+		var now := Time.get_ticks_msec()
+		var dt := maxf(0.004, float(now - drag_ms) / 1000.0)
+		drag_ms = now
+		scroll_vel = clampf(lerpf(scroll_vel, -relative.y / dt, 0.4), -7000.0, 7000.0)
 		scroll_y -= relative.y
 		_clamp_scroll()
 
-func _clamp_scroll() -> void:
+## Devuelve true si el límite recortó la posición (para frenar la inercia en los bordes).
+func _clamp_scroll() -> bool:
 	var content := view_groups.size() * (CARD_H + CARD_GAP)
-	scroll_y = clampf(scroll_y, 0.0, maxf(0.0, content - (viewport_size.y - LIST_TOP) + 40.0))
+	var before := scroll_y
+	scroll_y = clampf(scroll_y, 0.0, maxf(0.0, content - (_list_bottom() - LIST_TOP) + 40.0))
+	return not is_equal_approx(before, scroll_y)
 
 func _library_tap(pos: Vector2) -> void:
+	if overlay != "":
+		_overlay_tap(pos)
+		return
 	# Selector de dificultad abierto: solo responde él.
 	if not open_group.is_empty():
 		var layout := _picker_layout()
@@ -1095,42 +1529,339 @@ func _library_tap(pos: Vector2) -> void:
 				_select_song(open_group.entries[i])
 				return
 		return
+	if _nav_tap(pos):
+		return
+	if tab == TAB_HOME:
+		_home_tap(pos)
+	elif tab == TAB_FILES:
+		_files_tap(pos)
+	else:
+		_music_tap(pos)
+
+func _music_tap(pos: Vector2) -> void:
+	var w := viewport_size.x
+	var hy := 150.0 + top_inset
 	if search_edit.visible and search_edit.get_global_rect().has_point(pos):
 		return
 	search_edit.release_focus()
 	if search_open:
-		if Rect2(viewport_size.x - 300, 150 + top_inset, 245, 95).has_point(pos):
+		if Rect2(w - 300, hy, 245, 95).has_point(pos):
 			_close_search()
 			return
 	else:
-		if Rect2(viewport_size.x - 300, 40 + top_inset, 245, 80).has_point(pos):
-			screen = Screen.SETTINGS
-			return
-		if Rect2(55, 150 + top_inset, 130, 95).has_point(pos):
-			fav_only = false; _apply_filter()
-			return
-		if Rect2(195, 150 + top_inset, 205, 95).has_point(pos):
-			fav_only = true; _apply_filter()
-			return
-		if Rect2(viewport_size.x - 645, 150 + top_inset, 220, 95).has_point(pos):
+		if Rect2(w - 300, 40 + top_inset, 245, 80).has_point(pos):
 			_open_search()
 			return
-		if Rect2(viewport_size.x - 405, 150 + top_inset, 350, 95).has_point(pos):
-			file_dialog.popup_centered_ratio(0.85)
+		if Rect2(55, hy, 130, 95).has_point(pos):
+			_set_music_tab(0)
 			return
-	if pos.y < LIST_TOP - 22.0 or pos.x < 55.0 or pos.x > viewport_size.x - 55.0:
+		if Rect2(195, hy, 205, 95).has_point(pos):
+			_set_music_tab(1)
+			return
+		if Rect2(410, hy, 160, 95).has_point(pos):
+			_set_music_tab(2)
+			return
+		if Rect2(w - 440, hy, 385, 95).has_point(pos):
+			if music_tab != 2:
+				overlay = "sort"
+			elif open_playlist < 0:
+				_open_newlist(false)
+			elif delete_armed:
+				playlists.remove_at(open_playlist)
+				open_playlist = -1
+				delete_armed = false
+				_save_settings()
+				_apply_filter()
+			else:
+				delete_armed = true
+			return
+	if pos.y < LIST_TOP - 22.0 or pos.y > _list_bottom() or pos.x < 55.0 or pos.x > w - 55.0:
 		return
 	var offset := pos.y - LIST_TOP + scroll_y
 	var idx := int(offset / (CARD_H + CARD_GAP))
 	if offset >= 0.0 and fmod(offset, CARD_H + CARD_GAP) <= CARD_H and idx < view_groups.size():
 		var g: Dictionary = view_groups[idx]
-		if pos.x > viewport_size.x - 55.0 - 140.0:   # zona del corazón
-			_toggle_favorite(String(g.id))
+		if g.has("playlist_idx"):
+			open_playlist = int(g.playlist_idx)
+			delete_armed = false
+			_apply_filter()
+			return
+		if pos.x > w - 55.0 - 140.0:   # zona del corazón / quitar de la lista
+			if g.get("in_playlist", false):
+				var keep := scroll_y
+				playlists[open_playlist].refs.erase(_ref(g.entries[0]))
+				_save_settings()
+				_apply_filter()
+				scroll_y = keep
+				_clamp_scroll()
+			else:
+				_toggle_favorite(String(g.id))
 			return
 		if g.entries.size() == 1:
 			_select_song(g.entries[0])
 		else:
 			open_group = g
+
+# --- Inicio --------------------------------------------------------------------
+
+func _rebuild_home() -> void:
+	home_dirty = false
+	home_records = []
+	for key in bests:
+		var k := String(key)
+		var inf := false
+		var lvl := 1
+		if k.ends_with("|inf"):
+			inf = true
+			k = k.trim_suffix("|inf")
+		var p := k.rfind("|d")
+		if p > 0 and k.substr(p + 2).is_valid_int():
+			lvl = int(k.substr(p + 2))
+			k = k.substr(0, p)
+		var sid := k.get_slice("|", 0)
+		var ver := k.substr(sid.length() + 1)
+		var e := _find_entry(sid, ver)
+		if e.is_empty():
+			continue
+		var b: Dictionary = bests[key]
+		home_records.append({"entry": e, "level": clampi(lvl, 0, DIFFICULTY_LEVELS.size() - 1), "inf": inf, "b": b})
+	home_records.sort_custom(func(a, b): return int(a.b.get("score", 0)) > int(b.b.get("score", 0)))
+
+func _home_row_count() -> int:
+	var avail := viewport_size.y - NAV_H - top_inset - 570.0
+	return clampi(int(avail / 148.0), 1, 8)
+
+func _home_tap(pos: Vector2) -> void:
+	pos.y -= top_inset
+	var x := 55.0
+	var cw := viewport_size.x - 110.0
+	var le := _find_entry(String(last_played.get("id", "")), String(last_played.get("version", "")))
+	if not le.is_empty() and Rect2(x, 240, cw, CARD_H).has_point(pos):
+		_select_song(le)
+		return
+	var n := mini(_home_row_count(), home_records.size())
+	for i in n:
+		if Rect2(x, 570 + i * 148.0, cw, 132).has_point(pos):
+			var rec: Dictionary = home_records[i]
+			diff_level = int(rec.level)
+			if rec.inf:
+				lives_mode = true
+				infinite_mode = true
+			_select_song(rec.entry)
+			return
+
+func _draw_home() -> void:
+	if home_dirty:
+		_rebuild_home()
+	var w := viewport_size.x
+	var x := 55.0
+	var cw := w - 110.0
+	var muted := Color(0.62, 0.75, 0.88)
+	var ink := Color(0.12, 0.22, 0.31)
+	draw_set_transform(Vector2(0, top_inset))
+	_text("TILES FOSS", Vector2(55, 105), 58, Color.WHITE)
+	_text("Última canción jugada", Vector2(55, 215), 32, muted)
+	var le := _find_entry(String(last_played.get("id", "")), String(last_played.get("version", "")))
+	if le.is_empty():
+		_text("Aún no has jugado ninguna canción.", Vector2(55, 300), 28, muted)
+	else:
+		var lg := {"id": le.get("set_id", "demo"), "title": le.title, "artist": le.artist, "creator": "", "entries": [le]}
+		_draw_card(lg, x, 240, cw, "plain")
+	_text("Tus mejores récords", Vector2(55, 520), 32, muted)
+	if home_records.is_empty():
+		_text("Juega en modo Vidas o Infinito para guardar récords.", Vector2(55, 600), 28, muted)
+	var n := mini(_home_row_count(), home_records.size())
+	for i in n:
+		var rec: Dictionary = home_records[i]
+		var e: Dictionary = rec.entry
+		var b: Dictionary = rec.b
+		var y := 570.0 + i * 148.0
+		_panel(Rect2(x, y, cw, 132), Color(0.97, 0.98, 1), 24)
+		if rec.inf:
+			_panel(Rect2(x, y, 120, 132), Color(0.5, 0.38, 0.92), 24)
+			var n_cr := int(b.get("crowns", 0))
+			var n_st := int(b.get("stars", 0))
+			var kind := "crown" if n_cr > 0 else "star"
+			var cnt := mini(n_cr if n_cr > 0 else n_st, 3)
+			_text_centered("INF", x + 60, y + 52, 30, Color(1, 1, 1, 0.85))
+			for k in cnt:
+				_draw_award(kind, Vector2(x + 60 + (k - (cnt - 1) / 2.0) * 34.0, y + 92), 13.0, true)
+		else:
+			_panel(Rect2(x, y, 120, 132), RANK_COLORS[int(b.get("rank", 0))], 24)
+			_text_centered(String(RANKS[int(b.get("rank", 0))]), x + 60, y + 86, 56, Color.WHITE)
+		_text(_fit(String(e.title), cw - 145 - 230, 34), Vector2(x + 145, y + 58), 34, ink)
+		var sub := "%s · %s" % [e.version, DIFFICULTY_LEVELS[int(rec.level)].name]
+		if rec.inf:
+			sub += " · Infinito"
+		_text(_fit(sub, cw - 145 - 230, 24), Vector2(x + 145, y + 102), 24, Color(0.42, 0.52, 0.62))
+		var score_txt := str(int(b.get("score", 0)))
+		var sw := _font().get_string_size(score_txt, HORIZONTAL_ALIGNMENT_LEFT, -1, 38).x
+		_text(score_txt, Vector2(x + cw - 30 - sw, y + 80), 38, Color(0.02, 0.55, 0.8))
+	draw_set_transform(Vector2.ZERO)
+
+# --- Archivos (importar, carpeta y exportar) ---------------------------------------
+
+func _files_half() -> float:
+	return (viewport_size.x - 110.0 - 80.0 - 40.0) / 2.0
+
+func _files_tap(pos: Vector2) -> void:
+	pos.y -= top_inset
+	var x := 55.0
+	var cw := viewport_size.x - 110.0
+	var half := _files_half()
+	if Rect2(x + 40, 370, cw - 80, 100).has_point(pos):
+		file_dialog.popup_centered_ratio(0.85)
+	elif Rect2(x + 40, 810, half, 100).has_point(pos):
+		folder_dialog.popup_centered_ratio(0.85)
+	elif Rect2(x + 80 + half, 810, half, 100).has_point(pos):
+		_sync_folder()
+	elif Rect2(x + 40, 1200, cw - 80, 100).has_point(pos):
+		_export_library()
+
+func _draw_files() -> void:
+	var w := viewport_size.x
+	var x := 55.0
+	var cw := w - 110.0
+	var muted := Color(0.62, 0.75, 0.88)
+	var panel_col := Color(0.08, 0.13, 0.22, 0.92)
+	var accent := Color(0.02, 0.68, 0.88)
+	var half := _files_half()
+	draw_set_transform(Vector2(0, top_inset))
+	_text("ARCHIVOS", Vector2(55, 105), 58, Color.WHITE)
+	_panel(Rect2(x, 200, cw, 300), panel_col, 34)
+	_text("Importar mapa", Vector2(x + 40, 285), 40, Color.WHITE)
+	_text("Elige un archivo .osz de osu! de tu móvil.", Vector2(x + 40, 335), 26, muted)
+	_button(Rect2(x + 40, 370, cw - 80, 100), "Importar .osz", accent)
+	_panel(Rect2(x, 540, cw, 420), panel_col, 34)
+	_text("Carpeta de canciones", Vector2(x + 40, 625), 40, Color.WHITE)
+	var shown_dir := library_dir if library_dir != "" else "Sin configurar (por defecto: Documentos/TilesFOSS)"
+	_text(_fit(shown_dir, cw - 80, 24), Vector2(x + 40, 675), 24, Color(0.5, 0.95, 0.75) if library_dir != "" else muted)
+	_text(_fit("Deja tus .osz en \"Por importar\" y pulsa Recargar.", cw - 80, 24), Vector2(x + 40, 720), 24, muted)
+	_text(_fit("Al reinstalar la app, Recargar restaura lo de \"Importadas\".", cw - 80, 24), Vector2(x + 40, 760), 24, muted)
+	_button(Rect2(x + 40, 810, half, 100), "Elegir carpeta", Color(0.14, 0.22, 0.34))
+	_button(Rect2(x + 80 + half, 810, half, 100), "Recargando..." if syncing else "Recargar mapas", accent)
+	_panel(Rect2(x, 1000, cw, 330), panel_col, 34)
+	_text("Exportar canciones", Vector2(x + 40, 1085), 40, Color.WHITE)
+	var n_songs := 0
+	for g in groups:
+		if g.id != "demo":
+			n_songs += 1
+	_text(_fit("Guarda un .osz de cada canción en \"Importadas\" (%d en la biblioteca)." % n_songs, cw - 80, 24), Vector2(x + 40, 1135), 24, muted)
+	_text(_fit("Así no las pierdes si desinstalas la app.", cw - 80, 24), Vector2(x + 40, 1175), 24, muted)
+	_button(Rect2(x + 40, 1200, cw - 80, 100), "Exportando..." if syncing else "Exportar canciones", accent)
+	_text("Los mapas importados antes de los fondos hay que importarlos otra vez para que traigan su imagen.", Vector2(55, 1400), 22, muted)
+	if status_time > 0.0:
+		_text(_fit(status_text, cw, 26), Vector2(55, 1460), 26, Color(1, 0.45, 0.45) if status_error else Color(0.5, 0.95, 0.75))
+	draw_set_transform(Vector2.ZERO)
+
+# --- Música ----------------------------------------------------------------------
+
+## Una tarjeta de canción. kind: song (corazón), remove (quitar de lista), playlist, plain.
+func _draw_card(g: Dictionary, x: float, y: float, w: float, kind: String) -> void:
+	_panel(Rect2(x, y, w, CARD_H), Color(0.97, 0.98, 1), 28)
+	var ink := Color(0.12, 0.22, 0.31)
+	var soft := Color(0.42, 0.52, 0.62)
+	var text_w := w - 190 - 150
+	if kind == "playlist":
+		draw_rect(Rect2(x, y, 190, CARD_H), Color(0.45, 0.4, 0.95))
+		_draw_nav_icon(1, Vector2(x + 95, y + CARD_H / 2.0), 34.0, Color.WHITE)
+		_text(_fit(g.title, text_w, 38), Vector2(x + 215, y + 82), 38, ink)
+		_text(_fit(g.artist, text_w, 27), Vector2(x + 215, y + 132), 27, soft)
+		var cc := Vector2(x + w - 60, y + CARD_H / 2.0)
+		draw_polyline(PackedVector2Array([cc + Vector2(-8, -22), cc + Vector2(12, 0), cc + Vector2(-8, 22)]), Color(0.7, 0.78, 0.88), 7.0)
+		return
+	var first: Dictionary = g.entries[0]
+	var count: int = g.entries.size()
+	var thumb: Texture2D = _group_thumb(g) if show_thumbs else null
+	if thumb != null:
+		_draw_cover(thumb, Rect2(x, y, 190, CARD_H))
+		if count > 1:
+			draw_rect(Rect2(x, y + CARD_H - 46, 190, 46), Color(0, 0, 0, 0.55))
+			_text_centered("%d dif." % count, x + 95, y + CARD_H - 13, 28, Color.WHITE)
+	else:
+		draw_rect(Rect2(x, y, 190, CARD_H), _badge_color(first))
+		if count > 1:
+			_text_centered(first.badge, x + 95, y + CARD_H / 2 - 2, 44, Color.WHITE)
+			_text_centered("%d dif." % count, x + 95, y + CARD_H / 2 + 44, 28, Color(1, 1, 1, 0.9))
+		else:
+			_text_centered(first.badge, x + 95, y + CARD_H / 2 + 15, 44, Color.WHITE)
+	_text(_fit(g.title, text_w, 38), Vector2(x + 215, y + 82), 38, ink)
+	var sub: String = ("%s · %d dificultades" % [g.artist, count]) if count > 1 else ("%s · %s" % [g.artist, first.version])
+	_text(_fit(sub, text_w, 27), Vector2(x + 215, y + 132), 27, soft)
+	if kind == "song":
+		_draw_heart(Vector2(x + w - 66, y + CARD_H / 2 - 8), 36.0, Color(1.0, 0.28, 0.4) if favorites.has(g.id) else Color(0.8, 0.85, 0.91))
+	elif kind == "remove":
+		var c := Vector2(x + w - 66, y + CARD_H / 2.0)
+		draw_line(c + Vector2(-16, -16), c + Vector2(16, 16), Color(0.85, 0.45, 0.5), 8.0)
+		draw_line(c + Vector2(-16, 16), c + Vector2(16, -16), Color(0.85, 0.45, 0.5), 8.0)
+	else:
+		var pc := Vector2(x + w - 62, y + CARD_H / 2.0)
+		draw_colored_polygon(PackedVector2Array([pc + Vector2(-14, -22), pc + Vector2(-14, 22), pc + Vector2(22, 0)]), Color(0.04, 0.65, 0.88))
+
+func _draw_music() -> void:
+	var bg := Color(0.025, 0.05, 0.1)
+	var muted := Color(0.62, 0.75, 0.88)
+	var x := 55.0
+	var w := viewport_size.x - 110.0
+	for i in view_groups.size():
+		var g: Dictionary = view_groups[i]
+		var y := LIST_TOP + i * (CARD_H + CARD_GAP) - scroll_y
+		if y + CARD_H < LIST_TOP - 30.0 or y > viewport_size.y:
+			continue
+		var kind := "song"
+		if g.has("playlist_idx"):
+			kind = "playlist"
+		elif g.get("in_playlist", false):
+			kind = "remove"
+		_draw_card(g, x, y, w, kind)
+	if view_groups.is_empty():
+		var empty_msg := "Sin resultados para \"%s\"" % search_query
+		if search_query.strip_edges() == "":
+			if music_tab == 1:
+				empty_msg = "Aún no tienes favoritas: toca el corazón de una canción."
+			elif music_tab == 2:
+				empty_msg = "Aún no tienes listas: crea una con \"+ Nueva lista\"." if open_playlist < 0 else "Esta lista está vacía: usa \"+ Lista\" al abrir una canción."
+		_text(_fit(empty_msg, w, 30), Vector2(x, LIST_TOP + 70), 30, muted)
+	elif music_tab == 0 and groups.size() == 1 and not search_open:
+		_text("Importa un mapa de osu! (.osz) en la pestaña Archivos.", Vector2(x, LIST_TOP + CARD_H + CARD_GAP + 70.0 - scroll_y), 28, muted)
+	# La cabecera tapa las tarjetas que suben por debajo.
+	draw_rect(Rect2(0, 0, viewport_size.x, LIST_TOP - 22), bg)
+	draw_set_transform(Vector2(0, top_inset))
+	var title := "MÚSICA"
+	if music_tab == 2 and open_playlist >= 0 and open_playlist < playlists.size():
+		title = String(playlists[open_playlist].name)
+	_text(_fit(title, viewport_size.x - 380, 58), Vector2(55, 105), 58, Color.WHITE)
+	var dark := Color(0.14, 0.22, 0.34)
+	if search_open:
+		_button(Rect2(viewport_size.x - 300, 150, 245, 95), "Cerrar", Color(0.17, 0.25, 0.37))
+	else:
+		_button(Rect2(viewport_size.x - 300, 40, 245, 80), "Buscar", dark)
+		_button(Rect2(55, 150, 130, 95), "Todas", Color(0.04, 0.65, 0.88) if music_tab == 0 else dark)
+		_button(Rect2(195, 150, 205, 95), "Favoritas", Color(0.9, 0.25, 0.4) if music_tab == 1 else dark)
+		_button(Rect2(410, 150, 160, 95), "Listas", Color(0.45, 0.4, 0.95) if music_tab == 2 else dark)
+		if music_tab != 2:
+			_button(Rect2(viewport_size.x - 440, 150, 385, 95), "Orden: %s" % SORT_MODES[sort_mode], dark)
+		elif open_playlist < 0:
+			_button(Rect2(viewport_size.x - 440, 150, 385, 95), "+ Nueva lista", Color(0.04, 0.65, 0.88))
+		else:
+			_button(Rect2(viewport_size.x - 440, 150, 385, 95), "¿Seguro?" if delete_armed else "Eliminar lista", Color(0.78, 0.2, 0.3) if delete_armed else dark)
+	draw_set_transform(Vector2.ZERO)
+	if status_time > 0.0:
+		_text(_fit(status_text, viewport_size.x - 110, 26), Vector2(55, 272 + top_inset), 26, Color(1, 0.45, 0.45) if status_error else Color(0.5, 0.95, 0.75))
+
+func _draw_library() -> void:
+	thumb_budget = 2
+	draw_rect(Rect2(Vector2.ZERO, viewport_size), Color(0.025, 0.05, 0.1))
+	if tab == TAB_HOME:
+		_draw_home()
+	elif tab == TAB_FILES:
+		_draw_files()
+	else:
+		_draw_music()
+	_draw_nav()
+	if not open_group.is_empty():
+		_draw_difficulty_picker()
+
 
 ## Construye el chart jugable de un mapa parseado con el nivel de dificultad actual.
 ## Devuelve {} si no queda ninguna nota.
@@ -1257,6 +1988,13 @@ func _load_settings() -> void:
 	if fav_list is Array:
 		for fid in fav_list:
 			favorites[String(fid)] = true
+	sort_mode = clampi(int(cfg.get_value("library", "sort", 0)), 0, SORT_MODES.size() - 1)
+	last_played = {"id": String(cfg.get_value("library", "last_id", "")), "version": String(cfg.get_value("library", "last_version", ""))}
+	var pl = cfg.get_value("library", "playlists", [])
+	if pl is Array:
+		for p in pl:
+			if p is Dictionary and p.has("name") and p.get("refs") is Array:
+				playlists.append({"name": String(p.name), "refs": (p.refs as Array).duplicate()})
 	show_bg = bool(cfg.get_value("display", "show_bg", true))
 	bg_vis = clampf(float(cfg.get_value("display", "bg_vis", 0.30)), 0.1, 0.7)
 	if cfg.has_section("best"):
@@ -1266,6 +2004,7 @@ func _load_settings() -> void:
 				bests[key] = v
 
 func _save_settings() -> void:
+	home_dirty = true
 	var cfg := ConfigFile.new()
 	cfg.set_value("speed", "auto", speed_auto)
 	cfg.set_value("speed", "mult", speed_mult)
@@ -1276,6 +2015,10 @@ func _save_settings() -> void:
 	cfg.set_value("mods", "lives", lives_setting)
 	cfg.set_value("display", "show_thumbs", show_thumbs)
 	cfg.set_value("library", "favorites", favorites.keys())
+	cfg.set_value("library", "sort", sort_mode)
+	cfg.set_value("library", "last_id", String(last_played.get("id", "")))
+	cfg.set_value("library", "last_version", String(last_played.get("version", "")))
+	cfg.set_value("library", "playlists", playlists)
 	cfg.set_value("display", "show_bg", show_bg)
 	cfg.set_value("display", "bg_vis", bg_vis)
 	for key in bests:
@@ -1390,6 +2133,8 @@ func _draw() -> void:
 	elif screen == Screen.SETTINGS: _draw_settings()
 	else: _draw_results()
 	draw_set_transform(Vector2.ZERO)
+	if overlay != "" and (screen == Screen.LIBRARY or screen == Screen.PREPARE):
+		_draw_overlay()
 
 func _draw_game() -> void:
 	var lane_w := viewport_size.x / LANES
@@ -1517,63 +2262,6 @@ func _draw_hold_marks(rect: Rect2, active: bool) -> void:
 		draw_circle(head, 30.0, Color(0.0, 0.95, 1.0, 0.22))
 	draw_arc(head, 30.0, 0, TAU, 40, color, width)
 
-func _draw_library() -> void:
-	thumb_budget = 1
-	var bg := Color(0.025, 0.05, 0.1)
-	draw_rect(Rect2(Vector2.ZERO, viewport_size), bg)
-	var x := 55.0
-	var w := viewport_size.x - 110.0
-	for i in view_groups.size():
-		var g: Dictionary = view_groups[i]
-		var first: Dictionary = g.entries[0]
-		var count: int = g.entries.size()
-		var y := LIST_TOP + i * (CARD_H + CARD_GAP) - scroll_y
-		if y + CARD_H < 0.0 or y > viewport_size.y: continue
-		_panel(Rect2(x, y, w, CARD_H), Color(0.97, 0.98, 1), 28)
-		var thumb: Texture2D = _group_thumb(g) if show_thumbs else null
-		if thumb != null:
-			_draw_cover(thumb, Rect2(x, y, 190, CARD_H))
-			if count > 1:
-				draw_rect(Rect2(x, y + CARD_H - 46, 190, 46), Color(0, 0, 0, 0.55))
-				_text_centered("%d dif." % count, x + 95, y + CARD_H - 13, 28, Color.WHITE)
-		else:
-			draw_rect(Rect2(x, y, 190, CARD_H), _badge_color(first))
-			if count > 1:
-				_text_centered(first.badge, x + 95, y + CARD_H / 2 - 2, 44, Color.WHITE)
-				_text_centered("%d dif." % count, x + 95, y + CARD_H / 2 + 44, 28, Color(1, 1, 1, 0.9))
-			else:
-				_text_centered(first.badge, x + 95, y + CARD_H / 2 + 15, 44, Color.WHITE)
-		var text_w := w - 190 - 150
-		_text(_fit(g.title, text_w, 38), Vector2(x + 215, y + 82), 38, Color(0.12, 0.22, 0.31))
-		var sub: String = ("%s · %d dificultades" % [g.artist, count]) if count > 1 else ("%s · %s" % [g.artist, first.version])
-		_text(_fit(sub, text_w, 27), Vector2(x + 215, y + 132), 27, Color(0.42, 0.52, 0.62))
-		_draw_heart(Vector2(x + w - 66, y + CARD_H / 2 - 8), 36.0, Color(1.0, 0.28, 0.4) if favorites.has(g.id) else Color(0.8, 0.85, 0.91))
-	if view_groups.is_empty():
-		var empty_msg := "Sin resultados para \"%s\"" % search_query
-		if search_query.strip_edges() == "" and fav_only:
-			empty_msg = "Aún no tienes favoritas: toca el corazón de una canción."
-		_text(_fit(empty_msg, w, 30), Vector2(x, LIST_TOP + 70), 30, Color(0.62, 0.75, 0.88))
-	elif groups.size() == 1 and not search_open:
-		var hint_y := LIST_TOP + CARD_H + CARD_GAP + 70.0 - scroll_y
-		_text("Importa un mapa de osu! (.osz) con el botón de arriba.", Vector2(x, hint_y), 28, Color(0.62, 0.75, 0.88))
-	# La cabecera tapa las tarjetas que suben por debajo.
-	draw_rect(Rect2(0, 0, viewport_size.x, LIST_TOP - 22), bg)
-	draw_set_transform(Vector2(0, top_inset))
-	_text("TILES FOSS", Vector2(55, 105), 58, Color.WHITE)
-	if search_open:
-		_button(Rect2(viewport_size.x - 300, 150, 245, 95), "Cerrar", Color(0.17, 0.25, 0.37))
-	else:
-		_button(Rect2(viewport_size.x - 300, 40, 245, 80), "Ajustes", Color(0.14, 0.22, 0.34))
-		_button(Rect2(55, 150, 130, 95), "Todas", Color(0.04, 0.65, 0.88) if not fav_only else Color(0.14, 0.22, 0.34))
-		_button(Rect2(195, 150, 205, 95), "Favoritas", Color(0.9, 0.25, 0.4) if fav_only else Color(0.14, 0.22, 0.34))
-		_button(Rect2(viewport_size.x - 645, 150, 220, 95), "Buscar", Color(0.14, 0.22, 0.34))
-		_button(Rect2(viewport_size.x - 405, 150, 350, 95), "Importar .osz", Color(0.04, 0.65, 0.88))
-	draw_set_transform(Vector2.ZERO)
-	if not open_group.is_empty():
-		_draw_difficulty_picker()
-	if status_time > 0.0:
-		_text(_fit(status_text, viewport_size.x - 110, 26), Vector2(55, 272 + top_inset), 26, Color(1, 0.45, 0.45) if status_error else Color(0.5, 0.95, 0.75))
-
 func _draw_difficulty_picker() -> void:
 	draw_rect(Rect2(Vector2.ZERO, viewport_size), Color(0, 0, 0, 0.62))
 	var layout := _picker_layout()
@@ -1621,6 +2309,7 @@ func _draw_prepare() -> void:
 	if audio_stream == null:
 		prev_col = Color(0.14, 0.22, 0.34, 0.4)
 	_button(Rect2(w - 365, 45, 330, 95), "Detener" if previewing else "Escuchar", prev_col)
+	_button(Rect2(235, 45, w - 620, 95), "+ A lista", Color(0.45, 0.4, 0.95))
 	var text_w := w - 160
 	_text(_fit(current_song.title, text_w, 58), Vector2(80,370), 58, Color.WHITE)
 	_text(_fit("%s · %s" % [current_song.artist, current_song.version], text_w, 32), Vector2(82,445), 32, Color(0.68,0.84,0.96))
@@ -1703,8 +2392,7 @@ func _draw_settings() -> void:
 	_background(); draw_set_transform(Vector2(0, ui_off))
 	var w := viewport_size.x
 	var muted := Color(0.62, 0.75, 0.88)
-	_button(Rect2(35, 45, 180, 95), "< Volver", Color(0.14, 0.22, 0.34))
-	_text_centered("AJUSTES", w / 2, 230, 58, Color.WHITE)
+	_text("AJUSTES", Vector2(55, 105 + top_inset), 58, Color.WHITE)
 	_panel(Rect2(80, 330, w - 160, 180), Color(0.08, 0.13, 0.22, 0.92), 34)
 	_text("Fondos de los mapas", Vector2(130, 415), 40, Color.WHITE)
 	_text("Imagen del mapa detrás de las teclas", Vector2(130, 465), 26, muted)
@@ -1719,18 +2407,11 @@ func _draw_settings() -> void:
 	_text("Miniaturas de canciones", Vector2(130, 955), 40, Color.WHITE)
 	_text("Imagen del mapa en cada canción de la lista", Vector2(130, 1005), 26, muted)
 	_button(Rect2(w - 330, 915, 200, 90), "SÍ" if show_thumbs else "NO", Color(0.02, 0.68, 0.88) if show_thumbs else Color(0.22, 0.28, 0.38))
-	_panel(Rect2(80, 1090, w - 160, 330), Color(0.08, 0.13, 0.22, 0.92), 34)
-	_text("Carpeta de canciones", Vector2(130, 1165), 40, Color.WHITE)
-	var shown_dir := library_dir if library_dir != "" else "Sin configurar (por defecto: Documentos/TilesFOSS)"
-	_text(_fit(shown_dir, w - 260, 24), Vector2(130, 1210), 24, Color(0.5, 0.95, 0.75) if library_dir != "" else muted)
-	_text(_fit("Respalda tus mapas para recuperarlos al reinstalar.", w - 260, 24), Vector2(130, 1250), 24, muted)
-	var half := (w - 300.0) / 2.0
-	_button(Rect2(130, 1300, half, 100), "Elegir carpeta", Color(0.14, 0.22, 0.34))
-	_button(Rect2(130 + half + 40, 1300, half, 100), "Recargando..." if syncing else "Recargar mapas", Color(0.02, 0.68, 0.88))
-	_text("Los mapas importados antes de los fondos", Vector2(80, 1480), 26, muted)
-	_text("hay que importarlos otra vez para que traigan su imagen.", Vector2(80, 1520), 26, muted)
+	_text("Las carpetas de canciones, importar y exportar", Vector2(80, 1130), 26, muted)
+	_text("están ahora en la pestaña Archivos.", Vector2(80, 1170), 26, muted)
 	if status_time > 0.0:
-		_text(_fit(status_text, w - 160, 26), Vector2(80, 1600), 26, Color(1, 0.45, 0.45) if status_error else Color(0.5, 0.95, 0.75))
+		_text(_fit(status_text, w - 160, 26), Vector2(80, 1240), 26, Color(1, 0.45, 0.45) if status_error else Color(0.5, 0.95, 0.75))
+	_draw_nav()
 
 func _draw_results_infinite() -> void:
 	_background(); draw_set_transform(Vector2(0, ui_off)); _text_centered("MODO INFINITO", viewport_size.x / 2, 230, 58, Color.WHITE)

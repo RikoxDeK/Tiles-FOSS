@@ -263,7 +263,8 @@ static func safe_name(file_name: String) -> String:
 
 ## Extrae un .osz a user://songs/<id>/ (solo los .osu compatibles y su audio).
 ## Devuelve {"ok", "error", "title", "count"}.
-static func import_osz(path: String) -> Dictionary:
+## forced_id: conserva el id de una copia exportada para que no cambien los récords.
+static func import_osz(path: String, forced_id := "") -> Dictionary:
 	var zr := ZIPReader.new()
 	if zr.open(path) != OK:
 		return {"ok": false, "error": "No se pudo abrir el archivo .osz"}
@@ -288,7 +289,7 @@ static func import_osz(path: String) -> Dictionary:
 		zr.close()
 		return {"ok": false, "error": "No hay mapas compatibles (osu!mania u osu!standard)"}
 
-	var id := FileAccess.get_md5(path).substr(0, 10)
+	var id := forced_id if forced_id != "" else FileAccess.get_md5(path).substr(0, 10)
 	if id.is_empty():
 		id = str(hash(path))
 	var dir := SONGS_DIR.path_join(id)
