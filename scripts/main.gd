@@ -80,6 +80,7 @@ var diff_level := 1          # índice en DIFFICULTY_LEVELS (1 = Normal)
 var current_parsed: Dictionary = {}   # mapa .osu parseado de la canción abierta
 var library_dir := ""        # carpeta de canciones elegida ("" = sin configurar)
 var syncing := false
+var bg_blend := 0.0       # 0 = fondo azul normal, 1 = fondo de las 3 estrellas
 var perm_asked := false   # ya pedimos el permiso de archivos en esta sesión
 var folder_dialog: FileDialog
 var infinite_mode := false   # ajuste: modo Infinito (usa las vidas)
@@ -234,6 +235,8 @@ func _process(delta: float) -> void:
 		combo_pop -= delta
 	if banner_time > 0.0:
 		banner_time -= delta
+	var bg_target := 1.0 if infinite_run and (stars >= 3 or crowns > 0) else 0.0
+	bg_blend = move_toward(bg_blend, bg_target, delta * 0.8)
 	if lap_banner_time > 0.0:
 		lap_banner_time -= delta
 	if life_menu_lock > 0.0:
@@ -534,7 +537,7 @@ func _start_game() -> void:
 	screen = Screen.GAME
 	infinite_run = infinite_mode and lives_mode
 	lap = 1; lap_factor = 1.0; award_idx = 0; stars = 0; crowns = 0
-	banner_time = 0.0; lap_banner_time = 0.0
+	banner_time = 0.0; lap_banner_time = 0.0; bg_blend = 0.0
 	speed = BASE_SPEED * _effective_mult() * lap_factor
 	ahead = hit_y / speed + 0.15
 	# Que la primera nota entre desde arriba justo al empezar.
@@ -1341,10 +1344,13 @@ func _draw() -> void:
 
 func _draw_game() -> void:
 	var lane_w := viewport_size.x / LANES
-	draw_rect(Rect2(Vector2.ZERO, viewport_size), Color(0.74, 0.88, 0.98))
+	# Fondo base: azul claro; con las 3 estrellas pasa a un verde menta suave (y se queda en las coronas).
+	var base_col := Color(0.74, 0.88, 0.98).lerp(Color(0.78, 0.92, 0.82), bg_blend)
+	draw_rect(Rect2(Vector2.ZERO, viewport_size), base_col)
 	if show_bg and bg_texture != null:
 		_draw_cover(bg_texture, Rect2(Vector2.ZERO, viewport_size))
-		draw_rect(Rect2(Vector2.ZERO, viewport_size), Color(0.74, 0.88, 0.98, 1.0 - bg_vis))
+		base_col.a = 1.0 - bg_vis   # misma capa de transparencia que ya tenía, con el color nuevo
+		draw_rect(Rect2(Vector2.ZERO, viewport_size), base_col)
 	for lane in LANES:
 		draw_rect(Rect2(lane * lane_w, 0, lane_w, viewport_size.y), Color(0.9,0.96,1,0.20))
 		draw_line(Vector2(lane * lane_w,0), Vector2(lane * lane_w,viewport_size.y), Color.WHITE, 3)
@@ -1412,10 +1418,12 @@ func _draw_game() -> void:
 		for i in crowns:
 			_draw_award("crown", Vector2(68 + i * 38, 232 + top_inset), 14.0, true)
 		if banner_time > 0.0:
-			var bt := clampf(banner_time / 0.5, 0.0, 1.0)
-			var gold := Color(1.0, 0.8, 0.2, bt)
-			_draw_award(banner_kind, Vector2(viewport_size.x / 2, 640 + top_inset), 60.0 * (1.0 + 0.2 * clampf(banner_time - 1.5, 0.0, 0.3) / 0.3), true)
-			_text_outlined(banner_text, viewport_size.x / 2, 780 + top_inset, 60, gold, Color(0.02, 0.05, 0.12, 0.95 * bt), 12)
+			# Solo los iconos: tantas estrellas/coronas como lleves (1, 2 o 3), sin texto.
+			var n_icons := stars if banner_kind == "star" else crowns
+			var pop := 60.0 * (1.0 + 0.2 * clampf(banner_time - 1.5, 0.0, 0.3) / 0.3)
+			for i in n_icons:
+				var ix := viewport_size.x / 2.0 + (i - (n_icons - 1) / 2.0) * 150.0
+				_draw_award(banner_kind, Vector2(ix, 640 + top_inset), pop, true)
 		if lap_banner_time > 0.0:
 			var lt := clampf(lap_banner_time / 0.5, 0.0, 1.0)
 			_text_outlined(lap_banner_text, viewport_size.x / 2, 960 + top_inset, 72, Color(0.75, 0.6, 1.0, lt), Color(0.02, 0.05, 0.12, 0.95 * lt), 14)
