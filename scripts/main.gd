@@ -14,6 +14,10 @@ const START_TIME := -100.0
 const LIST_TOP := 320.0
 const RANKS := ["D", "C", "B", "A", "S", "SS"]
 const RANK_COLORS := [Color(0.55, 0.6, 0.68), Color(0.35, 0.75, 0.55), Color(0.2, 0.7, 0.95), Color(0.55, 0.5, 1.0), Color(1.0, 0.75, 0.2), Color(1.0, 0.45, 0.75)]
+## Cuánto de la aceleración de cada vuelta se nota en la caída de las notas (0 = nada, 1 = todo).
+## Con 0.5, en la vuelta 2 (x1.5) las notas caen ~22 % más rápido y el resto de la aceleración
+## se nota en el ritmo de la canción, para que no se vuelvan ilegibles.
+const LAP_FALL_EXP := 0.5
 const PERFECT_WINDOW := 0.12
 const GREAT_WINDOW := 0.20
 ## Niveles de dificultad de notas: cuánto se filtra al adaptar el mapa a dos dedos.
@@ -120,8 +124,8 @@ var first_note_time := 0.0
 var speed := BASE_SPEED
 var hit_y := 1580.0         # se recalcula en _resize según el alto real de la pantalla
 var ahead := 1580.0 / BASE_SPEED + 0.15   # segundos de notas visibles por delante
-var speed_auto := true      # true: usa el multiplicador sugerido para el mapa
-var speed_mult := 1.0       # multiplicador manual (se guarda en disco)
+var speed_auto := false     # true: usa el multiplicador sugerido para el mapa
+var speed_mult := 3.0       # multiplicador manual (se guarda en disco)
 var auto_mult := 1.0        # multiplicador sugerido para la canción elegida
 var first_idx := 0          # primera nota que aún no se resolvió (notas ordenadas por tiempo)
 
@@ -361,7 +365,7 @@ func _next_lap() -> void:
 	lap_banner_time = 2.4
 	play_rate = lap_factor   # la canción suena y avanza más rápido
 	player.pitch_scale = play_rate
-	speed = BASE_SPEED * _effective_mult()
+	speed = BASE_SPEED * _effective_mult() * pow(play_rate, LAP_FALL_EXP - 1.0)
 	_store_infinite_best()
 	ahead = hit_y / speed + 0.15
 	lead_in = maxf(0.0, hit_y / speed + 0.05 - first_note_time) if use_lead_in else 0.0
@@ -1239,8 +1243,8 @@ func _load_settings() -> void:
 	var cfg := ConfigFile.new()
 	if cfg.load(SETTINGS_PATH) != OK:
 		return
-	speed_auto = cfg.get_value("speed", "auto", true)
-	speed_mult = clampf(float(cfg.get_value("speed", "mult", 1.0)), SPEED_MIN, SPEED_MAX)
+	speed_auto = cfg.get_value("speed", "auto", false)
+	speed_mult = clampf(float(cfg.get_value("speed", "mult", 3.0)), SPEED_MIN, SPEED_MAX)
 	lives_mode = bool(cfg.get_value("mods", "lives_mode", false))
 	infinite_mode = bool(cfg.get_value("mods", "infinite", false))
 	diff_level = clampi(int(cfg.get_value("mods", "diff", 1)), 0, DIFFICULTY_LEVELS.size() - 1)
