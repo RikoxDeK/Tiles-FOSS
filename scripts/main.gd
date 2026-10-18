@@ -490,8 +490,8 @@ func _continue_after_life() -> void:
 			n.holding = false
 			n.done = true
 	active_inputs.clear()
-	# La siguiente tecla pendiente se muestra abajo como "Continuar": al tocarla se
-	# cuenta como esa nota y la canción sigue desde ahí (como la tecla Comenzar).
+	# La siguiente nota pendiente se marca como "Continuar": al tocarla se cuenta como
+	# esa nota y la canción sigue desde ahí.
 	resume_idx = -1
 	for i in range(first_idx, notes.size()):
 		if not notes[i].done and notes[i].type != "start":
@@ -501,6 +501,9 @@ func _continue_after_life() -> void:
 		grace_time = GRACE_AFTER_CONTINUE
 		_set_paused(false)
 	else:
+		# La escena queda congelada tal como se verá al seguir: la nota a retomar y las
+		# que vienen detrás se ven en su sitio, así puedes colocar los dedos antes de tocar.
+		song_time = float(notes[resume_idx].time) - RESUME_BACKOFF
 		resume_pending = true   # sigue pausado hasta que se toque esa tecla
 
 func _resume_with(lane: int, input_id: int) -> void:
@@ -508,7 +511,6 @@ func _resume_with(lane: int, input_id: int) -> void:
 		return
 	var n: Dictionary = notes[resume_idx]
 	resume_pending = false; resume_idx = -1
-	song_time = float(n.time) - RESUME_BACKOFF
 	if n.type == "hold":
 		n.holding = true; n.input_id = input_id
 	else:
@@ -907,7 +909,7 @@ func _draw_game() -> void:
 	for lane in LANES:
 		draw_rect(Rect2(lane * lane_w, 0, lane_w, viewport_size.y), Color(0.9,0.96,1,0.20))
 		draw_line(Vector2(lane * lane_w,0), Vector2(lane * lane_w,viewport_size.y), Color.WHITE, 3)
-	for i in range(first_idx, first_idx if resume_pending else notes.size()):
+	for i in range(first_idx, notes.size()):
 		var note: Dictionary = notes[i]
 		if note.type != "start" and note.time - song_time > ahead: break
 		if note.done or (note.type == "start" and started): continue
@@ -927,6 +929,9 @@ func _draw_game() -> void:
 			_draw_hold_marks(rect, note.holding)
 		else:
 			draw_rect(rect, Color(0.01,0.01,0.015))
+		if resume_pending and i == resume_idx:
+			draw_rect(rect, Color.WHITE, false, 6.0)
+			_text("Continuar", Vector2(rect.position.x + 18, rect.get_center().y + 12), 35, Color.WHITE)
 		if note.type == "start": _text("Comenzar", Vector2(rect.position.x+18,rect.get_center().y+12), 35, Color.WHITE)
 	for effect in effects:
 		var progress: float = 1.0 - float(effect.time) / float(effect.duration)
@@ -954,11 +959,6 @@ func _draw_game() -> void:
 		_draw_lives_bars(55, 60 + top_inset, 64, 16, 12)
 	elif run_lives > LIVES_MIN:
 		_text_outlined(str(lives_left), 90, 105 + top_inset, 60, Color(1.0, 0.3, 0.4), Color(0.04, 0.16, 0.32, 0.95), 10)
-	if resume_pending:
-		var rn: Dictionary = notes[resume_idx]
-		var rrect := Rect2(rn.lane * (viewport_size.x / LANES) + 2, viewport_size.y - NORMAL_HEIGHT, viewport_size.x / LANES - 4, NORMAL_HEIGHT)
-		draw_rect(rrect, Color(0.01, 0.01, 0.015))
-		_text("Continuar", Vector2(rrect.position.x + 18, rrect.get_center().y + 12), 35, Color.WHITE)
 	if failed and finished:
 		draw_rect(Rect2(Vector2.ZERO, viewport_size), Color(0, 0, 0, 0.6))
 		_text_outlined(fail_text, viewport_size.x / 2, viewport_size.y / 2, 90, Color(1.0, 0.3, 0.35), Color(0.02, 0.05, 0.12, 0.95), 14)
