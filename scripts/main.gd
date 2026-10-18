@@ -14,10 +14,11 @@ const START_TIME := -100.0
 const LIST_TOP := 320.0
 const RANKS := ["D", "C", "B", "A", "S", "SS"]
 const RANK_COLORS := [Color(0.55, 0.6, 0.68), Color(0.35, 0.75, 0.55), Color(0.2, 0.7, 0.95), Color(0.55, 0.5, 1.0), Color(1.0, 0.75, 0.2), Color(1.0, 0.45, 0.75)]
-## Cuánto de la aceleración de cada vuelta se nota en la caída de las notas (0 = nada, 1 = todo).
-## Con 0.5, en la vuelta 2 (x1.5) las notas caen ~22 % más rápido y el resto de la aceleración
-## se nota en el ritmo de la canción, para que no se vuelvan ilegibles.
-const LAP_FALL_EXP := 0.5
+## Cuánto sube la velocidad de la CANCIÓN (audio y ritmo) en cada vuelta del Infinito.
+## 0.0 = la canción siempre suena igual (solo caen más rápido las notas), 0.1 = x1.1, x1.2...
+## La caída de las notas sigue la escala x1.0, x1.5, x2.0... de siempre: al subir la canción,
+## las notas se separan menos, así que esta cifra es la que las "aglomera" más o menos.
+const LAP_SONG_STEP := 0.1
 const PERFECT_WINDOW := 0.12
 const GREAT_WINDOW := 0.20
 ## Niveles de dificultad de notas: cuánto se filtra al adaptar el mapa a dos dedos.
@@ -363,9 +364,10 @@ func _next_lap() -> void:
 	lap_factor = 1.0 + 0.5 * float(lap - 1)
 	lap_banner_text = "VUELTA %d · x%.1f" % [lap, lap_factor]
 	lap_banner_time = 2.4
-	play_rate = lap_factor   # la canción suena y avanza más rápido
+	play_rate = 1.0 + LAP_SONG_STEP * float(lap - 1)   # la canción suena un poco más rápido
 	player.pitch_scale = play_rate
-	speed = BASE_SPEED * _effective_mult() * pow(play_rate, LAP_FALL_EXP - 1.0)
+	# Velocidad real de caída = BASE * mult * lap_factor (como antes); aquí va por segundo de canción.
+	speed = BASE_SPEED * _effective_mult() * lap_factor / play_rate
 	_store_infinite_best()
 	ahead = hit_y / speed + 0.15
 	lead_in = maxf(0.0, hit_y / speed + 0.05 - first_note_time) if use_lead_in else 0.0
@@ -1653,7 +1655,7 @@ func _draw_prepare() -> void:
 		var pen_col := Color(0.5, 0.95, 0.75) if lives_setting == LIVES_MIN else Color(1.0, 0.75, 0.4)
 		if infinite_mode:
 			_text_centered("3 estrellas en la vuelta 1 y 3 coronas en las vueltas 2 y 3", cx, 1470, 24, Color(1.0, 0.82, 0.3))
-			_text_centered("Cada vuelta acelera la canción: x1.0, x1.5, x2.0, x2.5...", cx, 1500, 24, Color(1.0, 0.82, 0.3))
+			_text_centered("Cada vuelta acelera notas y canción: x1.0, x1.5, x2.0...", cx, 1500, 24, Color(1.0, 0.82, 0.3))
 			_text_centered(pen_text, cx, 1532, 26, pen_col)
 			_text_centered("Puedes fallar %d veces y seguir; el siguiente fallo termina." % lives_setting, cx, 1560, 22, muted)
 		else:
