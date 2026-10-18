@@ -165,7 +165,7 @@ static func _slider_duration(r: Dictionary, t_ms: float, length: float, slides: 
 
 ## Convierte los objetos parseados en notas jugables, ordenadas por tiempo.
 ## Descarta lo que no cabe en 4 carriles / max_fingers dedos.
-static func build_chart(parsed: Dictionary, max_fingers := DEFAULT_MAX_FINGERS) -> Array:
+static func build_chart(parsed: Dictionary, max_fingers := DEFAULT_MAX_FINGERS, event_gap := MIN_EVENT_GAP, lane_gap := MIN_LANE_GAP) -> Array:
 	var objs: Array = parsed.objects.duplicate(true)
 	objs.sort_custom(func(a, b): return a.time < b.time)
 
@@ -177,10 +177,10 @@ static func build_chart(parsed: Dictionary, max_fingers := DEFAULT_MAX_FINGERS) 
 		if o.end - o.time < MIN_HOLD:
 			o.end = o.time
 		var lane: int = o.lane
-		if o.time - busy_until[lane] < MIN_LANE_GAP:
+		if o.time - busy_until[lane] < lane_gap:
 			continue
 		var in_chord: bool = o.time - event_time <= CHORD_WINDOW
-		if not in_chord and o.time - event_time < MIN_EVENT_GAP:
+		if not in_chord and o.time - event_time < event_gap:
 			continue
 		# Dedos ocupados: holds en curso + notas del mismo grupo.
 		var group_start: float = event_time if in_chord else o.time
@@ -189,10 +189,10 @@ static func build_chart(parsed: Dictionary, max_fingers := DEFAULT_MAX_FINGERS) 
 			continue
 		# Reglas de comodidad: reubica la nota a un carril válido; si es sostenida
 		# y no hay sitio, la baja a nota normal; si aun así no cabe, se descarta.
-		var placed := _find_lane(o, live, busy_until)
+		var placed := _find_lane(o, live, busy_until, lane_gap)
 		if placed < 0 and o.end > o.time:
 			o.end = o.time
-			placed = _find_lane(o, live, busy_until)
+			placed = _find_lane(o, live, busy_until, lane_gap)
 		if placed < 0:
 			continue
 		lane = placed
@@ -229,7 +229,7 @@ static func _pair_ok(lane_a: int, hold_a: bool, lane_b: int, hold_b: bool) -> bo
 
 ## Carril válido para la nota o (el suyo, o el más cercano que cumpla las
 ## reglas contra las notas que ya ocupan dedos). -1 si no hay ninguno.
-static func _find_lane(o: Dictionary, live: Array, busy_until: Array) -> int:
+static func _find_lane(o: Dictionary, live: Array, busy_until: Array, lane_gap := MIN_LANE_GAP) -> int:
 	var is_hold: bool = o.end > o.time
 	var order: Array = [o.lane]
 	for d in range(1, LANES):
@@ -238,7 +238,7 @@ static func _find_lane(o: Dictionary, live: Array, busy_until: Array) -> int:
 		if o.lane + d < LANES:
 			order.append(o.lane + d)
 	for candidate in order:
-		if o.time - busy_until[candidate] < MIN_LANE_GAP:
+		if o.time - busy_until[candidate] < lane_gap:
 			continue
 		var ok := true
 		for p in live:
@@ -403,7 +403,7 @@ static func load_audio(path: String) -> AudioStream:
 
 ## Multiplicador de velocidad sugerido (1.0 = BASE_SPEED) para que las filas de
 ## notas no se amontonen: usa el 10% de separaciones más pequeñas entre grupos.
-static func suggest_speed(chart: Array) -> float:
+static func suggest_speed(chart: Array, event_gap := MIN_EVENT_GAP) -> float:
 	var gaps: Array = []
 	var last := -100.0
 	for n in chart:
@@ -415,5 +415,5 @@ static func suggest_speed(chart: Array) -> float:
 		return AUTO_SPEED_MIN
 	gaps.sort()
 	var p10: float = gaps[int(gaps.size() * 0.1)]
-	var mult: float = TARGET_ROW_PX / (maxf(p10, MIN_EVENT_GAP) * BASE_SPEED)
+	var mult: float = TARGET_ROW_PX / (maxf(p10, event_gap) * BASE_SPEED)
 	return snappedf(clampf(mult, AUTO_SPEED_MIN, AUTO_SPEED_MAX), 0.1)

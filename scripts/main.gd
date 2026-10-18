@@ -16,6 +16,18 @@ const RANKS := ["D", "C", "B", "A", "S", "SS"]
 const RANK_COLORS := [Color(0.55, 0.6, 0.68), Color(0.35, 0.75, 0.55), Color(0.2, 0.7, 0.95), Color(0.55, 0.5, 1.0), Color(1.0, 0.75, 0.2), Color(1.0, 0.45, 0.75)]
 const PERFECT_WINDOW := 0.12
 const GREAT_WINDOW := 0.20
+## Niveles de dificultad de notas: cuánto se filtra al adaptar el mapa a dos dedos.
+## "event" = segundos mínimos entre grupos de notas; "lane" = entre notas del mismo carril.
+## Siempre se mantiene el límite de dos dedos y las reglas de comodidad.
+const DIFFICULTY_LEVELS := [
+	{"name": "Relajado", "event": 0.20, "lane": 0.14, "color": Color(0.5, 0.95, 0.75)},
+	{"name": "Normal", "event": 0.16, "lane": 0.12, "color": Color(1, 1, 1)},
+	{"name": "Intenso", "event": 0.125, "lane": 0.10, "color": Color(1.0, 0.75, 0.4)},
+	{"name": "Extremo", "event": 0.10, "lane": 0.085, "color": Color(1.0, 0.45, 0.45)},
+	{"name": "Máximo", "event": 0.08, "lane": 0.07, "color": Color(1.0, 0.5, 0.85)},
+]
+const INBOX_NAME := "Por importar"
+const BACKUP_NAME := "Importadas"
 const LIVES_MIN := 3
 const LIVES_MAX := 10
 const RESUME_BACKOFF := 0.10    # al continuar, la canción retoma este tiempo antes de la tecla
@@ -64,6 +76,23 @@ var grace_time := 0.0        # tras continuar, un segundo sin perder vidas
 var failed := false
 var fail_text := ""
 var run_mult := 1.0
+var diff_level := 1          # índice en DIFFICULTY_LEVELS (1 = Normal)
+var current_parsed: Dictionary = {}   # mapa .osu parseado de la canción abierta
+var library_dir := ""        # carpeta de canciones elegida ("" = sin configurar)
+var syncing := false
+var folder_dialog: FileDialog
+var infinite_mode := false   # ajuste: modo Infinito (usa las vidas)
+var infinite_run := false    # esta partida es infinita
+var lap := 1
+var lap_factor := 1.0
+var award_idx := 0
+var stars := 0
+var crowns := 0
+var banner_text := ""
+var banner_kind := ""
+var banner_time := 0.0
+var lap_banner_text := ""
+var lap_banner_time := 0.0
 var combo_pop := 0.0
 var show_bg := true          # ajuste: mostrar la imagen de fondo del mapa
 var bg_vis := 0.30           # ajuste: cuánto se ve la imagen (0.1 - 0.7)
@@ -141,6 +170,12 @@ func _ready() -> void:
 	file_dialog.filters = PackedStringArray(["*.osz ; Beatmaps de osu!"])
 	file_dialog.file_selected.connect(_import_osz)
 	add_child(file_dialog)
+	folder_dialog = FileDialog.new()
+	folder_dialog.file_mode = FileDialog.FILE_MODE_OPEN_DIR
+	folder_dialog.access = FileDialog.ACCESS_FILESYSTEM
+	folder_dialog.use_native_dialog = true
+	folder_dialog.dir_selected.connect(_set_library_dir)
+	add_child(folder_dialog)
 	get_window().files_dropped.connect(_on_files_dropped)
 	_setup_search()
 	_load_settings()
@@ -196,6 +231,10 @@ func _process(delta: float) -> void:
 		judgement_time -= delta
 	if combo_pop > 0.0:
 		combo_pop -= delta
+	if banner_time > 0.0:
+		banner_time -= delta
+	if lap_banner_time > 0.0:
+		lap_banner_time -= delta
 	if life_menu_lock > 0.0:
 		life_menu_lock -= delta
 	if grace_time > 0.0 and not paused:
@@ -252,6 +291,10 @@ func _update_notes() -> void:
 			_miss(note.lane, miss_position)
 	while first_idx < notes.size() and notes[first_idx].done and not _ghost_visible(notes[first_idx]):
 		first_idx += 1
+	_check_awards(false)
+	if song_time > chart_end and not finished and infinite_run:
+		_next_lap()
+		return
 	if song_time > chart_end and not finished:
 		finished = true
 		await get_tree().create_timer(0.7).timeout
@@ -263,6 +306,95 @@ func _update_notes() -> void:
 ## Soltar una larga antes de tiempo NO cuesta vida: Great si la sostuviste al menos la mitad
 ## (el combo sigue), Good si la soltaste muy pronto (se rompe el combo). Lo que queda de la
 ## larga se queda atrás, apagada y sin poder tocarse.
+# --- Modo Infinito -------------------------------------------------------
+# Vuelta 1 (x1.0): 3 estrellas, a 1/3, 2/3 y al final. Vuelta 2 (x1.5): 2 coronas, a la
+# mitad y al final. Vuelta 3 (x2.0): la 3ª corona al terminar. Luego +0.5x por vuelta.
+
+func _lap_awards(n: int) -> Array:
+	match n:
+		1: return [[1.0 / 3.0, "star"], [2.0 / 3.0, "star"], [1.0, "star"]]
+		2: return [[0.5, "crown"], [1.0, "crown"]]
+		3: return [[1.0, "crown"]]
+	return []
+
+func _check_awards(final: bool) -> void:
+	if not infinite_run:
+		return
+	var frac := clampf(song_time / maxf(0.1, chart_end), 0.0, 1.0)
+	var list := _lap_awards(lap)
+	while award_idx < list.size():
+		var at: float = list[award_idx][0]
+		if at < 0.999:
+			if frac < at: break
+		elif not final:
+			break
+		_grant_award(String(list[award_idx][1]))
+		award_idx += 1
+
+func _grant_award(kind: String) -> void:
+	score += 500
+	if kind == "star":
+		stars += 1
+		banner_text = "ESTRELLA %d/3" % stars
+	else:
+		crowns += 1
+		banner_text = "CORONA %d/3" % crowns
+	banner_kind = kind
+	banner_time = 1.8
+
+func _next_lap() -> void:
+	_check_awards(true)
+	lap += 1
+	lap_factor = 1.0 + 0.5 * float(lap - 1)
+	lap_banner_text = "VUELTA %d · x%.1f" % [lap, lap_factor]
+	lap_banner_time = 2.4
+	speed = BASE_SPEED * _effective_mult() * lap_factor
+	ahead = hit_y / speed + 0.15
+	lead_in = maxf(0.0, hit_y / speed + 0.05 - first_note_time) if use_lead_in else 0.0
+	for n in notes:
+		if n.type == "start":
+			continue
+		n.done = false; n.holding = false; n.released = false; n.input_id = -999
+	_assign_tap_heights()
+	first_idx = 0
+	active_inputs.clear()
+	player.stop(); audio_started = false
+	song_time = -(lead_in + 0.6)
+	award_idx = 0
+
+func _finish_infinite() -> void:
+	var key := _song_key(current_song) + "|inf"
+	var old: Dictionary = bests.get(key, {})
+	run_record = stars > int(old.get("stars", 0)) or crowns > int(old.get("crowns", 0)) or lap > int(old.get("laps", 0))
+	bests[key] = {
+		"stars": maxi(stars, int(old.get("stars", 0))),
+		"crowns": maxi(crowns, int(old.get("crowns", 0))),
+		"laps": maxi(lap, int(old.get("laps", 0))),
+		"score": maxi(score, int(old.get("score", 0))),
+	}
+	_save_settings()
+
+func _star_poly(c: Vector2, r: float) -> PackedVector2Array:
+	var pts := PackedVector2Array()
+	for i in 10:
+		var ang := -PI / 2.0 + i * PI / 5.0
+		var rad := r if i % 2 == 0 else r * 0.45
+		pts.append(c + Vector2(cos(ang), sin(ang)) * rad)
+	return pts
+
+func _crown_poly(c: Vector2, r: float) -> PackedVector2Array:
+	return PackedVector2Array([c + Vector2(-r, r * 0.7), c + Vector2(-r, -r * 0.55), c + Vector2(-r * 0.5, r * 0.05), c + Vector2(0, -r * 0.85), c + Vector2(r * 0.5, r * 0.05), c + Vector2(r, -r * 0.55), c + Vector2(r, r * 0.7)])
+
+func _draw_award(kind: String, c: Vector2, r: float, earned: bool) -> void:
+	var fill := Color(1.0, 0.8, 0.2) if earned else Color(0.45, 0.5, 0.6, 0.5)
+	var edge := Color(0.3, 0.18, 0.0, 0.9) if earned else Color(0.3, 0.35, 0.45, 0.4)
+	if kind == "star":
+		draw_colored_polygon(_star_poly(c, r * 1.2), edge)
+		draw_colored_polygon(_star_poly(c, r), fill)
+	else:
+		draw_colored_polygon(_crown_poly(c, r * 1.2), edge)
+		draw_colored_polygon(_crown_poly(c, r), fill)
+
 func _release_hold(note: Dictionary) -> void:
 	var frac: float = clampf((song_time - float(note.time)) / maxf(0.05, float(note.duration)), 0.0, 1.0)
 	note.done = true
@@ -333,11 +465,14 @@ func _pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
 	if screen == Screen.PREPARE:
 		if Rect2(100, 1640, viewport_size.x - 200, 145).has_point(pos): _start_game()
 		elif Rect2(35, 45, 180, 95).has_point(pos): screen = Screen.LIBRARY
+		elif Rect2(100, 800, 190, 110).has_point(pos): _adjust_diff(-1)
+		elif Rect2(viewport_size.x - 290, 800, 190, 110).has_point(pos): _adjust_diff(1)
 		elif Rect2(100, 950, 190, 120).has_point(pos): _adjust_speed(-SPEED_STEP)
 		elif Rect2(viewport_size.x - 290, 950, 190, 120).has_point(pos): _adjust_speed(SPEED_STEP)
 		elif Rect2(310, 950, viewport_size.x - 620, 120).has_point(pos): speed_auto = not speed_auto; _save_settings()
-		elif _mode_rect(false).has_point(pos): lives_mode = false; _save_settings()
-		elif _mode_rect(true).has_point(pos): lives_mode = true; _save_settings()
+		elif _mode_rect(0).has_point(pos): lives_mode = false; infinite_mode = false; _save_settings()
+		elif _mode_rect(1).has_point(pos): lives_mode = true; infinite_mode = false; _save_settings()
+		elif _mode_rect(2).has_point(pos): lives_mode = true; infinite_mode = true; _save_settings()
 		elif lives_mode and Rect2(130, 1340, 170, 100).has_point(pos): _adjust_lives(-1)
 		elif lives_mode and Rect2(viewport_size.x - 300, 1340, 170, 100).has_point(pos): _adjust_lives(1)
 	elif screen == Screen.GAME:
@@ -371,16 +506,35 @@ func _pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
 			show_bg = not show_bg; _reload_bg(); _save_settings()
 		elif Rect2(80, 870, viewport_size.x - 160, 180).has_point(pos):
 			show_thumbs = not show_thumbs; _save_settings()
+		elif Rect2(130, 1300, (viewport_size.x - 300.0) / 2.0, 100).has_point(pos):
+			folder_dialog.popup_centered_ratio(0.85)
+		elif Rect2(130 + (viewport_size.x - 300.0) / 2.0 + 40, 1300, (viewport_size.x - 300.0) / 2.0, 100).has_point(pos):
+			_sync_folder()
 		elif show_bg and Rect2(130, 690, 170, 110).has_point(pos): _adjust_bg(-0.05)
 		elif show_bg and Rect2(viewport_size.x - 300, 690, 170, 110).has_point(pos): _adjust_bg(0.05)
 	elif screen == Screen.RESULTS:
 		if Rect2(110, 1400, viewport_size.x - 220, 135).has_point(pos): _start_game()
 		elif Rect2(110, 1570, viewport_size.x - 220, 120).has_point(pos): open_group = {}; screen = Screen.LIBRARY
 
+## Un tap no debe solaparse con la siguiente nota de su carril.
+func _assign_tap_heights() -> void:
+	var next_time := {}
+	for i in range(notes.size() - 1, -1, -1):
+		var n: Dictionary = notes[i]
+		if n.type == "start":
+			continue
+		n.height = NORMAL_HEIGHT
+		if n.type == "tap" and next_time.has(n.lane):
+			n.height = clampf((next_time[n.lane] - n.time) * speed - 6.0, 50.0, NORMAL_HEIGHT)
+		next_time[n.lane] = n.time
+
 func _start_game() -> void:
 	_stop_audio()
 	screen = Screen.GAME
-	speed = BASE_SPEED * _effective_mult()
+	infinite_run = infinite_mode and lives_mode
+	lap = 1; lap_factor = 1.0; award_idx = 0; stars = 0; crowns = 0
+	banner_time = 0.0; lap_banner_time = 0.0
+	speed = BASE_SPEED * _effective_mult() * lap_factor
 	ahead = hit_y / speed + 0.15
 	# Que la primera nota entre desde arriba justo al empezar.
 	lead_in = maxf(0.0, hit_y / speed + 0.05 - first_note_time) if use_lead_in else 0.0
@@ -392,15 +546,7 @@ func _start_game() -> void:
 		note.input_id = -999
 		note.height = NORMAL_HEIGHT
 		notes.append(note)
-	# Un tap no debe solaparse con la siguiente nota de su carril.
-	var next_time := {}
-	for i in range(notes.size() - 1, -1, -1):
-		var n: Dictionary = notes[i]
-		if n.type == "start":
-			continue
-		if n.type == "tap" and next_time.has(n.lane):
-			n.height = clampf((next_time[n.lane] - n.time) * speed - 6.0, 50.0, NORMAL_HEIGHT)
-		next_time[n.lane] = n.time
+	_assign_tap_heights()
 	first_idx = 0
 	player.stream = audio_stream
 	active_inputs.clear(); effects.clear()
@@ -447,7 +593,6 @@ func _try_hit(lane: int, input_id: int) -> void:
 		return
 	if best.type == "hold":
 		best.holding = true; best.input_id = input_id
-		_set_judgement("MANTÉN", 0.45)
 		_effect(lane, hit_y, Color(1, 1, 1, 0.82))
 	else:
 		best.done = true
@@ -472,7 +617,6 @@ func _judgement_color(text: String) -> Color:
 		"PERFECT": return Color(1.0, 0.78, 0.12)
 		"GREAT": return Color(0.05, 0.82, 0.95)
 		"GOOD": return Color(0.3, 0.85, 0.45)
-		"MANTÉN": return Color(1.0, 0.55, 0.1)
 		"MISS", "VACÍO": return Color(1.0, 0.25, 0.3)
 	return Color.WHITE
 
@@ -576,9 +720,9 @@ func _adjust_lives(delta: int) -> void:
 	lives_setting = clampi(lives_setting + delta, LIVES_MIN, LIVES_MAX)
 	_save_settings()
 
-func _mode_rect(lives: bool) -> Rect2:
-	var half := (viewport_size.x - 240.0) / 2.0
-	return Rect2(130.0 + half if lives else 110.0, 1190, half, 120)
+func _mode_rect(i: int) -> Rect2:
+	var bw := (viewport_size.x - 240.0 - 32.0) / 3.0
+	return Rect2(110.0 + i * (bw + 16.0), 1190, bw, 120)
 
 ## Vidas como barras horizontales gruesas (las restantes encendidas, de izquierda a derecha).
 func _draw_lives_bars(x: float, y: float, bar_w: float, bar_h: float, gap: float) -> void:
@@ -736,10 +880,121 @@ func _badge_color(e: Dictionary) -> Color:
 func _import_osz(path: String) -> void:
 	var result: Dictionary = OsuImporter.import_osz(path)
 	if result.ok:
+		if library_dir != "":   # copia de respaldo en la carpeta de canciones
+			var bdir := library_dir.path_join(BACKUP_NAME)
+			DirAccess.make_dir_recursive_absolute(bdir)
+			var bid := FileAccess.get_md5(path).substr(0, 10)
+			_backup_copy(path, bdir, bid, "%s [%s].osz" % [OsuImporter.safe_name(String(result.title)), bid])
 		_refresh_library()
 		_show_status("Importado: %s (%d dificultades)" % [result.title, result.count], false)
 	else:
 		_show_status(result.error, true)
+
+# --- Carpeta de canciones (respaldo y recarga) -----------------------------
+# <carpeta>/Por importar : se dejan aquí los .osz; al recargar se importan y se mueven.
+# <carpeta>/Importadas   : copia de todos los .osz importados; si reinstalas la app,
+#                          elegir la carpeta y recargar restaura las canciones.
+
+func _default_library_dir() -> String:
+	var docs := OS.get_system_dir(OS.SYSTEM_DIR_DOCUMENTS)
+	if docs == "":
+		docs = OS.get_user_data_dir()
+	return docs.path_join("TilesFOSS")
+
+func _set_library_dir(path: String) -> void:
+	if path == "" or path.begins_with("content://"):
+		_show_status("No se pudo usar esa carpeta. Elige otra del almacenamiento (ej. Documentos).", true, 8.0)
+		return
+	library_dir = path
+	_save_settings()
+	_show_status("Carpeta de canciones: %s" % path, false)
+
+func _osz_files(dir: String) -> Array:
+	var out: Array = []
+	for f in DirAccess.get_files_at(dir):
+		if f.to_lower().ends_with(".osz"):
+			out.append(f)
+	return out
+
+## Copia un .osz a la carpeta de respaldo (sin duplicar). true si queda guardado.
+func _backup_copy(src: String, backup_dir: String, id: String, name: String) -> bool:
+	var target := backup_dir.path_join(name)
+	if FileAccess.file_exists(target):
+		if FileAccess.get_md5(target).substr(0, 10) == id:
+			return true
+		target = backup_dir.path_join("%s_%s" % [id, name])
+		if FileAccess.file_exists(target):
+			return true
+	if DirAccess.copy_absolute(src, target) != OK:
+		var bytes := FileAccess.get_file_as_bytes(src)
+		if bytes.is_empty():
+			return false
+		var out := FileAccess.open(target, FileAccess.WRITE)
+		if out == null:
+			return false
+		out.store_buffer(bytes)
+		out.close()
+	return FileAccess.file_exists(target)
+
+func _sync_folder() -> void:
+	if syncing:
+		return
+	syncing = true
+	if library_dir == "":
+		library_dir = _default_library_dir()
+		_save_settings()
+	var inbox := library_dir.path_join(INBOX_NAME)
+	var backup := library_dir.path_join(BACKUP_NAME)
+	DirAccess.make_dir_recursive_absolute(inbox)
+	DirAccess.make_dir_recursive_absolute(backup)
+	if not DirAccess.dir_exists_absolute(inbox) or not DirAccess.dir_exists_absolute(backup):
+		if OS.has_feature("android"):
+			OS.request_permissions()
+		_show_status("Sin acceso a la carpeta. Concede \"acceso a todos los archivos\" a la app y pulsa Recargar otra vez.", true, 10.0)
+		syncing = false
+		return
+	var backup_files := _osz_files(backup)
+	var inbox_files := _osz_files(inbox)
+	var total := backup_files.size() + inbox_files.size()
+	var done := 0
+	var restored := 0
+	var imported := 0
+	var failed := 0
+	# 1) Restaurar lo que esté en Importadas y no esté en la biblioteca (reinstalación).
+	for f in backup_files:
+		done += 1
+		var bpath := backup.path_join(f)
+		if not DirAccess.dir_exists_absolute(OsuImporter.SONGS_DIR.path_join(FileAccess.get_md5(bpath).substr(0, 10))):
+			_show_status("Restaurando %d/%d..." % [done, total], false, 60.0)
+			await get_tree().process_frame
+			if OsuImporter.import_osz(bpath).ok:
+				restored += 1
+			else:
+				failed += 1
+	# 2) Importar lo nuevo de Por importar, guardarlo en Importadas y borrarlo de ahí.
+	for f in inbox_files:
+		done += 1
+		var ipath := inbox.path_join(f)
+		var id := FileAccess.get_md5(ipath).substr(0, 10)
+		var good := DirAccess.dir_exists_absolute(OsuImporter.SONGS_DIR.path_join(id))
+		if not good:
+			_show_status("Importando %d/%d..." % [done, total], false, 60.0)
+			await get_tree().process_frame
+			good = OsuImporter.import_osz(ipath).ok
+		if good:
+			if _backup_copy(ipath, backup, id, f):
+				DirAccess.remove_absolute(ipath)
+			imported += 1
+		else:
+			failed += 1
+	_refresh_library()
+	var msg := "Listo: %d importadas, %d restauradas" % [imported, restored]
+	if failed > 0:
+		msg += ", %d con error" % failed
+	if total == 0:
+		msg = "Carpeta lista. Deja tus .osz en \"%s\" y pulsa Recargar." % INBOX_NAME
+	_show_status(msg, failed > 0, 8.0)
+	syncing = false
 
 func _on_files_dropped(files: PackedStringArray) -> void:
 	if screen != Screen.LIBRARY:
@@ -750,8 +1005,8 @@ func _on_files_dropped(files: PackedStringArray) -> void:
 		else:
 			_show_status("Solo se admiten archivos .osz", true)
 
-func _show_status(text: String, is_error: bool) -> void:
-	status_text = text; status_error = is_error; status_time = 6.0
+func _show_status(text: String, is_error: bool, seconds := 6.0) -> void:
+	status_text = text; status_error = is_error; status_time = seconds
 
 func _library_pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
 	if pressed:
@@ -825,6 +1080,59 @@ func _library_tap(pos: Vector2) -> void:
 		else:
 			open_group = g
 
+## Construye el chart jugable de un mapa parseado con el nivel de dificultad actual.
+## Devuelve {} si no queda ninguna nota.
+func _build_from_parsed(parsed: Dictionary) -> Dictionary:
+	var lvl: Dictionary = DIFFICULTY_LEVELS[diff_level]
+	var playable: Array = OsuImporter.build_chart(parsed, OsuImporter.DEFAULT_MAX_FINGERS, float(lvl.event), float(lvl.lane))
+	if playable.is_empty():
+		return {}
+	var out_chart: Array = [{"time": START_TIME, "lane": 0, "type": "start"}]
+	out_chart.append_array(playable)
+	var last_end := 0.0
+	for n in playable:
+		last_end = maxf(last_end, float(n.time) + float(n.get("duration", 0.0)))
+	return {
+		"chart": out_chart, "first": float(playable[0].time),
+		"auto": OsuImporter.suggest_speed(playable, float(lvl.event)),
+		"end": last_end + 1.06, "total": parsed.objects.size(),
+		"dropped": parsed.objects.size() - playable.size(),
+	}
+
+## Reconstruye el chart de la canción abierta (al cambiar la dificultad en "preparar").
+func _rebuild_chart() -> bool:
+	if current_parsed.is_empty():
+		return false
+	var built := _build_from_parsed(current_parsed)
+	if built.is_empty():
+		return false
+	chart = built.chart; chart_end = built.end; first_note_time = built.first; auto_mult = built.auto
+	var note_count := 0
+	var hold_count := 0
+	for n in chart:
+		if n.type == "start": continue
+		note_count += 1
+		if n.type == "hold": hold_count += 1
+	song_stats.notes = note_count
+	song_stats.holds = hold_count
+	song_stats.dropped = built.dropped
+	song_stats.total = built.total
+	if audio_stream == null or audio_stream.get_length() <= 0.0:
+		song_stats.duration = chart_end - 1.06
+	return true
+
+func _adjust_diff(delta: int) -> void:
+	if current_parsed.is_empty():
+		return
+	var old := diff_level
+	diff_level = clampi(diff_level + delta, 0, DIFFICULTY_LEVELS.size() - 1)
+	if diff_level == old:
+		return
+	if not _rebuild_chart():
+		diff_level = old
+		return
+	_save_settings()
+
 func _select_song(entry: Dictionary) -> void:
 	var new_chart: Array = []
 	var stream: AudioStream = null
@@ -834,6 +1142,7 @@ func _select_song(entry: Dictionary) -> void:
 	var new_end := 12.4
 	var dropped := 0
 	var total := 0
+	var new_parsed: Dictionary = {}
 	if entry.demo:
 		new_chart = demo_chart
 	else:
@@ -841,21 +1150,18 @@ func _select_song(entry: Dictionary) -> void:
 		if not parsed.ok:
 			_show_status(parsed.error, true)
 			return
-		var playable: Array = OsuImporter.build_chart(parsed)
-		if playable.is_empty():
+		var built := _build_from_parsed(parsed)
+		if built.is_empty():
 			_show_status("No quedaron notas jugables en este mapa", true)
 			return
-		new_chart = [{"time": START_TIME, "lane": 0, "type": "start"}]
-		new_chart.append_array(playable)
+		new_chart = built.chart
 		new_lead = true
-		new_first = float(playable[0].time)
-		new_auto = OsuImporter.suggest_speed(playable)
-		total = parsed.objects.size()
-		dropped = total - playable.size()
-		var last_end := 0.0
-		for n in playable:
-			last_end = maxf(last_end, float(n.time) + float(n.get("duration", 0.0)))
-		new_end = last_end + 1.06
+		new_first = built.first
+		new_auto = built.auto
+		total = built.total
+		dropped = built.dropped
+		new_end = built.end
+		new_parsed = parsed
 		stream = OsuImporter.load_audio(entry.audio_path)
 	var note_count := 0
 	var hold_count := 0
@@ -867,7 +1173,7 @@ func _select_song(entry: Dictionary) -> void:
 	if stream != null and stream.get_length() > 0.0:
 		duration = stream.get_length()
 	chart = new_chart; chart_end = new_end; use_lead_in = new_lead; first_note_time = new_first; auto_mult = new_auto
-	audio_stream = stream; current_song = entry
+	audio_stream = stream; current_song = entry; current_parsed = new_parsed
 	_reload_bg()
 	song_stats = {"notes": note_count, "holds": hold_count, "duration": duration, "dropped": dropped, "total": total}
 	screen = Screen.PREPARE
@@ -889,6 +1195,9 @@ func _load_settings() -> void:
 	speed_auto = cfg.get_value("speed", "auto", true)
 	speed_mult = clampf(float(cfg.get_value("speed", "mult", 1.0)), SPEED_MIN, SPEED_MAX)
 	lives_mode = bool(cfg.get_value("mods", "lives_mode", false))
+	infinite_mode = bool(cfg.get_value("mods", "infinite", false))
+	diff_level = clampi(int(cfg.get_value("mods", "diff", 1)), 0, DIFFICULTY_LEVELS.size() - 1)
+	library_dir = String(cfg.get_value("library", "dir", ""))
 	lives_setting = clampi(int(cfg.get_value("mods", "lives", 3)), LIVES_MIN, LIVES_MAX)
 	show_thumbs = bool(cfg.get_value("display", "show_thumbs", true))
 	var fav_list = cfg.get_value("library", "favorites", [])
@@ -908,6 +1217,9 @@ func _save_settings() -> void:
 	cfg.set_value("speed", "auto", speed_auto)
 	cfg.set_value("speed", "mult", speed_mult)
 	cfg.set_value("mods", "lives_mode", lives_mode)
+	cfg.set_value("mods", "infinite", infinite_mode)
+	cfg.set_value("mods", "diff", diff_level)
+	cfg.set_value("library", "dir", library_dir)
 	cfg.set_value("mods", "lives", lives_setting)
 	cfg.set_value("display", "show_thumbs", show_thumbs)
 	cfg.set_value("library", "favorites", favorites.keys())
@@ -929,7 +1241,10 @@ func _adjust_bg(delta: float) -> void:
 	_save_settings()
 
 func _song_key(entry: Dictionary) -> String:
-	return "%s|%s" % [entry.get("set_id", "demo"), entry.get("version", "")]
+	var key := "%s|%s" % [entry.get("set_id", "demo"), entry.get("version", "")]
+	if not entry.get("demo", false) and diff_level != 1:
+		key += "|d%d" % diff_level   # cada nivel de dificultad de notas tiene sus propios récords
+	return key
 
 ## Precisión 0..100: Perfect 100 %, Great 80 %, Good 50 %, cada VACÍO resta 25 % de una nota.
 func _accuracy() -> float:
@@ -946,6 +1261,9 @@ func _rank_for(acc: float, miss_count: int) -> int:
 	return 0                                       # D
 
 func _finish_run() -> void:
+	if infinite_run:
+		_finish_infinite()
+		return
 	run_accuracy = _accuracy()
 	run_rank = _rank_for(run_accuracy, misses + empties)
 	run_mult = _lives_mult(run_lives) if run_lives > 0 else 1.0
@@ -1068,6 +1386,22 @@ func _draw_game() -> void:
 		_draw_lives_bars(55, 60 + top_inset, 64, 16, 12)
 	elif run_lives > LIVES_MIN:
 		_text_outlined(str(lives_left), 90, 105 + top_inset, 60, Color(1.0, 0.3, 0.4), Color(0.04, 0.16, 0.32, 0.95), 10)
+	if infinite_run:
+		var ltxt := "Vuelta %d · x%.1f" % [lap, lap_factor]
+		var lw := _font().get_string_size(ltxt, HORIZONTAL_ALIGNMENT_LEFT, -1, 30).x
+		_text_outlined(ltxt, 55 + lw / 2.0, 150 + top_inset, 30, Color.WHITE, Color(0.04, 0.16, 0.32, 0.95), 8)
+		for i in stars:
+			_draw_award("star", Vector2(68 + i * 38, 190 + top_inset), 14.0, true)
+		for i in crowns:
+			_draw_award("crown", Vector2(68 + i * 38, 232 + top_inset), 14.0, true)
+		if banner_time > 0.0:
+			var bt := clampf(banner_time / 0.5, 0.0, 1.0)
+			var gold := Color(1.0, 0.8, 0.2, bt)
+			_draw_award(banner_kind, Vector2(viewport_size.x / 2, 640 + top_inset), 60.0 * (1.0 + 0.2 * clampf(banner_time - 1.5, 0.0, 0.3) / 0.3), true)
+			_text_outlined(banner_text, viewport_size.x / 2, 780 + top_inset, 60, gold, Color(0.02, 0.05, 0.12, 0.95 * bt), 12)
+		if lap_banner_time > 0.0:
+			var lt := clampf(lap_banner_time / 0.5, 0.0, 1.0)
+			_text_outlined(lap_banner_text, viewport_size.x / 2, 960 + top_inset, 72, Color(0.75, 0.6, 1.0, lt), Color(0.02, 0.05, 0.12, 0.95 * lt), 14)
 	var prog := clampf(song_time / maxf(0.1, chart_end), 0.0, 1.0)
 	draw_rect(Rect2(0, top_inset, viewport_size.x, 10), Color(0.04, 0.16, 0.32, 0.45))
 	draw_rect(Rect2(0, top_inset, viewport_size.x * prog, 10), Color(0.02, 0.68, 0.88))
@@ -1185,12 +1519,24 @@ func _draw_difficulty_picker() -> void:
 		var pb: Dictionary = bests.get(_song_key(e), {})
 		if not pb.is_empty():
 			bcol = RANK_COLORS[int(pb.rank)]
+		elif bests.has(_song_key(e) + "|inf"):
+			bcol = Color(0.5, 0.38, 0.92)
 		_panel(Rect2(r.position.x, r.position.y, 130, r.size.y), bcol, 24)
 		var row_best: Dictionary = bests.get(_song_key(e), {})
-		if row_best.is_empty():
-			_text_centered("–", r.position.x + 65, r.get_center().y + 14, 50, Color(1, 1, 1, 0.55))
-		else:
-			_text_centered(RANKS[int(row_best.rank)], r.position.x + 65, r.get_center().y + 16, 56, Color.WHITE)
+		var inf_best: Dictionary = bests.get(_song_key(e) + "|inf", {})
+		var n_crowns := int(inf_best.get("crowns", 0))
+		var n_stars := int(inf_best.get("stars", 0))
+		var has_icons := n_crowns > 0 or n_stars > 0
+		var letter := "–" if row_best.is_empty() else String(RANKS[int(row_best.rank)])
+		var lsize := int(clampf(r.size.y * 0.42, 30.0, 56.0)) if has_icons else 56
+		var ly := r.position.y + r.size.y * 0.46 if has_icons else r.get_center().y + 16.0
+		_text_centered(letter, r.position.x + 65, ly + lsize * 0.3, lsize, Color(1, 1, 1, 0.6) if row_best.is_empty() else Color.WHITE)
+		if has_icons:
+			var kind := "crown" if n_crowns > 0 else "star"
+			var cnt := n_crowns if n_crowns > 0 else n_stars
+			var ir := clampf(r.size.y * 0.13, 9.0, 16.0)
+			for k in cnt:
+				_draw_award(kind, Vector2(r.position.x + 65 + (k - (cnt - 1) / 2.0) * (ir * 2.6), r.position.y + r.size.y * 0.80), ir, true)
 		_text(_fit(e.version, r.size.x - 180.0, 34), Vector2(r.position.x + 155, r.get_center().y + 12), 34, Color(0.12, 0.22, 0.31))
 
 func _draw_prepare() -> void:
@@ -1200,11 +1546,18 @@ func _draw_prepare() -> void:
 	var text_w := w - 160
 	_text(_fit(current_song.title, text_w, 58), Vector2(80,370), 58, Color.WHITE)
 	_text(_fit("%s · %s" % [current_song.artist, current_song.version], text_w, 32), Vector2(82,445), 32, Color(0.68,0.84,0.96))
-	_panel(Rect2(80,560,w-160,340),Color(0.08,0.13,0.22,0.92),34)
+	_panel(Rect2(80,560,w-160,200),Color(0.08,0.13,0.22,0.92),34)
 	_text("%d notas · %d sostenidas" % [song_stats.notes, song_stats.holds], Vector2(140,645), 38, Color.WHITE)
 	_text("%s · %s" % [_format_time(song_stats.duration), "Con audio" if audio_stream != null else "Sin audio"], Vector2(140,715), 38, Color.WHITE if audio_stream != null else Color(1,0.6,0.6))
-	# Velocidad
+	# Dificultad de notas
 	var cx := w / 2
+	var lvl: Dictionary = DIFFICULTY_LEVELS[diff_level]
+	var demo_song: bool = current_parsed.is_empty()
+	_button(Rect2(100,800,190,110),"-",Color(0.14,0.22,0.34, 0.4 if demo_song else 1.0))
+	_button(Rect2(w-290,800,190,110),"+",Color(0.14,0.22,0.34, 0.4 if demo_song else 1.0))
+	_text_centered("Dificultad de notas", cx, 842, 28, muted)
+	_text_centered("—" if demo_song else String(lvl.name), cx, 902, 52, Color(1, 1, 1, 0.4) if demo_song else lvl.color)
+	# Velocidad
 	_button(Rect2(100,950,190,120),"-",Color(0.14,0.22,0.34))
 	_button(Rect2(w-290,950,190,120),"+",Color(0.14,0.22,0.34))
 	_text_centered("Velocidad · AUTO" if speed_auto else "Velocidad · MANUAL (toca: auto)", cx, 992, 28, muted)
@@ -1212,21 +1565,26 @@ func _draw_prepare() -> void:
 	# Modificadores
 	_panel(Rect2(80,1110,w-160,450),Color(0.08,0.13,0.22,0.92),34)
 	_text("MODO", Vector2(130,1165), 28, muted)
-	_button(_mode_rect(false), "CASUAL", Color(0.02,0.68,0.88) if not lives_mode else Color(0.17,0.25,0.37))
-	_button(_mode_rect(true), "VIDAS", Color(0.78,0.2,0.3) if lives_mode else Color(0.17,0.25,0.37))
+	_button(_mode_rect(0), "CASUAL", Color(0.02,0.68,0.88) if not lives_mode else Color(0.17,0.25,0.37))
+	_button(_mode_rect(1), "VIDAS", Color(0.78,0.2,0.3) if lives_mode and not infinite_mode else Color(0.17,0.25,0.37))
+	_button(_mode_rect(2), "INFINITO", Color(0.5,0.38,0.92) if infinite_mode else Color(0.17,0.25,0.37))
 	if lives_mode:
 		_button(Rect2(130,1340,170,100), "-", Color(0.14,0.22,0.34))
 		_button(Rect2(w-300,1340,170,100), "+", Color(0.14,0.22,0.34))
 		_text_centered("%d vidas" % lives_setting, cx, 1405, 48, Color.WHITE)
-		var m := _lives_mult(lives_setting)
-		if lives_setting == LIVES_MIN:
-			_text_centered("Sin penalización de puntos", cx, 1490, 28, Color(0.5, 0.95, 0.75))
+		if infinite_mode:
+			_text_centered("3 estrellas en la vuelta 1 y 3 coronas en las vueltas 2 y 3", cx, 1480, 26, Color(1.0, 0.82, 0.3))
+			_text_centered("Cada vuelta sube la velocidad: x1.0, x1.5, x2.0, x2.5...", cx, 1515, 26, Color(1.0, 0.82, 0.3))
 		else:
-			_text_centered("Puntos x%.2f (-%d %%)" % [m, roundi((1.0 - m) * 100.0)], cx, 1490, 28, Color(1.0, 0.75, 0.4))
-		_text_centered("Puedes fallar %d veces y seguir; el siguiente fallo termina." % lives_setting, cx, 1535, 24, muted)
+			var m := _lives_mult(lives_setting)
+			if lives_setting == LIVES_MIN:
+				_text_centered("Sin penalización de puntos", cx, 1490, 28, Color(0.5, 0.95, 0.75))
+			else:
+				_text_centered("Puntos x%.2f (-%d %%)" % [m, roundi((1.0 - m) * 100.0)], cx, 1490, 28, Color(1.0, 0.75, 0.4))
+		_text_centered("Puedes fallar %d veces y seguir; el siguiente fallo termina." % lives_setting, cx, 1545, 24, muted)
 	else:
 		_text_centered("Sin límite de fallos", cx, 1405, 40, Color.WHITE)
-		_text_centered("Juega tranquilo: fallar solo rompe el combo.", cx, 1465, 28, muted)
+		_text_centered("Juega tranquilo: fallar solo rompe el combo. No se guarda.", cx, 1465, 28, muted)
 	_button(Rect2(100,1640,w-200,145),"JUGAR",Color(0.02,0.68,0.88))
 
 func _draw_settings() -> void:
@@ -1249,10 +1607,44 @@ func _draw_settings() -> void:
 	_text("Miniaturas de canciones", Vector2(130, 955), 40, Color.WHITE)
 	_text("Imagen del mapa en cada canción de la lista", Vector2(130, 1005), 26, muted)
 	_button(Rect2(w - 330, 915, 200, 90), "SÍ" if show_thumbs else "NO", Color(0.02, 0.68, 0.88) if show_thumbs else Color(0.22, 0.28, 0.38))
-	_text("Los mapas importados antes de esta versión", Vector2(80, 1130), 26, muted)
-	_text("hay que importarlos otra vez para que traigan su imagen.", Vector2(80, 1170), 26, muted)
+	_panel(Rect2(80, 1090, w - 160, 330), Color(0.08, 0.13, 0.22, 0.92), 34)
+	_text("Carpeta de canciones", Vector2(130, 1165), 40, Color.WHITE)
+	var shown_dir := library_dir if library_dir != "" else "Sin configurar (por defecto: Documentos/TilesFOSS)"
+	_text(_fit(shown_dir, w - 260, 24), Vector2(130, 1210), 24, Color(0.5, 0.95, 0.75) if library_dir != "" else muted)
+	_text(_fit("Respalda tus mapas para recuperarlos al reinstalar.", w - 260, 24), Vector2(130, 1250), 24, muted)
+	var half := (w - 300.0) / 2.0
+	_button(Rect2(130, 1300, half, 100), "Elegir carpeta", Color(0.14, 0.22, 0.34))
+	_button(Rect2(130 + half + 40, 1300, half, 100), "Recargando..." if syncing else "Recargar mapas", Color(0.02, 0.68, 0.88))
+	_text("Los mapas importados antes de los fondos", Vector2(80, 1480), 26, muted)
+	_text("hay que importarlos otra vez para que traigan su imagen.", Vector2(80, 1520), 26, muted)
+	if status_time > 0.0:
+		_text(_fit(status_text, w - 160, 26), Vector2(80, 1600), 26, Color(1, 0.45, 0.45) if status_error else Color(0.5, 0.95, 0.75))
+
+func _draw_results_infinite() -> void:
+	_background(); draw_set_transform(Vector2(0, ui_off)); _text_centered("MODO INFINITO", viewport_size.x / 2, 230, 58, Color.WHITE)
+	var w := viewport_size.x
+	_panel(Rect2(90, 300, w - 180, 1010), Color(0.96, 0.98, 1), 38)
+	var dark := Color(0.12, 0.22, 0.32)
+	var muted := Color(0.42, 0.52, 0.62)
+	_text_centered("Llegaste a la vuelta", w / 2, 410, 32, muted)
+	_text_centered(str(lap), w / 2, 590, 200, Color(0.5, 0.38, 0.92))
+	_text_centered("velocidad x%.1f" % lap_factor, w / 2, 660, 34, dark)
+	_text("Estrellas", Vector2(170, 760), 38, dark)
+	_text("Coronas", Vector2(170, 880), 38, dark)
+	for i in 3:
+		_draw_award("star", Vector2(w - 170 - 270 + 45 + i * 90, 745), 34.0, i < stars)
+		_draw_award("crown", Vector2(w - 170 - 270 + 45 + i * 90, 865), 34.0, i < crowns)
+	if failed:
+		_text_centered(fail_text, w / 2, 980, 32, Color(0.9, 0.2, 0.28))
+	if run_record:
+		_text_centered("¡Nuevo récord!", w / 2, 1030, 34, Color(1.0, 0.6, 0.1))
+	_text("Puntuación", Vector2(170, 1120), 29, muted); _text(str(score), Vector2(170, 1200), 68, Color(0.02, 0.62, 0.86))
+	_button(Rect2(110, 1400, w - 220, 135), "REPETIR", Color(0.02, 0.68, 0.88)); _button(Rect2(110, 1570, w - 220, 120), "CANCIONES", Color(0.17, 0.25, 0.37))
 
 func _draw_results() -> void:
+	if infinite_run:
+		_draw_results_infinite()
+		return
 	_background(); draw_set_transform(Vector2(0, ui_off)); _text_centered("RESULTADOS", viewport_size.x / 2, 230, 58, Color.WHITE)
 	var w := viewport_size.x
 	_panel(Rect2(90, 300, w - 180, 1010), Color(0.96, 0.98, 1), 38)
