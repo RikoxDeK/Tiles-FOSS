@@ -15,6 +15,7 @@ extends RefCounted
 const LANES := 4
 const SONGS_DIR := "user://songs"
 const AUDIO_EXTENSIONS := ["mp3", "ogg"]
+const IMAGE_EXTENSIONS := ["jpg", "jpeg", "png", "webp", "bmp"]
 
 ## Segundos mínimos entre dos notas del mismo carril (evita jacks imposibles).
 const MIN_LANE_GAP := 0.12
@@ -53,7 +54,7 @@ static func parse_osu(text: String, header_only := false) -> Dictionary:
 	var r := {
 		"ok": false, "error": "", "mode": 0, "keys": 4,
 		"title": "", "artist": "", "creator": "", "version": "",
-		"audio": "", "slider_multiplier": 1.4,
+		"audio": "", "background": "", "slider_multiplier": 1.4,
 		"timing": [], "objects": []
 	}
 	var section := ""
@@ -84,6 +85,11 @@ static func parse_osu(text: String, header_only := false) -> Dictionary:
 			elif key == "Version": r.version = val
 			elif key == "CircleSize": r.keys = int(round(float(val)))
 			elif key == "SliderMultiplier": r.slider_multiplier = float(val)
+		elif section == "Events":
+			# Línea de imagen de fondo:  0,0,"archivo.jpg",0,0
+			var ev := line.split(",")
+			if ev.size() >= 3 and ev[0].strip_edges() == "0" and ev[1].strip_edges() == "0" and r.background.is_empty():
+				r.background = ev[2].strip_edges().trim_prefix("\"").trim_suffix("\"")
 		elif section == "TimingPoints":
 			if header_only:
 				continue
@@ -263,6 +269,7 @@ static func import_osz(path: String) -> Dictionary:
 		return {"ok": false, "error": "No se pudo abrir el archivo .osz"}
 	var maps: Array = []
 	var audio_names := {}
+	var bg_names := {}
 	var title := ""
 	for f in zr.get_files():
 		if not f.to_lower().ends_with(".osu"):
@@ -273,6 +280,8 @@ static func import_osz(path: String) -> Dictionary:
 			continue
 		maps.append({"name": safe_name(f), "text": text})
 		audio_names[parsed.audio] = true
+		if not parsed.background.is_empty() and parsed.background.get_extension().to_lower() in IMAGE_EXTENSIONS:
+			bg_names[parsed.background] = true
 		if title.is_empty():
 			title = parsed.title
 	if maps.is_empty():
@@ -300,6 +309,14 @@ static func import_osz(path: String) -> Dictionary:
 				if out != null:
 					out.store_buffer(zr.read_file(f))
 					out.close()
+				break
+	for wanted in bg_names.keys():
+		for f in zr.get_files():
+			if f.get_file().to_lower() == String(wanted).get_file().to_lower():
+				var bout := FileAccess.open(dir.path_join(safe_name(wanted)), FileAccess.WRITE)
+				if bout != null:
+					bout.store_buffer(zr.read_file(f))
+					bout.close()
 				break
 	zr.close()
 	return {"ok": true, "error": "", "title": title, "count": maps.size()}
@@ -329,6 +346,7 @@ static func scan_library() -> Array:
 				"size": text.length(),
 				"osu_path": dir.path_join(f),
 				"audio_path": dir.path_join(safe_name(parsed.audio)),
+				"bg_path": dir.path_join(safe_name(parsed.background)) if not parsed.background.is_empty() else "",
 				"title": parsed.title, "artist": parsed.artist,
 				"version": parsed.version, "creator": parsed.creator,
 				"badge": ("%dK" % parsed.keys) if parsed.mode == 3 else "STD",
@@ -338,6 +356,32 @@ static func scan_library() -> Array:
 			return a.title.naturalnocasecmp_to(b.title) < 0
 		return a.version.naturalnocasecmp_to(b.version) < 0)
 	return entries
+
+
+## Carga una imagen (jpg/png/webp/bmp) como textura; la reduce a 1920 px como máximo.
+## Devuelve null si no existe o no se puede leer.
+static func load_image(path: String, max_side := 1920) -> Texture2D:
+	if path.is_empty() or not FileAccess.file_exists(path):
+		return null
+	var bytes := FileAccess.get_file_as_bytes(path)
+	if bytes.is_empty():
+		return null
+	var img := Image.new()
+	var err := ERR_FILE_UNRECOGNIZED
+	match path.get_extension().to_lower():
+		"jpg", "jpeg": err = img.load_jpg_from_buffer(bytes)
+		"png": err = img.load_png_from_buffer(bytes)
+		"webp": err = img.load_webp_from_buffer(bytes)
+		"bmp": err = img.load_bmp_from_buffer(bytes)
+	if err != OK:  # extensión que no coincide con el contenido real
+		err = img.load_jpg_from_buffer(bytes)
+		if err != OK: err = img.load_png_from_buffer(bytes)
+		if err != OK: return null
+	var longest := maxi(img.get_width(), img.get_height())
+	if longest > max_side:
+		var k := float(max_side) / float(longest)
+		img.resize(maxi(1, int(img.get_width() * k)), maxi(1, int(img.get_height() * k)), Image.INTERPOLATE_BILINEAR)
+	return ImageTexture.create_from_image(img)
 
 
 ## Carga mp3/ogg desde disco. Devuelve null si no existe o el formato no sirve.

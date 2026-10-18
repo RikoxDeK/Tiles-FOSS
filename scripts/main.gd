@@ -1,6 +1,6 @@
 extends Node2D
 
-enum Screen { LIBRARY, PREPARE, GAME, RESULTS }
+enum Screen { LIBRARY, PREPARE, GAME, RESULTS, SETTINGS }
 const LANES := 4
 const NORMAL_HEIGHT := 455.0
 const BASE_SPEED := 760.0
@@ -47,6 +47,11 @@ var run_record := false
 var bests: Dictionary = {}   # clave de mapa -> {"score", "rank", "acc"}
 var last_judgement := ""
 var judgement_time := 0.0
+var judgement_total := 0.5
+var combo_pop := 0.0
+var show_bg := true          # ajuste: mostrar la imagen de fondo del mapa
+var bg_vis := 0.30           # ajuste: cuánto se ve la imagen (0.1 - 0.7)
+var bg_texture: Texture2D = null
 
 # Canción actual
 var chart: Array = []
@@ -130,7 +135,7 @@ func _go_back() -> void:
 	match screen:
 		Screen.GAME:
 			_set_paused(not paused)
-		Screen.PREPARE:
+		Screen.PREPARE, Screen.SETTINGS:
 			screen = Screen.LIBRARY
 		Screen.RESULTS:
 			open_group = {}
@@ -166,6 +171,8 @@ func _process(delta: float) -> void:
 		search_edit.visible = screen == Screen.LIBRARY and search_open and open_group.is_empty()
 	if judgement_time > 0.0:
 		judgement_time -= delta
+	if combo_pop > 0.0:
+		combo_pop -= delta
 	if status_time > 0.0:
 		status_time -= delta
 	for effect in effects:
@@ -270,7 +277,7 @@ func _pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
 	if not pressed:
 		active_inputs.erase(input_id)
 		return
-	if screen == Screen.PREPARE or screen == Screen.RESULTS:
+	if screen == Screen.PREPARE or screen == Screen.RESULTS or screen == Screen.SETTINGS:
 		pos.y -= ui_off
 	if screen == Screen.PREPARE:
 		if Rect2(100, 1360, viewport_size.x - 200, 145).has_point(pos): _start_game()
@@ -290,6 +297,12 @@ func _pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
 		var lane: int = clampi(int(pos.x / (viewport_size.x / LANES)), 0, LANES - 1)
 		active_inputs[input_id] = lane
 		_try_hit(lane, input_id)
+	elif screen == Screen.SETTINGS:
+		if Rect2(35, 45, 180, 95).has_point(pos): screen = Screen.LIBRARY
+		elif Rect2(80, 330, viewport_size.x - 160, 180).has_point(pos):
+			show_bg = not show_bg; _reload_bg(); _save_settings()
+		elif show_bg and Rect2(130, 690, 170, 110).has_point(pos): _adjust_bg(-0.05)
+		elif show_bg and Rect2(viewport_size.x - 300, 690, 170, 110).has_point(pos): _adjust_bg(0.05)
 	elif screen == Screen.RESULTS:
 		if Rect2(110, 1400, viewport_size.x - 220, 135).has_point(pos): _start_game()
 		elif Rect2(110, 1570, viewport_size.x - 220, 120).has_point(pos): open_group = {}; screen = Screen.LIBRARY
@@ -349,12 +362,12 @@ func _try_hit(lane: int, input_id: int) -> void:
 		best_diff = abs(signed_diff); best = note
 		break  # la más antigua pendiente del carril
 	if best.is_empty():
-		combo = 0; empties += 1; last_judgement = "VACÍO"; judgement_time = 0.35
+		combo = 0; empties += 1; _set_judgement("VACÍO", 0.4)
 		_effect(lane, hit_y, Color(1.0, 0.15, 0.18, 0.84))
 		return
 	if best.type == "hold":
 		best.holding = true; best.input_id = input_id
-		last_judgement = "MANTÉN"; judgement_time = 0.4
+		_set_judgement("MANTÉN", 0.45)
 		_effect(lane, hit_y, Color(1, 1, 1, 0.82))
 	else:
 		best.done = true
@@ -364,15 +377,26 @@ func _try_hit(lane: int, input_id: int) -> void:
 
 func _hit(lane: int, text: String, points: int, effect_y: float) -> void:
 	hits += 1; combo += 1; max_combo = max(max_combo, combo); score += points + min(combo, 50)
-	last_judgement = text; judgement_time = 0.48
+	_set_judgement(text, 0.55); combo_pop = 0.18
 	match text:
 		"PERFECT": perfects += 1
 		"GREAT": greats += 1
 		"GOOD": goods += 1
 	_effect(lane, effect_y, Color(1, 1, 1, 0.82))
 
+func _set_judgement(text: String, duration: float) -> void:
+	last_judgement = text; judgement_time = duration; judgement_total = duration
+
+func _judgement_color(text: String) -> Color:
+	match text:
+		"PERFECT": return Color(1.0, 0.78, 0.12)
+		"GREAT": return Color(0.05, 0.82, 0.95)
+		"GOOD": return Color(0.3, 0.85, 0.45)
+		"MISS", "VACÍO": return Color(1.0, 0.25, 0.3)
+	return Color.WHITE
+
 func _miss(lane: int, effect_y: float) -> void:
-	misses += 1; combo = 0; last_judgement = "MISS"; judgement_time = 0.55
+	misses += 1; combo = 0; _set_judgement("MISS", 0.6)
 	_effect(lane, effect_y, Color(1.0, 0.15, 0.18, 0.84))
 
 func _effect(lane: int, effect_y: float, color: Color) -> void:
@@ -543,6 +567,9 @@ func _library_tap(pos: Vector2) -> void:
 			_close_search()
 			return
 	else:
+		if Rect2(viewport_size.x - 300, 40 + top_inset, 245, 80).has_point(pos):
+			screen = Screen.SETTINGS
+			return
 		if Rect2(viewport_size.x - 670, 150 + top_inset, 245, 95).has_point(pos):
 			_open_search()
 			return
@@ -603,6 +630,7 @@ func _select_song(entry: Dictionary) -> void:
 		duration = stream.get_length()
 	chart = new_chart; chart_end = new_end; use_lead_in = new_lead; first_note_time = new_first; auto_mult = new_auto
 	audio_stream = stream; current_song = entry
+	_reload_bg()
 	song_stats = {"notes": note_count, "holds": hold_count, "duration": duration, "dropped": dropped, "total": total}
 	screen = Screen.PREPARE
 
@@ -622,6 +650,8 @@ func _load_settings() -> void:
 		return
 	speed_auto = cfg.get_value("speed", "auto", true)
 	speed_mult = clampf(float(cfg.get_value("speed", "mult", 1.0)), SPEED_MIN, SPEED_MAX)
+	show_bg = bool(cfg.get_value("display", "show_bg", true))
+	bg_vis = clampf(float(cfg.get_value("display", "bg_vis", 0.30)), 0.1, 0.7)
 	if cfg.has_section("best"):
 		for key in cfg.get_section_keys("best"):
 			var v = cfg.get_value("best", key)
@@ -632,11 +662,22 @@ func _save_settings() -> void:
 	var cfg := ConfigFile.new()
 	cfg.set_value("speed", "auto", speed_auto)
 	cfg.set_value("speed", "mult", speed_mult)
+	cfg.set_value("display", "show_bg", show_bg)
+	cfg.set_value("display", "bg_vis", bg_vis)
 	for key in bests:
 		cfg.set_value("best", key, bests[key])
 	cfg.save(SETTINGS_PATH)
 
 # --- Puntaje y rangos ----------------------------------------------------
+
+func _reload_bg() -> void:
+	bg_texture = null
+	if show_bg and not current_song.is_empty():
+		bg_texture = OsuImporter.load_image(String(current_song.get("bg_path", "")))
+
+func _adjust_bg(delta: float) -> void:
+	bg_vis = snappedf(clampf(bg_vis + delta, 0.1, 0.7), 0.05)
+	_save_settings()
 
 func _song_key(entry: Dictionary) -> String:
 	return "%s|%s" % [entry.get("set_id", "demo"), entry.get("version", "")]
@@ -704,12 +745,16 @@ func _draw() -> void:
 	if screen == Screen.LIBRARY: _draw_library()
 	elif screen == Screen.PREPARE: _draw_prepare()
 	elif screen == Screen.GAME: _draw_game()
+	elif screen == Screen.SETTINGS: _draw_settings()
 	else: _draw_results()
 	draw_set_transform(Vector2.ZERO)
 
 func _draw_game() -> void:
 	var lane_w := viewport_size.x / LANES
 	draw_rect(Rect2(Vector2.ZERO, viewport_size), Color(0.74, 0.88, 0.98))
+	if show_bg and bg_texture != null:
+		_draw_cover(bg_texture, Rect2(Vector2.ZERO, viewport_size))
+		draw_rect(Rect2(Vector2.ZERO, viewport_size), Color(0.74, 0.88, 0.98, 1.0 - bg_vis))
 	for lane in LANES:
 		draw_rect(Rect2(lane * lane_w, 0, lane_w, viewport_size.y), Color(0.9,0.96,1,0.20))
 		draw_line(Vector2(lane * lane_w,0), Vector2(lane * lane_w,viewport_size.y), Color.WHITE, 3)
@@ -740,11 +785,21 @@ func _draw_game() -> void:
 		var center := Vector2((float(effect.lane)+0.5)*lane_w, float(effect.y))
 		var half := Vector2(lane_w*(0.20+progress*0.24), 28.0+progress*38.0)
 		draw_rect(Rect2(center-half, half*2.0), color, false, 7.0)
-	if judgement_time > 0:
-		var color := Color(1,0.2,0.22) if last_judgement in ["MISS","VACÍO"] else Color(0.08,0.15,0.22)
-		_text(last_judgement, Vector2(viewport_size.x/2-110,340+top_inset), 48, color)
-	_text(str(hits), Vector2(viewport_size.x/2-25,155+top_inset), 72, Color(1,0.22,0.28))
-	_text("Combo %d" % combo, Vector2(35,95+top_inset), 30, Color(0.12,0.22,0.32))
+	if judgement_time > 0.0:
+		var t := clampf(judgement_time / judgement_total, 0.0, 1.0)   # 1 al aparecer, 0 al irse
+		var age := 1.0 - t
+		var pop := 1.0 + 0.45 * maxf(0.0, 1.0 - age / 0.2)            # rebote al aparecer
+		var fade := clampf(t / 0.3, 0.0, 1.0)
+		var jcol := _judgement_color(last_judgement); jcol.a = fade
+		_text_outlined(last_judgement, viewport_size.x / 2, 480 + top_inset - age * 40.0, int(68 * pop), jcol, Color(0.02, 0.05, 0.12, 0.95 * fade), 14)
+	if combo >= 2:
+		var ccol := Color.WHITE
+		if combo >= 100: ccol = Color(1.0, 0.55, 0.85)
+		elif combo >= 50: ccol = Color(1.0, 0.82, 0.2)
+		elif combo >= 25: ccol = Color(0.55, 0.95, 1.0)
+		var csize := int(100 + 40 * clampf(combo_pop / 0.18, 0.0, 1.0))
+		_text_outlined(str(combo), viewport_size.x / 2, 200 + top_inset, csize, ccol, Color(0.04, 0.16, 0.32, 0.95), 16)
+		_text_outlined("COMBO", viewport_size.x / 2, 255 + top_inset, 30, Color.WHITE, Color(0.04, 0.16, 0.32, 0.95), 8)
 	_button(Rect2(viewport_size.x-145,35+top_inset,110,100), "II", Color(0.06,0.12,0.2,0.72))
 	if paused:
 		draw_rect(Rect2(Vector2.ZERO,viewport_size), Color(0,0,0,0.74))
@@ -802,6 +857,7 @@ func _draw_library() -> void:
 	if search_open:
 		_button(Rect2(viewport_size.x - 300, 150, 245, 95), "Cerrar", Color(0.17, 0.25, 0.37))
 	else:
+		_button(Rect2(viewport_size.x - 300, 40, 245, 80), "Ajustes", Color(0.14, 0.22, 0.34))
 		_text("Canciones", Vector2(55, 205), 42, Color(0.82, 0.91, 1))
 		_button(Rect2(viewport_size.x - 670, 150, 245, 95), "Buscar", Color(0.14, 0.22, 0.34))
 		_button(Rect2(viewport_size.x - 405, 150, 350, 95), "Importar .osz", Color(0.04, 0.65, 0.88))
@@ -855,6 +911,25 @@ func _draw_prepare() -> void:
 	_text_centered("x%.1f" % _effective_mult(), cx, 1232, 56, Color(0.3,0.9,1.0) if speed_auto else Color.WHITE)
 	_button(Rect2(100,1360,viewport_size.x-200,145),"JUGAR",Color(0.02,0.68,0.88))
 
+func _draw_settings() -> void:
+	_background(); draw_set_transform(Vector2(0, ui_off))
+	var w := viewport_size.x
+	var muted := Color(0.62, 0.75, 0.88)
+	_button(Rect2(35, 45, 180, 95), "< Volver", Color(0.14, 0.22, 0.34))
+	_text_centered("AJUSTES", w / 2, 230, 58, Color.WHITE)
+	_panel(Rect2(80, 330, w - 160, 180), Color(0.08, 0.13, 0.22, 0.92), 34)
+	_text("Fondos de los mapas", Vector2(130, 415), 40, Color.WHITE)
+	_text("Imagen del mapa detrás de las teclas", Vector2(130, 465), 26, muted)
+	_button(Rect2(w - 330, 375, 200, 90), "SÍ" if show_bg else "NO", Color(0.02, 0.68, 0.88) if show_bg else Color(0.22, 0.28, 0.38))
+	var a := 1.0 if show_bg else 0.4
+	_panel(Rect2(80, 540, w - 160, 300), Color(0.08, 0.13, 0.22, 0.92 * a), 34)
+	_text("Visibilidad del fondo", Vector2(130, 625), 40, Color(1, 1, 1, a))
+	_button(Rect2(130, 690, 170, 110), "-", Color(0.14, 0.22, 0.34, a))
+	_button(Rect2(w - 300, 690, 170, 110), "+", Color(0.14, 0.22, 0.34, a))
+	_text_centered("%d %%" % roundi(bg_vis * 100.0), w / 2, 765, 56, Color(1, 1, 1, a))
+	_text("Los mapas importados antes de esta versión", Vector2(80, 920), 26, muted)
+	_text("hay que importarlos otra vez para que traigan su imagen.", Vector2(80, 960), 26, muted)
+
 func _draw_results() -> void:
 	_background(); draw_set_transform(Vector2(0, ui_off)); _text_centered("RESULTADOS", viewport_size.x / 2, 230, 58, Color.WHITE)
 	var w := viewport_size.x
@@ -878,6 +953,9 @@ func _draw_results() -> void:
 
 func _background() -> void:
 	draw_rect(Rect2(Vector2.ZERO,viewport_size),Color(0.025,0.05,0.1))
+	if show_bg and bg_texture != null and (screen == Screen.PREPARE or screen == Screen.RESULTS):
+		_draw_cover(bg_texture, Rect2(Vector2.ZERO, viewport_size))
+		draw_rect(Rect2(Vector2.ZERO, viewport_size), Color(0.025, 0.05, 0.1, 0.82))
 	for i in range(10): draw_circle(Vector2(viewport_size.x*0.75,viewport_size.y*0.22),700-i*50,Color(0,0.58,0.95,0.025))
 
 func _button(rect: Rect2, label: String, color: Color) -> void:
@@ -889,5 +967,19 @@ func _box(color: Color, radius: float) -> StyleBoxFlat:
 	var box := StyleBoxFlat.new(); box.bg_color=color
 	box.corner_radius_top_left=int(radius); box.corner_radius_top_right=int(radius); box.corner_radius_bottom_left=int(radius); box.corner_radius_bottom_right=int(radius)
 	return box
+func _text_outlined(value: String, center_x: float, y: float, size: int, color: Color, outline_color: Color, outline: int) -> void:
+	var font := _font()
+	var width := font.get_string_size(value, HORIZONTAL_ALIGNMENT_LEFT, -1, size).x
+	var pos := Vector2(center_x - width / 2.0, y)
+	draw_string_outline(font, pos, value, HORIZONTAL_ALIGNMENT_LEFT, -1, size, outline, outline_color)
+	draw_string(font, pos, value, HORIZONTAL_ALIGNMENT_LEFT, -1, size, color)
+
+## Dibuja la textura rellenando el rectángulo (recorta lo que sobra, sin deformar).
+func _draw_cover(tex: Texture2D, rect: Rect2, tint := Color.WHITE) -> void:
+	var ts := tex.get_size()
+	var k := maxf(rect.size.x / ts.x, rect.size.y / ts.y)
+	var src_size := rect.size / k
+	draw_texture_rect_region(tex, rect, Rect2((ts - src_size) / 2.0, src_size), tint)
+
 func _text(value: String, pos: Vector2, size: int, color: Color) -> void: draw_string(_font(),pos,value,HORIZONTAL_ALIGNMENT_LEFT,-1,size,color)
 func _font() -> Font: return ThemeDB.fallback_font
