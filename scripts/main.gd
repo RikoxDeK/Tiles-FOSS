@@ -16,6 +16,10 @@ const RANKS := ["D", "C", "B", "A", "S", "SS"]
 const RANK_COLORS := [Color(0.55, 0.6, 0.68), Color(0.35, 0.75, 0.55), Color(0.2, 0.7, 0.95), Color(0.55, 0.5, 1.0), Color(1.0, 0.75, 0.2), Color(1.0, 0.45, 0.75)]
 const PERFECT_WINDOW := 0.12
 const GREAT_WINDOW := 0.20
+const LIVES_MIN := 3
+const LIVES_MAX := 10
+const RESUME_BACKOFF := 0.10    # al continuar, la canción retoma este tiempo antes de la tecla
+const GRACE_AFTER_CONTINUE := 1.0
 const HIT_LATE := 0.28      # segundos de margen para tocar una tecla tarde
 const CARD_H := 190.0
 const CARD_GAP := 24.0
@@ -48,6 +52,18 @@ var bests: Dictionary = {}   # clave de mapa -> {"score", "rank", "acc"}
 var last_judgement := ""
 var judgement_time := 0.0
 var judgement_total := 0.5
+var lives_mode := false      # modo Vidas (ajuste guardado); false = Casual
+var lives_setting := 3       # vidas elegidas para la próxima partida (3..10)
+var lives_left := 0
+var run_lives := 0           # vidas con las que empezó esta partida (0 = casual)
+var life_menu := false       # menú "perdiste una vida"
+var life_menu_lock := 0.0    # evita tocar sin querer el menú justo al aparecer
+var resume_pending := false  # tras continuar: la siguiente tecla hace de "Continuar"
+var resume_idx := -1
+var grace_time := 0.0        # tras continuar, un segundo sin perder vidas
+var failed := false
+var fail_text := ""
+var run_mult := 1.0
 var combo_pop := 0.0
 var show_bg := true          # ajuste: mostrar la imagen de fondo del mapa
 var bg_vis := 0.30           # ajuste: cuánto se ve la imagen (0.1 - 0.7)
@@ -134,6 +150,8 @@ func _notification(what: int) -> void:
 func _go_back() -> void:
 	match screen:
 		Screen.GAME:
+			if life_menu or resume_pending or finished:
+				return
 			_set_paused(not paused)
 		Screen.PREPARE, Screen.SETTINGS:
 			screen = Screen.LIBRARY
@@ -173,6 +191,10 @@ func _process(delta: float) -> void:
 		judgement_time -= delta
 	if combo_pop > 0.0:
 		combo_pop -= delta
+	if life_menu_lock > 0.0:
+		life_menu_lock -= delta
+	if grace_time > 0.0 and not paused:
+		grace_time -= delta
 	if status_time > 0.0:
 		status_time -= delta
 	for effect in effects:
@@ -250,7 +272,9 @@ func _unhandled_input(event: InputEvent) -> void:
 	elif event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT:
 		_pointer(event.position, event.pressed, -1)
 	elif event is InputEventKey and screen == Screen.GAME:
-		if event.pressed and not event.echo and event.keycode == KEY_ESCAPE:
+		if life_menu or finished:
+			return
+		if event.pressed and not event.echo and event.keycode == KEY_ESCAPE and not resume_pending:
 			_set_paused(not paused)
 			return
 		var lane: int = _key_lane(event)
@@ -280,12 +304,29 @@ func _pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
 	if screen == Screen.PREPARE or screen == Screen.RESULTS or screen == Screen.SETTINGS:
 		pos.y -= ui_off
 	if screen == Screen.PREPARE:
-		if Rect2(100, 1360, viewport_size.x - 200, 145).has_point(pos): _start_game()
+		if Rect2(100, 1640, viewport_size.x - 200, 145).has_point(pos): _start_game()
 		elif Rect2(35, 45, 180, 95).has_point(pos): screen = Screen.LIBRARY
-		elif Rect2(100, 1130, 190, 120).has_point(pos): _adjust_speed(-SPEED_STEP)
-		elif Rect2(viewport_size.x - 290, 1130, 190, 120).has_point(pos): _adjust_speed(SPEED_STEP)
-		elif Rect2(310, 1130, viewport_size.x - 620, 120).has_point(pos): speed_auto = not speed_auto; _save_settings()
+		elif Rect2(100, 950, 190, 120).has_point(pos): _adjust_speed(-SPEED_STEP)
+		elif Rect2(viewport_size.x - 290, 950, 190, 120).has_point(pos): _adjust_speed(SPEED_STEP)
+		elif Rect2(310, 950, viewport_size.x - 620, 120).has_point(pos): speed_auto = not speed_auto; _save_settings()
+		elif _mode_rect(false).has_point(pos): lives_mode = false; _save_settings()
+		elif _mode_rect(true).has_point(pos): lives_mode = true; _save_settings()
+		elif lives_mode and Rect2(130, 1340, 170, 100).has_point(pos): _adjust_lives(-1)
+		elif lives_mode and Rect2(viewport_size.x - 300, 1340, 170, 100).has_point(pos): _adjust_lives(1)
 	elif screen == Screen.GAME:
+		if finished:
+			return
+		if life_menu:
+			pos.y -= ui_off
+			if life_menu_lock <= 0.0:
+				if Rect2(170, 760, viewport_size.x - 340, 135).has_point(pos): _give_up()
+				elif Rect2(170, 930, viewport_size.x - 340, 135).has_point(pos): _continue_after_life()
+			return
+		if resume_pending:
+			var rl: int = clampi(int(pos.x / (viewport_size.x / LANES)), 0, LANES - 1)
+			active_inputs[input_id] = rl
+			_try_hit(rl, input_id)
+			return
 		if Rect2(viewport_size.x - 145, 35 + top_inset, 110, 100).has_point(pos):
 			_set_paused(not paused)
 			return
@@ -337,8 +378,17 @@ func _start_game() -> void:
 	song_time = -lead_in; started = false; paused = false; finished = false
 	score = 0; combo = 0; max_combo = 0; hits = 0; misses = 0
 	perfects = 0; greats = 0; goods = 0; empties = 0
+	run_lives = lives_setting if lives_mode else 0
+	lives_left = run_lives
+	life_menu = false; life_menu_lock = 0.0; resume_pending = false; resume_idx = -1; grace_time = 0.0
+	failed = false; fail_text = ""; run_mult = 1.0
 
 func _try_hit(lane: int, input_id: int) -> void:
+	if resume_pending:
+		_resume_with(lane, input_id)
+		return
+	if paused or finished:
+		return
 	if not started:
 		for note in notes:
 			if note.type == "start" and note.lane == lane and not note.done:
@@ -364,6 +414,7 @@ func _try_hit(lane: int, input_id: int) -> void:
 	if best.is_empty():
 		combo = 0; empties += 1; _set_judgement("VACÍO", 0.4)
 		_effect(lane, hit_y, Color(1.0, 0.15, 0.18, 0.84))
+		_lose_life()
 		return
 	if best.type == "hold":
 		best.holding = true; best.input_id = input_id
@@ -392,12 +443,100 @@ func _judgement_color(text: String) -> Color:
 		"PERFECT": return Color(1.0, 0.78, 0.12)
 		"GREAT": return Color(0.05, 0.82, 0.95)
 		"GOOD": return Color(0.3, 0.85, 0.45)
+		"MANTÉN": return Color(1.0, 0.55, 0.1)
 		"MISS", "VACÍO": return Color(1.0, 0.25, 0.3)
 	return Color.WHITE
 
 func _miss(lane: int, effect_y: float) -> void:
 	misses += 1; combo = 0; _set_judgement("MISS", 0.6)
 	_effect(lane, effect_y, Color(1.0, 0.15, 0.18, 0.84))
+	_lose_life()
+
+# --- Modo Vidas ----------------------------------------------------------
+
+## Cada fallo (nota que se va, hold soltado, toque en vacío) cuesta una vida.
+## Con vidas restantes: pausa y menú (rendirse / continuar). Sin vidas: fin de la partida.
+func _lose_life() -> void:
+	if run_lives <= 0 or finished or life_menu or grace_time > 0.0:
+		return
+	lives_left -= 1
+	if lives_left <= 0:
+		_game_over("SIN VIDAS")
+	else:
+		life_menu = true
+		life_menu_lock = 0.7
+		_set_paused(true)
+
+func _game_over(text: String) -> void:
+	failed = true; fail_text = text; finished = true
+	await get_tree().create_timer(0.9).timeout
+	if screen == Screen.GAME:
+		_stop_audio()
+		_finish_run()
+		screen = Screen.RESULTS
+
+func _give_up() -> void:
+	life_menu = false; paused = false
+	failed = true; fail_text = "TE RENDISTE"; finished = true
+	_stop_audio()
+	_finish_run()
+	screen = Screen.RESULTS
+
+func _continue_after_life() -> void:
+	life_menu = false
+	# Las notas sostenidas en curso se perdonan: el dedo ya no está en la pantalla.
+	for n in notes:
+		if n.holding:
+			n.holding = false
+			n.done = true
+	active_inputs.clear()
+	# La siguiente tecla pendiente se muestra abajo como "Continuar": al tocarla se
+	# cuenta como esa nota y la canción sigue desde ahí (como la tecla Comenzar).
+	resume_idx = -1
+	for i in range(first_idx, notes.size()):
+		if not notes[i].done and notes[i].type != "start":
+			resume_idx = i
+			break
+	if resume_idx < 0:
+		grace_time = GRACE_AFTER_CONTINUE
+		_set_paused(false)
+	else:
+		resume_pending = true   # sigue pausado hasta que se toque esa tecla
+
+func _resume_with(lane: int, input_id: int) -> void:
+	if resume_idx < 0 or lane != int(notes[resume_idx].lane):
+		return
+	var n: Dictionary = notes[resume_idx]
+	resume_pending = false; resume_idx = -1
+	song_time = float(n.time) - RESUME_BACKOFF
+	if n.type == "hold":
+		n.holding = true; n.input_id = input_id
+	else:
+		n.done = true
+	_effect(lane, hit_y, Color(1, 1, 1, 0.82))
+	grace_time = GRACE_AFTER_CONTINUE
+	_set_paused(false)
+	if audio_stream != null and audio_started:
+		player.seek(maxf(0.0, song_time))
+
+## Puntos x1.00 con 3 vidas; cada vida extra resta ~7,1 % hasta x0.50 con 10.
+func _lives_mult(n: int) -> float:
+	return 1.0 - float(n - LIVES_MIN) * 0.5 / float(LIVES_MAX - LIVES_MIN)
+
+func _adjust_lives(delta: int) -> void:
+	lives_setting = clampi(lives_setting + delta, LIVES_MIN, LIVES_MAX)
+	_save_settings()
+
+func _mode_rect(lives: bool) -> Rect2:
+	var half := (viewport_size.x - 240.0) / 2.0
+	return Rect2(130.0 + half if lives else 110.0, 1190, half, 120)
+
+## Vidas como barras horizontales gruesas (las restantes encendidas, de izquierda a derecha).
+func _draw_lives_bars(x: float, y: float, bar_w: float, bar_h: float, gap: float) -> void:
+	for i in run_lives:
+		var r := Rect2(x + i * (bar_w + gap), y, bar_w, bar_h)
+		draw_rect(r.grow(3.0), Color(0.04, 0.16, 0.32, 0.9))
+		draw_rect(r, Color(1.0, 0.3, 0.4) if i < lives_left else Color(0.4, 0.46, 0.56, 0.6))
 
 func _effect(lane: int, effect_y: float, color: Color) -> void:
 	effects.append({"lane":lane, "y":effect_y, "color":color, "time":0.20, "duration":0.20})
@@ -650,6 +789,8 @@ func _load_settings() -> void:
 		return
 	speed_auto = cfg.get_value("speed", "auto", true)
 	speed_mult = clampf(float(cfg.get_value("speed", "mult", 1.0)), SPEED_MIN, SPEED_MAX)
+	lives_mode = bool(cfg.get_value("mods", "lives_mode", false))
+	lives_setting = clampi(int(cfg.get_value("mods", "lives", 3)), LIVES_MIN, LIVES_MAX)
 	show_bg = bool(cfg.get_value("display", "show_bg", true))
 	bg_vis = clampf(float(cfg.get_value("display", "bg_vis", 0.30)), 0.1, 0.7)
 	if cfg.has_section("best"):
@@ -662,6 +803,8 @@ func _save_settings() -> void:
 	var cfg := ConfigFile.new()
 	cfg.set_value("speed", "auto", speed_auto)
 	cfg.set_value("speed", "mult", speed_mult)
+	cfg.set_value("mods", "lives_mode", lives_mode)
+	cfg.set_value("mods", "lives", lives_setting)
 	cfg.set_value("display", "show_bg", show_bg)
 	cfg.set_value("display", "bg_vis", bg_vis)
 	for key in bests:
@@ -699,6 +842,12 @@ func _rank_for(acc: float, miss_count: int) -> int:
 func _finish_run() -> void:
 	run_accuracy = _accuracy()
 	run_rank = _rank_for(run_accuracy, misses)
+	run_mult = _lives_mult(run_lives) if run_lives > 0 else 1.0
+	if run_lives > 0:
+		score = roundi(score * run_mult)
+	if failed:
+		run_record = false
+		return
 	var key := _song_key(current_song)
 	var old: Dictionary = bests.get(key, {})
 	run_record = score > int(old.get("score", 0))
@@ -758,7 +907,7 @@ func _draw_game() -> void:
 	for lane in LANES:
 		draw_rect(Rect2(lane * lane_w, 0, lane_w, viewport_size.y), Color(0.9,0.96,1,0.20))
 		draw_line(Vector2(lane * lane_w,0), Vector2(lane * lane_w,viewport_size.y), Color.WHITE, 3)
-	for i in range(first_idx, notes.size()):
+	for i in range(first_idx, first_idx if resume_pending else notes.size()):
 		var note: Dictionary = notes[i]
 		if note.type != "start" and note.time - song_time > ahead: break
 		if note.done or (note.type == "start" and started): continue
@@ -801,7 +950,33 @@ func _draw_game() -> void:
 		_text_outlined(str(combo), viewport_size.x / 2, 200 + top_inset, csize, ccol, Color(0.04, 0.16, 0.32, 0.95), 16)
 		_text_outlined("COMBO", viewport_size.x / 2, 255 + top_inset, 30, Color.WHITE, Color(0.04, 0.16, 0.32, 0.95), 8)
 	_button(Rect2(viewport_size.x-145,35+top_inset,110,100), "II", Color(0.06,0.12,0.2,0.72))
-	if paused:
+	if run_lives == LIVES_MIN:
+		_draw_lives_bars(55, 60 + top_inset, 64, 16, 12)
+	elif run_lives > LIVES_MIN:
+		_text_outlined(str(lives_left), 90, 105 + top_inset, 60, Color(1.0, 0.3, 0.4), Color(0.04, 0.16, 0.32, 0.95), 10)
+	if resume_pending:
+		var rn: Dictionary = notes[resume_idx]
+		var rrect := Rect2(rn.lane * (viewport_size.x / LANES) + 2, viewport_size.y - NORMAL_HEIGHT, viewport_size.x / LANES - 4, NORMAL_HEIGHT)
+		draw_rect(rrect, Color(0.01, 0.01, 0.015))
+		_text("Continuar", Vector2(rrect.position.x + 18, rrect.get_center().y + 12), 35, Color.WHITE)
+	if failed and finished:
+		draw_rect(Rect2(Vector2.ZERO, viewport_size), Color(0, 0, 0, 0.6))
+		_text_outlined(fail_text, viewport_size.x / 2, viewport_size.y / 2, 90, Color(1.0, 0.3, 0.35), Color(0.02, 0.05, 0.12, 0.95), 14)
+	if life_menu:
+		var lk := 0.45 if life_menu_lock > 0.0 else 1.0
+		draw_rect(Rect2(Vector2.ZERO, viewport_size), Color(0, 0, 0, 0.74))
+		draw_set_transform(Vector2(0, ui_off))
+		_text_outlined("PERDISTE UNA VIDA", viewport_size.x / 2, 520, 62, Color(1.0, 0.3, 0.35), Color(0.02, 0.05, 0.12, 0.95), 12)
+		if run_lives == LIVES_MIN:
+			_draw_lives_bars(viewport_size.x / 2 - 249.0, 590, 150, 30, 24)
+			_text_centered("Te quedan %d" % lives_left, viewport_size.x / 2, 700, 34, Color(0.82, 0.91, 1))
+		else:
+			_text_outlined(str(lives_left), viewport_size.x / 2, 680, 150, Color(1.0, 0.3, 0.4), Color(0.02, 0.05, 0.12, 0.95), 14)
+			_text_centered("vidas restantes", viewport_size.x / 2, 735, 30, Color(0.82, 0.91, 1))
+		_button(Rect2(170, 760, viewport_size.x - 340, 135), "RENDIRSE", Color(0.62, 0.16, 0.22, lk))
+		_button(Rect2(170, 930, viewport_size.x - 340, 135), "CONTINUAR", Color(0.02, 0.68, 0.88, lk))
+		draw_set_transform(Vector2.ZERO)
+	elif paused and not resume_pending:
 		draw_rect(Rect2(Vector2.ZERO,viewport_size), Color(0,0,0,0.74))
 		draw_set_transform(Vector2(0, ui_off))
 		_text("PAUSA", Vector2(viewport_size.x/2-110,600), 62, Color.WHITE)
@@ -894,22 +1069,42 @@ func _draw_difficulty_picker() -> void:
 
 func _draw_prepare() -> void:
 	_background(); draw_set_transform(Vector2(0, ui_off)); _button(Rect2(35,45,180,95),"< Volver",Color(0.14,0.22,0.34))
-	var text_w := viewport_size.x - 160
+	var w := viewport_size.x
+	var muted := Color(0.62, 0.75, 0.88)
+	var text_w := w - 160
 	_text(_fit(current_song.title, text_w, 58), Vector2(80,370), 58, Color.WHITE)
 	_text(_fit("%s · %s" % [current_song.artist, current_song.version], text_w, 32), Vector2(82,445), 32, Color(0.68,0.84,0.96))
-	_panel(Rect2(80,580,viewport_size.x-160,440),Color(0.08,0.13,0.22,0.92),34)
-	_text("%d notas · %d sostenidas" % [song_stats.notes, song_stats.holds], Vector2(140,690), 38, Color.WHITE)
-	_text("%s · %s" % [_format_time(song_stats.duration), "Con audio" if audio_stream != null else "Sin audio"], Vector2(140,770), 38, Color.WHITE if audio_stream != null else Color(1,0.6,0.6))
+	_panel(Rect2(80,560,w-160,340),Color(0.08,0.13,0.22,0.92),34)
+	_text("%d notas · %d sostenidas" % [song_stats.notes, song_stats.holds], Vector2(140,645), 38, Color.WHITE)
+	_text("%s · %s" % [_format_time(song_stats.duration), "Con audio" if audio_stream != null else "Sin audio"], Vector2(140,715), 38, Color.WHITE if audio_stream != null else Color(1,0.6,0.6))
 	if song_stats.dropped > 0:
-		_text("Adaptado a %d dedos: se quitaron %d de %d notas" % [OsuImporter.DEFAULT_MAX_FINGERS, song_stats.dropped, song_stats.total], Vector2(140,850), 28, Color(0.62,0.75,0.88))
-	_text("PC: D · F · J · K", Vector2(140,970), 28, Color(0.62,0.75,0.88))
+		_text(_fit("Adaptado a %d dedos: se quitaron %d de %d notas" % [OsuImporter.DEFAULT_MAX_FINGERS, song_stats.dropped, song_stats.total], w - 280, 28), Vector2(140,775), 28, muted)
+	_text("PC: D · F · J · K", Vector2(140,860), 28, muted)
 	# Velocidad
-	var cx := viewport_size.x / 2
-	_button(Rect2(100,1130,190,120),"-",Color(0.14,0.22,0.34))
-	_button(Rect2(viewport_size.x-290,1130,190,120),"+",Color(0.14,0.22,0.34))
-	_text_centered("Velocidad · AUTO" if speed_auto else "Velocidad · MANUAL (toca: auto)", cx, 1172, 28, Color(0.62,0.75,0.88))
-	_text_centered("x%.1f" % _effective_mult(), cx, 1232, 56, Color(0.3,0.9,1.0) if speed_auto else Color.WHITE)
-	_button(Rect2(100,1360,viewport_size.x-200,145),"JUGAR",Color(0.02,0.68,0.88))
+	var cx := w / 2
+	_button(Rect2(100,950,190,120),"-",Color(0.14,0.22,0.34))
+	_button(Rect2(w-290,950,190,120),"+",Color(0.14,0.22,0.34))
+	_text_centered("Velocidad · AUTO" if speed_auto else "Velocidad · MANUAL (toca: auto)", cx, 992, 28, muted)
+	_text_centered("x%.1f" % _effective_mult(), cx, 1052, 56, Color(0.3,0.9,1.0) if speed_auto else Color.WHITE)
+	# Modificadores
+	_panel(Rect2(80,1110,w-160,450),Color(0.08,0.13,0.22,0.92),34)
+	_text("MODO", Vector2(130,1165), 28, muted)
+	_button(_mode_rect(false), "CASUAL", Color(0.02,0.68,0.88) if not lives_mode else Color(0.17,0.25,0.37))
+	_button(_mode_rect(true), "VIDAS", Color(0.78,0.2,0.3) if lives_mode else Color(0.17,0.25,0.37))
+	if lives_mode:
+		_button(Rect2(130,1340,170,100), "-", Color(0.14,0.22,0.34))
+		_button(Rect2(w-300,1340,170,100), "+", Color(0.14,0.22,0.34))
+		_text_centered("%d vidas" % lives_setting, cx, 1405, 48, Color.WHITE)
+		var m := _lives_mult(lives_setting)
+		if lives_setting == LIVES_MIN:
+			_text_centered("Sin penalización de puntos", cx, 1490, 28, Color(0.5, 0.95, 0.75))
+		else:
+			_text_centered("Puntos x%.2f (-%d %%)" % [m, roundi((1.0 - m) * 100.0)], cx, 1490, 28, Color(1.0, 0.75, 0.4))
+		_text_centered("Cada fallo cuesta una vida. Al llegar a 0, se acaba.", cx, 1535, 24, muted)
+	else:
+		_text_centered("Sin límite de fallos", cx, 1405, 40, Color.WHITE)
+		_text_centered("Juega tranquilo: fallar solo rompe el combo.", cx, 1465, 28, muted)
+	_button(Rect2(100,1640,w-200,145),"JUGAR",Color(0.02,0.68,0.88))
 
 func _draw_settings() -> void:
 	_background(); draw_set_transform(Vector2(0, ui_off))
@@ -942,6 +1137,10 @@ func _draw_results() -> void:
 	_text_centered("Precisión %.1f %%" % run_accuracy, w / 2, 640, 40, dark)
 	if run_record:
 		_text_centered("¡Nuevo récord!", w / 2, 700, 34, Color(1.0, 0.6, 0.1))
+	if failed:
+		_text_centered(fail_text, w / 2, 745, 32, Color(0.9, 0.2, 0.28))
+	elif run_lives > 0:
+		_text_centered("Modo Vidas · %d vidas · puntos x%.2f" % [run_lives, run_mult], w / 2, 745, 28, muted)
 	_text("Puntuación", Vector2(170, 800), 29, muted); _text(str(score), Vector2(170, 880), 68, Color(0.02, 0.62, 0.86))
 	_text("Perfect: %d" % perfects, Vector2(170, 980), 34, dark); _text("Great: %d" % greats, Vector2(w / 2 + 20, 980), 34, dark)
 	_text("Good: %d" % goods, Vector2(170, 1045), 34, dark); _text("Fallos: %d" % misses, Vector2(w / 2 + 20, 1045), 34, dark)
