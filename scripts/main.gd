@@ -81,6 +81,8 @@ var current_parsed: Dictionary = {}   # mapa .osu parseado de la canción abiert
 var library_dir := ""        # carpeta de canciones elegida ("" = sin configurar)
 var syncing := false
 var bg_blend := 0.0       # 0 = fondo azul normal, 1 = fondo de las 3 estrellas
+var play_rate := 1.0      # velocidad de la canción (audio y reloj): sube con cada vuelta del Infinito
+var previewing := false   # escuchando solo el audio en la pantalla de preparar
 var perm_asked := false   # ya pedimos el permiso de archivos en esta sesión
 var folder_dialog: FileDialog
 var infinite_mode := false   # ajuste: modo Infinito (usa las vidas)
@@ -196,6 +198,7 @@ func _go_back() -> void:
 				return
 			_set_paused(not paused)
 		Screen.PREPARE, Screen.SETTINGS:
+			_stop_audio()
 			screen = Screen.LIBRARY
 		Screen.RESULTS:
 			open_group = {}
@@ -224,9 +227,11 @@ func _resize() -> void:
 
 func _process(delta: float) -> void:
 	if screen == Screen.GAME and started and not paused and not finished:
-		song_time += delta
+		song_time += delta * play_rate
 		_sync_audio()
 		_update_notes()
+	if previewing and (screen != Screen.PREPARE or not player.playing):
+		previewing = false
 	if search_edit != null:
 		search_edit.visible = screen == Screen.LIBRARY and search_open and open_group.is_empty()
 	if judgement_time > 0.0:
@@ -263,7 +268,8 @@ func _sync_audio() -> void:
 	if not player.playing:
 		return
 	# El reloj avanza con delta y se corrige suavemente contra la posición real del audio.
-	var audio_time := player.get_playback_position() + AudioServer.get_time_since_last_mix() - AudioServer.get_output_latency() + audio_offset
+	# La posición del audio va en segundos de la canción; latencia y mezcla van en segundos reales.
+	var audio_time := player.get_playback_position() + (AudioServer.get_time_since_last_mix() - AudioServer.get_output_latency()) * play_rate + audio_offset
 	var error := audio_time - song_time
 	if abs(error) > 0.08:
 		song_time = audio_time
@@ -286,7 +292,7 @@ func _update_notes() -> void:
 				note.done = true
 				note.holding = false
 				_hit(note.lane, "PERFECT", 180, hit_y)
-		elif note.type != "start" and song_time > note.time + HIT_LATE:
+		elif note.type != "start" and song_time > note.time + HIT_LATE * play_rate:
 			var miss_position: float = hit_y + (song_time - note.time) * speed
 			note.done = true
 			if note.type == "hold":   # la larga entera se queda atrás, apagada
@@ -345,6 +351,7 @@ func _grant_award(kind: String) -> void:
 		banner_text = "CORONA %d/3" % crowns
 	banner_kind = kind
 	banner_time = 1.8
+	_store_infinite_best()
 
 func _next_lap() -> void:
 	_check_awards(true)
@@ -352,7 +359,10 @@ func _next_lap() -> void:
 	lap_factor = 1.0 + 0.5 * float(lap - 1)
 	lap_banner_text = "VUELTA %d · x%.1f" % [lap, lap_factor]
 	lap_banner_time = 2.4
-	speed = BASE_SPEED * _effective_mult() * lap_factor
+	play_rate = lap_factor   # la canción suena y avanza más rápido
+	player.pitch_scale = play_rate
+	speed = BASE_SPEED * _effective_mult()
+	_store_infinite_best()
 	ahead = hit_y / speed + 0.15
 	lead_in = maxf(0.0, hit_y / speed + 0.05 - first_note_time) if use_lead_in else 0.0
 	for n in notes:
@@ -366,17 +376,31 @@ func _next_lap() -> void:
 	song_time = -(lead_in + 0.6)
 	award_idx = 0
 
-func _finish_infinite() -> void:
+## Guarda el mejor resultado del Infinito (estrellas, coronas, vuelta y puntos) para esta
+## canción y dificultad. Se llama al ganar cada premio y cada vuelta, así no se pierde nada
+## aunque salgas antes de que termine la partida. Solo sube, nunca baja.
+func _store_infinite_best() -> void:
+	if not infinite_run or current_song.is_empty():
+		return
 	var key := _song_key(current_song) + "|inf"
 	var old: Dictionary = bests.get(key, {})
-	run_record = stars > int(old.get("stars", 0)) or crowns > int(old.get("crowns", 0)) or lap > int(old.get("laps", 0))
-	bests[key] = {
+	var pen := roundi(score * _lives_mult(run_lives)) if run_lives > 0 else score
+	var nb := {
 		"stars": maxi(stars, int(old.get("stars", 0))),
 		"crowns": maxi(crowns, int(old.get("crowns", 0))),
 		"laps": maxi(lap, int(old.get("laps", 0))),
-		"score": maxi(score, int(old.get("score", 0))),
+		"score": maxi(pen, int(old.get("score", 0))),
 	}
+	if nb.stars > int(old.get("stars", 0)) or nb.crowns > int(old.get("crowns", 0)) or nb.laps > int(old.get("laps", 0)) or nb.score > int(old.get("score", 0)):
+		run_record = true
+	bests[key] = nb
 	_save_settings()
+
+func _finish_infinite() -> void:
+	_store_infinite_best()
+	# Penalización por vidas extra (igual que en Vidas): 3 vidas sin penalización.
+	run_mult = _lives_mult(run_lives) if run_lives > 0 else 1.0
+	score = roundi(score * run_mult)
 
 func _star_poly(c: Vector2, r: float) -> PackedVector2Array:
 	var pts := PackedVector2Array()
@@ -468,7 +492,8 @@ func _pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
 		pos.y -= ui_off
 	if screen == Screen.PREPARE:
 		if Rect2(100, 1640, viewport_size.x - 200, 145).has_point(pos): _start_game()
-		elif Rect2(35, 45, 180, 95).has_point(pos): screen = Screen.LIBRARY
+		elif Rect2(35, 45, 180, 95).has_point(pos): _stop_audio(); screen = Screen.LIBRARY
+		elif Rect2(viewport_size.x - 365, 45, 330, 95).has_point(pos): _toggle_preview()
 		elif Rect2(100, 800, 190, 110).has_point(pos): _adjust_diff(-1)
 		elif Rect2(viewport_size.x - 290, 800, 190, 110).has_point(pos): _adjust_diff(1)
 		elif Rect2(100, 950, 190, 120).has_point(pos): _adjust_speed(-SPEED_STEP)
@@ -538,7 +563,8 @@ func _start_game() -> void:
 	infinite_run = infinite_mode and lives_mode
 	lap = 1; lap_factor = 1.0; award_idx = 0; stars = 0; crowns = 0
 	banner_time = 0.0; lap_banner_time = 0.0; bg_blend = 0.0
-	speed = BASE_SPEED * _effective_mult() * lap_factor
+	play_rate = 1.0; player.pitch_scale = 1.0; run_record = false
+	speed = BASE_SPEED * _effective_mult()
 	ahead = hit_y / speed + 0.15
 	# Que la primera nota entre desde arriba justo al empezar.
 	lead_in = maxf(0.0, hit_y / speed + 0.05 - first_note_time) if use_lead_in else 0.0
@@ -587,7 +613,7 @@ func _try_hit(lane: int, input_id: int) -> void:
 		if note.done or note.type == "start" or note.lane != lane: continue
 		var early: float = clampf(float(note.height) / speed, 0.2, 0.6)
 		var signed_diff: float = song_time - note.time
-		if signed_diff < -early or signed_diff > HIT_LATE: continue
+		if signed_diff < -early * play_rate or signed_diff > HIT_LATE * play_rate: continue
 		best_diff = abs(signed_diff); best = note
 		break  # la más antigua pendiente del carril
 	if best.is_empty():
@@ -600,7 +626,7 @@ func _try_hit(lane: int, input_id: int) -> void:
 		_effect(lane, hit_y, Color(1, 1, 1, 0.82))
 	else:
 		best.done = true
-		var judgement := "PERFECT" if best_diff <= PERFECT_WINDOW else ("GREAT" if best_diff <= GREAT_WINDOW else "GOOD")
+		var judgement := "PERFECT" if best_diff <= PERFECT_WINDOW * play_rate else ("GREAT" if best_diff <= GREAT_WINDOW * play_rate else "GOOD")
 		var points := 100 if judgement == "PERFECT" else (75 if judgement == "GREAT" else 50)
 		_hit(lane, judgement, points, hit_y)
 
@@ -1154,6 +1180,7 @@ func _adjust_diff(delta: int) -> void:
 	_save_settings()
 
 func _select_song(entry: Dictionary) -> void:
+	_stop_audio()
 	var new_chart: Array = []
 	var stream: AudioStream = null
 	var new_lead := false
@@ -1313,11 +1340,27 @@ func _set_paused(value: bool) -> void:
 	player.stream_paused = value
 
 func _stop_audio() -> void:
+	previewing = false
 	player.stop()
 	player.stream_paused = false
 	audio_started = false
 
+## Escuchar solo el audio de la canción abierta (sin jugar).
+func _toggle_preview() -> void:
+	if previewing:
+		_stop_audio()
+		return
+	if audio_stream == null:
+		return
+	player.stream = audio_stream
+	player.pitch_scale = 1.0
+	player.stream_paused = false
+	player.play()
+	previewing = true
+
 func _go_library() -> void:
+	if infinite_run and screen == Screen.GAME and not finished:
+		_store_infinite_best()
 	_stop_audio()
 	open_group = {}
 	screen = Screen.LIBRARY
@@ -1568,6 +1611,10 @@ func _draw_prepare() -> void:
 	_background(); draw_set_transform(Vector2(0, ui_off)); _button(Rect2(35,45,180,95),"< Volver",Color(0.14,0.22,0.34))
 	var w := viewport_size.x
 	var muted := Color(0.62, 0.75, 0.88)
+	var prev_col := Color(0.78, 0.2, 0.3) if previewing else Color(0.02, 0.68, 0.88)
+	if audio_stream == null:
+		prev_col = Color(0.14, 0.22, 0.34, 0.4)
+	_button(Rect2(w - 365, 45, 330, 95), "Detener" if previewing else "Escuchar", prev_col)
 	var text_w := w - 160
 	_text(_fit(current_song.title, text_w, 58), Vector2(80,370), 58, Color.WHITE)
 	_text(_fit("%s · %s" % [current_song.artist, current_song.version], text_w, 32), Vector2(82,445), 32, Color(0.68,0.84,0.96))
@@ -1588,7 +1635,7 @@ func _draw_prepare() -> void:
 	_text_centered("Velocidad · AUTO" if speed_auto else "Velocidad · MANUAL (toca: auto)", cx, 992, 28, muted)
 	_text_centered("x%.1f" % _effective_mult(), cx, 1052, 56, Color(0.3,0.9,1.0) if speed_auto else Color.WHITE)
 	# Modificadores
-	_panel(Rect2(80,1110,w-160,450),Color(0.08,0.13,0.22,0.92),34)
+	_panel(Rect2(80,1110,w-160,470),Color(0.08,0.13,0.22,0.92),34)
 	_text("MODO", Vector2(130,1165), 28, muted)
 	_button(_mode_rect(0), "CASUAL", Color(0.02,0.68,0.88) if not lives_mode else Color(0.17,0.25,0.37))
 	_button(_mode_rect(1), "VIDAS", Color(0.78,0.2,0.3) if lives_mode and not infinite_mode else Color(0.17,0.25,0.37))
@@ -1597,20 +1644,54 @@ func _draw_prepare() -> void:
 		_button(Rect2(130,1340,170,100), "-", Color(0.14,0.22,0.34))
 		_button(Rect2(w-300,1340,170,100), "+", Color(0.14,0.22,0.34))
 		_text_centered("%d vidas" % lives_setting, cx, 1405, 48, Color.WHITE)
+		var m := _lives_mult(lives_setting)
+		var pen_text := "Sin penalización de puntos" if lives_setting == LIVES_MIN else "Puntos x%.2f (-%d %%)" % [m, roundi((1.0 - m) * 100.0)]
+		var pen_col := Color(0.5, 0.95, 0.75) if lives_setting == LIVES_MIN else Color(1.0, 0.75, 0.4)
 		if infinite_mode:
-			_text_centered("3 estrellas en la vuelta 1 y 3 coronas en las vueltas 2 y 3", cx, 1480, 26, Color(1.0, 0.82, 0.3))
-			_text_centered("Cada vuelta sube la velocidad: x1.0, x1.5, x2.0, x2.5...", cx, 1515, 26, Color(1.0, 0.82, 0.3))
+			_text_centered("3 estrellas en la vuelta 1 y 3 coronas en las vueltas 2 y 3", cx, 1470, 24, Color(1.0, 0.82, 0.3))
+			_text_centered("Cada vuelta acelera la canción: x1.0, x1.5, x2.0, x2.5...", cx, 1500, 24, Color(1.0, 0.82, 0.3))
+			_text_centered(pen_text, cx, 1532, 26, pen_col)
+			_text_centered("Puedes fallar %d veces y seguir; el siguiente fallo termina." % lives_setting, cx, 1560, 22, muted)
 		else:
-			var m := _lives_mult(lives_setting)
-			if lives_setting == LIVES_MIN:
-				_text_centered("Sin penalización de puntos", cx, 1490, 28, Color(0.5, 0.95, 0.75))
-			else:
-				_text_centered("Puntos x%.2f (-%d %%)" % [m, roundi((1.0 - m) * 100.0)], cx, 1490, 28, Color(1.0, 0.75, 0.4))
-		_text_centered("Puedes fallar %d veces y seguir; el siguiente fallo termina." % lives_setting, cx, 1545, 24, muted)
+			_text_centered(pen_text, cx, 1490, 28, pen_col)
+			_text_centered("Puedes fallar %d veces y seguir; el siguiente fallo termina." % lives_setting, cx, 1545, 24, muted)
 	else:
 		_text_centered("Sin límite de fallos", cx, 1405, 40, Color.WHITE)
 		_text_centered("Juega tranquilo: fallar solo rompe el combo. No se guarda.", cx, 1465, 28, muted)
+	_draw_prepare_record(cx)
 	_button(Rect2(100,1640,w-200,145),"JUGAR",Color(0.02,0.68,0.88))
+
+## Mejor récord de esta canción para el modo elegido (Casual no guarda).
+func _draw_prepare_record(cx: float) -> void:
+	if not lives_mode:
+		return
+	var key := _song_key(current_song)
+	var muted := Color(0.62, 0.75, 0.88)
+	var gold := Color(1.0, 0.82, 0.3)
+	if infinite_mode:
+		var b: Dictionary = bests.get(key + "|inf", {})
+		if b.is_empty():
+			_text_centered("Récord: sin récord todavía", cx, 1620, 28, muted)
+			return
+		var n_st := mini(int(b.get("stars", 0)), 3)
+		var n_cr := mini(int(b.get("crowns", 0)), 3)
+		var label := "Vuelta %d · %d pts" % [int(b.get("laps", 1)), int(b.get("score", 0))]
+		var ir := 15.0
+		var step := ir * 2.7
+		var icons_w := (n_st + n_cr) * step
+		var text_w := _font().get_string_size(label, HORIZONTAL_ALIGNMENT_LEFT, -1, 28).x
+		var x := cx - (icons_w + (24.0 if icons_w > 0.0 else 0.0) + text_w) / 2.0
+		for i in n_st:
+			_draw_award("star", Vector2(x + step / 2.0 + i * step, 1609), ir, true)
+		for i in n_cr:
+			_draw_award("crown", Vector2(x + step / 2.0 + (n_st + i) * step, 1609), ir, true)
+		_text(label, Vector2(x + icons_w + (24.0 if icons_w > 0.0 else 0.0), 1620), 28, gold)
+	else:
+		var b2: Dictionary = bests.get(key, {})
+		if b2.is_empty():
+			_text_centered("Récord: sin récord todavía", cx, 1620, 28, muted)
+		else:
+			_text_centered("Récord: %s · %d pts" % [RANKS[int(b2.rank)], int(b2.score)], cx, 1620, 28, gold)
 
 func _draw_settings() -> void:
 	_background(); draw_set_transform(Vector2(0, ui_off))
@@ -1663,7 +1744,13 @@ func _draw_results_infinite() -> void:
 		_text_centered(fail_text, w / 2, 980, 32, Color(0.9, 0.2, 0.28))
 	if run_record:
 		_text_centered("¡Nuevo récord!", w / 2, 1030, 34, Color(1.0, 0.6, 0.1))
+	if run_lives > 0:
+		var pen_note := "%d vidas · sin penalización" % run_lives if run_lives == LIVES_MIN else "%d vidas · puntos x%.2f" % [run_lives, run_mult]
+		_text_centered(pen_note, w / 2, 1085, 24, muted)
 	_text("Puntuación", Vector2(170, 1120), 29, muted); _text(str(score), Vector2(170, 1200), 68, Color(0.02, 0.62, 0.86))
+	var ib: Dictionary = bests.get(_song_key(current_song) + "|inf", {})
+	if not ib.is_empty():
+		_text_centered("Mejor: vuelta %d · %d pts" % [int(ib.get("laps", 1)), int(ib.get("score", 0))], w / 2, 1270, 28, muted)
 	_button(Rect2(110, 1400, w - 220, 135), "REPETIR", Color(0.02, 0.68, 0.88)); _button(Rect2(110, 1570, w - 220, 120), "CANCIONES", Color(0.17, 0.25, 0.37))
 
 func _draw_results() -> void:
