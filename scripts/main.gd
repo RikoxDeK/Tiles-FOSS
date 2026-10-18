@@ -1,6 +1,6 @@
 extends Node2D
 
-enum Screen { LIBRARY, PREPARE, GAME, RESULTS, SETTINGS }
+enum Screen { LIBRARY, PREPARE, GAME, RESULTS, SETTINGS, PALETTE }
 const LANES := 4
 const NORMAL_HEIGHT := 455.0
 const BASE_SPEED := 760.0
@@ -10,6 +10,8 @@ const SPEED_MAX := 5.0
 const SPEED_STEP := 0.1
 const HIT_MARGIN := 340.0   # distancia de la línea de golpeo al borde inferior de la pantalla
 const OsuImporter = preload("res://scripts/osu_importer.gd")
+const TilesLang = preload("res://scripts/i18n.gd")
+const TilesPalette = preload("res://scripts/palette.gd")
 const START_TIME := -100.0
 const LIST_TOP := 320.0
 const RANKS := ["D", "C", "B", "A", "S", "SS"]
@@ -95,6 +97,8 @@ var syncing := false
 var bg_blend := 0.0       # 0 = fondo azul normal, 1 = fondo de las 3 estrellas
 var play_rate := 1.0      # velocidad de la canción (audio y reloj): sube con cada vuelta del Infinito
 var previewing := false   # escuchando solo el audio en la pantalla de preparar
+var lang := "es"             # idioma de la interfaz: "es" o "en"
+var pal: Dictionary = TilesPalette.defaults()   # paleta actual: id de rol -> Color
 var perm_asked := false   # ya pedimos el permiso de archivos en esta sesión
 var folder_dialog: FileDialog
 var infinite_mode := false   # ajuste: modo Infinito (usa las vidas)
@@ -192,6 +196,246 @@ var demo_chart: Array = [
 	{"time":11.34,"lane":3,"type":"tap"}
 ]
 
+# --- Paleta de colores e idioma ---------------------------------------------
+
+var pal_sel := 0              # rol elegido en la pantalla de paleta
+var pal_h := 0.0              # tono, saturación y brillo del rol elegido (se guardan aparte para no perder el tono en grises)
+var pal_s := 0.0
+var pal_v := 0.0
+var pal_drag := -1            # barra que se está arrastrando (0 tono, 1 saturación, 2 brillo)
+var pal_drag_id := -999
+var pal_reset_armed := false  # "Restablecer todo" espera una segunda pulsación
+
+## Color de un rol de la paleta.
+func pcol(id: String) -> Color:
+	return pal.get(id, Color.WHITE)
+
+func acol(c: Color, a: float) -> Color:
+	return Color(c.r, c.g, c.b, a)
+
+## Colores derivados de la paleta (así hay menos roles que editar).
+func _soft() -> Color:
+	return pcol("card").lerp(pcol("accent"), 0.12)
+
+func _ink_soft() -> Color:
+	return pcol("ink").lerp(pcol("card"), 0.35)
+
+func _hot() -> Color:
+	return pcol("danger").lightened(0.15)
+
+func _ok() -> Color:
+	return pcol("good").lerp(Color.WHITE, 0.35)
+
+func _err() -> Color:
+	return pcol("danger").lerp(Color.WHITE, 0.4)
+
+func _nav_edge() -> Color:
+	return pcol("nav").lerp(pcol("muted"), 0.28)
+
+## Traduce un texto (la clave es el texto en español). Si no hay traducción, lo deja igual.
+func T(s: String) -> String:
+	if lang == "es":
+		return s
+	return TilesLang.EN.get(s, s)
+
+func _apply_language() -> void:
+	file_dialog.filters = PackedStringArray([T("*.osz ; Beatmaps de osu!")])
+	search_edit.placeholder_text = T("Canción, artista o dificultad")
+	name_edit.placeholder_text = T("Nombre de la lista")
+
+func _set_lang(code: String) -> void:
+	if lang == code:
+		return
+	lang = code
+	_apply_language()
+	_apply_filter()
+	_save_settings()
+
+## Los cuadros de texto (buscar, nombre de lista) usan nodos, así que se recolorean aparte.
+func _apply_edit_theme() -> void:
+	for e in [search_edit, name_edit]:
+		if e == null:
+			continue
+		e.add_theme_color_override("font_color", pcol("ink"))
+		e.add_theme_color_override("font_placeholder_color", Color(0.5, 0.6, 0.7))
+		e.add_theme_color_override("caret_color", pcol("accent").darkened(0.08))
+		var is_search: bool = e == search_edit
+		for style_name in ["normal", "focus", "read_only"]:
+			var box := _box(pcol("card") if is_search else _soft(), 24 if is_search else 22)
+			box.content_margin_left = 28.0 if is_search else 26.0
+			box.content_margin_right = 20.0
+			e.add_theme_stylebox_override(style_name, box)
+	if search_edit != null:
+		search_edit.add_theme_color_override("clear_button_color", Color(0.4, 0.5, 0.6))
+		search_edit.add_theme_color_override("clear_button_color_pressed", pcol("accent").darkened(0.08))
+
+func _open_palette() -> void:
+	screen = Screen.PALETTE
+	_pal_select(pal_sel)
+
+func _pal_id(i: int) -> String:
+	return String(TilesPalette.ROLES[i].id)
+
+func _pal_select(i: int) -> void:
+	pal_sel = clampi(i, 0, TilesPalette.ROLES.size() - 1)
+	var c: Color = pcol(_pal_id(pal_sel))
+	pal_h = c.h
+	pal_s = c.s
+	pal_v = c.v
+	pal_reset_armed = false
+
+func _pal_apply_hsv() -> void:
+	pal[_pal_id(pal_sel)] = Color.from_hsv(pal_h, pal_s, pal_v)
+	_apply_edit_theme()
+
+func _pal_close(a: Color, b: Color) -> bool:
+	return absf(a.r - b.r) < 0.01 and absf(a.g - b.g) < 0.01 and absf(a.b - b.b) < 0.01
+
+func _pal_is_preset(i: int) -> bool:
+	var p: Dictionary = TilesPalette.preset(i)
+	for k in p:
+		if not _pal_close(p[k], pcol(String(k))):
+			return false
+	return true
+
+func _pal_swatch_rect(i: int) -> Rect2:
+	var gap := 14.0
+	var cw := (viewport_size.x - 110.0 - 3.0 * gap) / 4.0
+	return Rect2(55.0 + (i % 4) * (cw + gap), 300.0 + (i / 4) * 112.0, cw, 100.0)
+
+func _pal_preset_rect(i: int) -> Rect2:
+	var gap := 14.0
+	var bw := (viewport_size.x - 110.0 - 3.0 * gap) / 4.0
+	return Rect2(55.0 + i * (bw + gap), 190.0, bw, 80.0)
+
+func _pal_slider_rect(i: int) -> Rect2:
+	return Rect2(95.0, 1110.0 + i * 130.0, viewport_size.x - 190.0, 64.0)
+
+func _pal_btn_rect(i: int) -> Rect2:
+	var gap := 20.0
+	var bw := (viewport_size.x - 110.0 - gap) / 2.0
+	return Rect2(55.0 + i * (bw + gap), 1500.0, bw, 100.0)
+
+func _grad(r: Rect2, c0: Color, c1: Color) -> void:
+	draw_polygon(PackedVector2Array([r.position, Vector2(r.end.x, r.position.y), r.end, Vector2(r.position.x, r.end.y)]), PackedColorArray([c0, c1, c1, c0]))
+
+func _draw_palette() -> void:
+	_background(); draw_set_transform(Vector2(0, ui_off))
+	var w := viewport_size.x
+	_button(Rect2(35, 45, 180, 95), "< Volver", pcol("button"))
+	_text("PALETA DE COLORES", Vector2(245, 118), 46, Color.WHITE)
+	for i in TilesPalette.PRESETS.size():
+		_button(_pal_preset_rect(i), String(TilesPalette.PRESETS[i].name), pcol("accent") if _pal_is_preset(i) else pcol("button"))
+	for i in TilesPalette.ROLES.size():
+		var r := _pal_swatch_rect(i)
+		var c: Color = pcol(_pal_id(i))
+		_panel(r, c, 20)
+		var fg := Color(0.05, 0.08, 0.12) if c.get_luminance() > 0.55 else Color(0.97, 0.98, 1.0)
+		_text_fixed(_fit(String(TilesPalette.ROLES[i].name), r.size.x - 20.0, 25), Vector2(r.position.x + 12, r.position.y + 62), 25, fg)
+		if i == pal_sel:
+			var ring := _box(Color(0, 0, 0, 0), 20)
+			ring.border_width_left = 8
+			ring.border_width_right = 8
+			ring.border_width_top = 8
+			ring.border_width_bottom = 8
+			ring.border_color = Color.WHITE
+			draw_style_box(ring, r)
+			var inner := _box(Color(0, 0, 0, 0), 14)
+			inner.border_width_left = 3
+			inner.border_width_right = 3
+			inner.border_width_top = 3
+			inner.border_width_bottom = 3
+			inner.border_color = Color(0.05, 0.08, 0.12, 0.9)
+			draw_style_box(inner, r.grow(-8.0))
+	var cur: Color = pcol(_pal_id(pal_sel))
+	_text(_fit("%s · #%s" % [T(String(TilesPalette.ROLES[pal_sel].name)), cur.to_html(false).to_upper()], w - 160, 30), Vector2(80, 1050), 30, Color.WHITE)
+	var names := ["Tono", "Saturación", "Brillo"]
+	var vals := [pal_h, pal_s, pal_v]
+	for i in 3:
+		var sr := _pal_slider_rect(i)
+		_text(names[i], Vector2(sr.position.x, sr.position.y - 16), 26, pcol("muted"))
+		if i == 0:
+			for k in 6:
+				_grad(Rect2(sr.position.x + sr.size.x * k / 6.0, sr.position.y, sr.size.x / 6.0, sr.size.y), Color.from_hsv(k / 6.0, 1.0, 1.0), Color.from_hsv((k + 1) / 6.0, 1.0, 1.0))
+		elif i == 1:
+			_grad(sr, Color.from_hsv(pal_h, 0.0, pal_v), Color.from_hsv(pal_h, 1.0, pal_v))
+		else:
+			_grad(sr, Color.from_hsv(pal_h, pal_s, 0.0), Color.from_hsv(pal_h, pal_s, 1.0))
+		draw_rect(sr, Color(1, 1, 1, 0.3), false, 3.0)
+		var tp := Vector2(sr.position.x + float(vals[i]) * sr.size.x, sr.get_center().y)
+		draw_circle(tp, 41.0, Color(0.05, 0.08, 0.12, 0.6))
+		draw_circle(tp, 37.0, Color.WHITE)
+		draw_circle(tp, 29.0, cur)
+	_button(_pal_btn_rect(0), "Restablecer color", pcol("button"))
+	_button(_pal_btn_rect(1), "¿Seguro?" if pal_reset_armed else "Restablecer todo", pcol("danger") if pal_reset_armed else pcol("button"))
+	_draw_nav()
+
+func _palette_pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
+	if not pressed:
+		if input_id == pal_drag_id:
+			pal_drag = -1
+			pal_drag_id = -999
+			_save_settings()
+		return
+	if _nav_tap(pos):
+		return
+	pos.y -= ui_off
+	if Rect2(35, 45, 180, 95).has_point(pos):
+		screen = Screen.SETTINGS
+		return
+	var was_armed := pal_reset_armed
+	pal_reset_armed = false
+	for i in 3:
+		if _pal_slider_rect(i).grow_individual(40, 45, 40, 45).has_point(pos):
+			pal_drag = i
+			pal_drag_id = input_id
+			_pal_drag_to(pos.x)
+			return
+	for i in TilesPalette.PRESETS.size():
+		if _pal_preset_rect(i).has_point(pos):
+			pal = TilesPalette.preset(i)
+			_pal_select(pal_sel)
+			_apply_edit_theme()
+			_save_settings()
+			return
+	for i in TilesPalette.ROLES.size():
+		if _pal_swatch_rect(i).has_point(pos):
+			_pal_select(i)
+			return
+	if _pal_btn_rect(0).has_point(pos):
+		pal[_pal_id(pal_sel)] = TilesPalette.ROLES[pal_sel].def
+		_pal_select(pal_sel)
+		_apply_edit_theme()
+		_save_settings()
+	elif _pal_btn_rect(1).has_point(pos):
+		if was_armed:
+			pal = TilesPalette.defaults()
+			_pal_select(pal_sel)
+			_apply_edit_theme()
+			_save_settings()
+		else:
+			pal_reset_armed = true
+
+func _pal_drag_to(x: float) -> void:
+	if pal_drag < 0:
+		return
+	var r := _pal_slider_rect(pal_drag)
+	var t := clampf((x - r.position.x) / r.size.x, 0.0, 1.0)
+	if pal_drag == 0:
+		pal_h = minf(t, 0.999)
+	elif pal_drag == 1:
+		pal_s = t
+	else:
+		pal_v = t
+	_pal_apply_hsv()
+
+func _drag_any(pos: Vector2, relative: Vector2, input_id: int) -> void:
+	if screen == Screen.PALETTE:
+		if input_id == pal_drag_id:
+			_pal_drag_to(pos.x)
+		return
+	_library_drag(pos, relative, input_id)
+
 func _ready() -> void:
 	get_viewport().size_changed.connect(_resize)
 	player = AudioStreamPlayer.new()
@@ -212,7 +456,10 @@ func _ready() -> void:
 	get_window().files_dropped.connect(_on_files_dropped)
 	_setup_search()
 	_setup_name_edit()
+	lang = "es" if OS.get_locale_language() == "es" else "en"   # primer arranque: idioma del móvil
 	_load_settings()
+	_apply_edit_theme()
+	_apply_language()
 	if _merge_progress_file():
 		_save_settings()
 	_refresh_library()
@@ -237,6 +484,8 @@ func _go_back() -> void:
 			screen = Screen.LIBRARY
 		Screen.SETTINGS:
 			screen = Screen.LIBRARY
+		Screen.PALETTE:
+			screen = Screen.SETTINGS
 		Screen.RESULTS:
 			open_group = {}
 			screen = Screen.LIBRARY
@@ -397,10 +646,10 @@ func _grant_award(kind: String) -> void:
 	score += 500
 	if kind == "star":
 		stars += 1
-		banner_text = "ESTRELLA %d/3" % stars
+		banner_text = T("ESTRELLA %d/3") % stars
 	else:
 		crowns += 1
-		banner_text = "CORONA %d/3" % crowns
+		banner_text = T("CORONA %d/3") % crowns
 	banner_kind = kind
 	banner_time = 1.8
 	_store_infinite_best()
@@ -409,7 +658,7 @@ func _next_lap() -> void:
 	_check_awards(true)
 	lap += 1
 	lap_factor = 1.0 + 0.5 * float(lap - 1)
-	lap_banner_text = "VUELTA %d · x%.1f" % [lap, lap_factor]
+	lap_banner_text = T("VUELTA %d · x%.1f") % [lap, lap_factor]
 	lap_banner_time = 2.4
 	play_rate = 1.0 + LAP_SONG_STEP * float(lap - 1)   # la canción suena un poco más rápido
 	player.pitch_scale = play_rate
@@ -467,7 +716,7 @@ func _crown_poly(c: Vector2, r: float) -> PackedVector2Array:
 	return PackedVector2Array([c + Vector2(-r, r * 0.7), c + Vector2(-r, -r * 0.55), c + Vector2(-r * 0.5, r * 0.05), c + Vector2(0, -r * 0.85), c + Vector2(r * 0.5, r * 0.05), c + Vector2(r, -r * 0.55), c + Vector2(r, r * 0.7)])
 
 func _draw_award(kind: String, c: Vector2, r: float, earned: bool) -> void:
-	var fill := Color(1.0, 0.8, 0.2) if earned else Color(0.45, 0.5, 0.6, 0.5)
+	var fill := pcol("gold") if earned else Color(0.45, 0.5, 0.6, 0.5)
 	var edge := Color(0.3, 0.18, 0.0, 0.9) if earned else Color(0.3, 0.35, 0.45, 0.4)
 	if kind == "star":
 		draw_colored_polygon(_star_poly(c, r * 1.2), edge)
@@ -502,9 +751,9 @@ func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventScreenTouch:
 		_pointer(event.position, event.pressed, event.index)
 	elif event is InputEventScreenDrag:
-		_library_drag(event.position, event.relative, event.index)
+		_drag_any(event.position, event.relative, event.index)
 	elif event is InputEventMouseMotion and (event.button_mask & MOUSE_BUTTON_MASK_LEFT):
-		_library_drag(event.position, event.relative, -1)
+		_drag_any(event.position, event.relative, -1)
 	elif event is InputEventMouseButton and event.pressed and event.button_index in [MOUSE_BUTTON_WHEEL_UP, MOUSE_BUTTON_WHEEL_DOWN]:
 		if screen == Screen.LIBRARY:
 			scroll_y += -120.0 if event.button_index == MOUSE_BUTTON_WHEEL_UP else 120.0
@@ -535,6 +784,9 @@ func _key_lane(event: InputEventKey) -> int:
 	return -1
 
 func _pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
+	if screen == Screen.PALETTE:
+		_palette_pointer(pos, pressed, input_id)
+		return
 	if screen == Screen.LIBRARY:
 		_library_pointer(pos, pressed, input_id)
 		return
@@ -595,6 +847,9 @@ func _pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
 			show_thumbs = not show_thumbs; _save_settings()
 		elif show_bg and Rect2(130, 690, 170, 110).has_point(pos): _adjust_bg(-0.05)
 		elif show_bg and Rect2(viewport_size.x - 300, 690, 170, 110).has_point(pos): _adjust_bg(0.05)
+		elif _lang_rect(0).has_point(pos): _set_lang("es")
+		elif _lang_rect(1).has_point(pos): _set_lang("en")
+		elif Rect2(80, 1290, viewport_size.x - 160, 180).has_point(pos): _open_palette()
 	elif screen == Screen.RESULTS:
 		if Rect2(110, 1400, viewport_size.x - 220, 135).has_point(pos): _start_game()
 		elif Rect2(110, 1570, viewport_size.x - 220, 120).has_point(pos): open_group = {}; screen = Screen.LIBRARY
@@ -657,7 +912,7 @@ func _try_hit(lane: int, input_id: int) -> void:
 				note.done = true; started = true; song_time = -lead_in; audio_started = false
 				_hit(lane, "COMENZAR", 0, hit_y)
 				return
-		_effect(lane, hit_y, Color(1.0, 0.15, 0.18, 0.84))
+		_effect(lane, hit_y, acol(pcol("miss"), 0.84))
 		return
 	# La tecla se dibuja con su borde inferior en la línea de golpeo al llegar su hora,
 	# así que el cuerpo (alto NORMAL_HEIGHT) se ve ANTES. Se puede tocar en cualquier
@@ -675,7 +930,7 @@ func _try_hit(lane: int, input_id: int) -> void:
 		break  # la más antigua pendiente del carril
 	if best.is_empty():
 		combo = 0; empties += 1; _set_judgement("VACÍO", 0.4)
-		_effect(lane, hit_y, Color(1.0, 0.15, 0.18, 0.84))
+		_effect(lane, hit_y, acol(pcol("miss"), 0.84))
 		_lose_life()
 		return
 	if best.type == "hold":
@@ -701,15 +956,15 @@ func _set_judgement(text: String, duration: float) -> void:
 
 func _judgement_color(text: String) -> Color:
 	match text:
-		"PERFECT": return Color(1.0, 0.78, 0.12)
-		"GREAT": return Color(0.05, 0.82, 0.95)
-		"GOOD": return Color(0.3, 0.85, 0.45)
-		"MISS", "VACÍO": return Color(1.0, 0.25, 0.3)
+		"PERFECT": return pcol("perfect")
+		"GREAT": return pcol("great")
+		"GOOD": return pcol("good")
+		"MISS", "VACÍO": return pcol("miss")
 	return Color.WHITE
 
 func _miss(lane: int, effect_y: float) -> void:
 	misses += 1; combo = 0; _set_judgement("MISS", 0.6)
-	_effect(lane, effect_y, Color(1.0, 0.15, 0.18, 0.84))
+	_effect(lane, effect_y, acol(pcol("miss"), 0.84))
 	_lose_life()
 
 # --- Modo Vidas ----------------------------------------------------------
@@ -816,7 +1071,7 @@ func _draw_lives_bars(x: float, y: float, bar_w: float, bar_h: float, gap: float
 	for i in run_lives:
 		var r := Rect2(x + i * (bar_w + gap), y, bar_w, bar_h)
 		draw_rect(r.grow(3.0), Color(0.04, 0.16, 0.32, 0.9))
-		draw_rect(r, Color(1.0, 0.3, 0.4) if i < lives_left else Color(0.4, 0.46, 0.56, 0.6))
+		draw_rect(r, _hot() if i < lives_left else Color(0.4, 0.46, 0.56, 0.6))
 
 func _effect(lane: int, effect_y: float, color: Color) -> void:
 	effects.append({"lane":lane, "y":effect_y, "color":color, "time":0.20, "duration":0.20})
@@ -947,13 +1202,13 @@ func _setup_search() -> void:
 	search_edit.clear_button_enabled = true
 	search_edit.visible = false
 	search_edit.add_theme_font_size_override("font_size", 36)
-	search_edit.add_theme_color_override("font_color", Color(0.12, 0.22, 0.31))
+	search_edit.add_theme_color_override("font_color", pcol("ink"))
 	search_edit.add_theme_color_override("font_placeholder_color", Color(0.5, 0.6, 0.7))
-	search_edit.add_theme_color_override("caret_color", Color(0.02, 0.62, 0.86))
+	search_edit.add_theme_color_override("caret_color", pcol("accent").darkened(0.08))
 	search_edit.add_theme_color_override("clear_button_color", Color(0.4, 0.5, 0.6))
-	search_edit.add_theme_color_override("clear_button_color_pressed", Color(0.02, 0.62, 0.86))
+	search_edit.add_theme_color_override("clear_button_color_pressed", pcol("accent").darkened(0.08))
 	for style_name in ["normal", "focus", "read_only"]:
-		var box := _box(Color(0.97, 0.98, 1), 24)
+		var box := _box(pcol("card"), 24)
 		box.content_margin_left = 28.0
 		box.content_margin_right = 20.0
 		search_edit.add_theme_stylebox_override(style_name, box)
@@ -1004,7 +1259,7 @@ func _import_osz(path: String) -> void:
 			var bid := FileAccess.get_md5(path).substr(0, 10)
 			_backup_copy(path, bdir, bid, "%s [%s].osz" % [OsuImporter.safe_name(String(result.title)), bid])
 		_refresh_library()
-		_show_status("Importado: %s (%d dificultades)" % [result.title, result.count], false)
+		_show_status(T("Importado: %s (%d dificultades)") % [result.title, result.count], false)
 	else:
 		_show_status(result.error, true)
 
@@ -1023,7 +1278,7 @@ func _set_library_dir(path: String) -> void:
 	if path == "" or path.begins_with("content://"):
 		library_dir = _default_library_dir()
 		_save_settings()
-		_show_status("Android no deja usar esa carpeta. Se usa la de por defecto: %s" % library_dir, true, 8.0)
+		_show_status(T("Android no deja usar esa carpeta. Se usa la de por defecto: %s") % library_dir, true, 8.0)
 		return
 	library_dir = path
 	progress_merged = false
@@ -1031,7 +1286,7 @@ func _set_library_dir(path: String) -> void:
 	progress_merged = true
 	_save_settings()
 	_apply_filter()
-	_show_status("Carpeta de canciones: %s" % path, false)
+	_show_status(T("Carpeta de canciones: %s") % path, false)
 
 func _osz_files(dir: String) -> Array:
 	var out: Array = []
@@ -1212,16 +1467,16 @@ func _export_library() -> void:
 	var done := 0
 	var failed := 0
 	for g in todo:
-		_show_status("Exportando %d/%d..." % [done + 1, todo.size()], false, 60.0)
+		_show_status(T("Exportando %d/%d...") % [done + 1, todo.size()], false, 60.0)
 		await get_tree().process_frame
 		var osz_name := "%s [%s].osz" % [OsuImporter.safe_name(String(g.title)), g.id]
 		if _zip_dir(OsuImporter.SONGS_DIR.path_join(String(g.id)), backup.path_join(osz_name)):
 			done += 1
 		else:
 			failed += 1
-	var msg := "Exportadas %d canciones nuevas (%d ya tenían copia)" % [done, total - todo.size()]
+	var msg := T("Exportadas %d canciones nuevas (%d ya tenían copia)") % [done, total - todo.size()]
 	if failed > 0:
-		msg += ", %d con error" % failed
+		msg += T(", %d con error") % failed
 	if total == 0:
 		msg = "No hay canciones importadas para exportar."
 	_show_status(msg, failed > 0, 8.0)
@@ -1254,7 +1509,7 @@ func _sync_folder() -> void:
 		var fid := _id_from_name(f)
 		var rid := fid if fid != "" else FileAccess.get_md5(bpath).substr(0, 10)
 		if not DirAccess.dir_exists_absolute(OsuImporter.SONGS_DIR.path_join(rid)):
-			_show_status("Restaurando %d/%d..." % [done, total], false, 60.0)
+			_show_status(T("Restaurando %d/%d...") % [done, total], false, 60.0)
 			await get_tree().process_frame
 			if OsuImporter.import_osz(bpath, fid).ok:
 				restored += 1
@@ -1267,7 +1522,7 @@ func _sync_folder() -> void:
 		var id := FileAccess.get_md5(ipath).substr(0, 10)
 		var good := DirAccess.dir_exists_absolute(OsuImporter.SONGS_DIR.path_join(id))
 		if not good:
-			_show_status("Importando %d/%d..." % [done, total], false, 60.0)
+			_show_status(T("Importando %d/%d...") % [done, total], false, 60.0)
 			await get_tree().process_frame
 			good = OsuImporter.import_osz(ipath).ok
 		if good:
@@ -1277,11 +1532,11 @@ func _sync_folder() -> void:
 		else:
 			failed += 1
 	_refresh_library()
-	var msg := "Listo: %d importadas, %d restauradas (vi %d en Por importar y %d en Importadas)" % [imported, restored, inbox_files.size(), backup_files.size()]
+	var msg := T("Listo: %d importadas, %d restauradas (vi %d en Por importar y %d en Importadas)") % [imported, restored, inbox_files.size(), backup_files.size()]
 	if failed > 0:
-		msg += ", %d con error" % failed
+		msg += T(", %d con error") % failed
 	if total == 0:
-		msg = "No veo ningún .osz en \"%s\" ni en \"%s\" (%s). Deja ahí tus .osz y pulsa Recargar. Si ya están, falta el permiso: Ajustes de Android, Apps, Tiles FOSS, Permisos, Archivos, permitir administrar todos los archivos." % [INBOX_NAME, BACKUP_NAME, library_dir]
+		msg = T("No veo ningún .osz en \"%s\" ni en \"%s\" (%s). Deja ahí tus .osz y pulsa Recargar. Si ya están, falta el permiso: Ajustes de Android, Apps, Tiles FOSS, Permisos, Archivos, permitir administrar todos los archivos.") % [INBOX_NAME, BACKUP_NAME, library_dir]
 		failed = 1
 	_show_status(msg, failed > 0, 14.0 if total == 0 else 8.0)
 	syncing = false
@@ -1296,7 +1551,7 @@ func _on_files_dropped(files: PackedStringArray) -> void:
 			_show_status("Solo se admiten archivos .osz", true)
 
 func _show_status(text: String, is_error: bool, seconds := 6.0) -> void:
-	status_text = text; status_error = is_error; status_time = seconds
+	status_text = T(text); status_error = is_error; status_time = seconds
 
 # --- Barra inferior (Inicio / Música / Archivos / Ajustes) ----------------
 
@@ -1305,7 +1560,7 @@ func _nav_rect(i: int) -> Rect2:
 	return Rect2(i * cw, viewport_size.y - NAV_H, cw, NAV_H)
 
 func _nav_active() -> int:
-	return 3 if screen == Screen.SETTINGS else tab
+	return 3 if screen == Screen.SETTINGS or screen == Screen.PALETTE else tab
 
 func _nav_tap(pos: Vector2) -> bool:
 	for i in 4:
@@ -1360,10 +1615,10 @@ func _draw_nav() -> void:
 	var body := top.duplicate()
 	body.append(Vector2(w, viewport_size.y + 2.0))
 	body.append(Vector2(0, viewport_size.y + 2.0))
-	draw_colored_polygon(body, Color(0.05, 0.09, 0.17))
-	draw_polyline(top, Color(0.2, 0.3, 0.45), 4.0)
+	draw_colored_polygon(body, pcol("nav"))
+	draw_polyline(top, _nav_edge(), 4.0)
 	var labels := ["Inicio", "Música", "Archivos", "Ajustes"]
-	var colors := [Color(0.22, 0.5, 0.95), Color(0.95, 0.36, 0.58), Color(0.97, 0.6, 0.2), Color(0.2, 0.75, 0.45)]
+	var colors := [pcol("nav_home"), pcol("nav_music"), pcol("nav_files"), pcol("nav_settings")]
 	var active := _nav_active()
 	for i in 4:
 		var r := _nav_rect(i)
@@ -1379,7 +1634,7 @@ func _draw_nav() -> void:
 		if on:
 			draw_arc(cc, rad + 3.0, 0.0, TAU, 40, Color.WHITE, 5.0)
 		_draw_nav_icon(i, cc, 18.0 if on else 16.0, base.lerp(Color.WHITE, 0.85))
-		_text_centered(labels[i], cx, ytop + 58.0 + 38.0 + 30.0, 28, Color.WHITE if on else Color(0.72, 0.8, 0.9))
+		_text_centered(labels[i], cx, ytop + 58.0 + 38.0 + 30.0, 28, Color.WHITE if on else pcol("muted").lerp(Color.WHITE, 0.25))
 
 # --- Listas de reproducción -------------------------------------------------
 
@@ -1421,7 +1676,7 @@ func _playlist_view() -> Array:
 					ok = false
 			if ok:
 				var n: int = playlists[i].refs.size()
-				out.append({"playlist_idx": i, "id": "pl%d" % i, "title": pname, "artist": "1 canción" if n == 1 else "%d canciones" % n, "creator": "", "entries": []})
+				out.append({"playlist_idx": i, "id": "pl%d" % i, "title": pname, "artist": T("1 canción") if n == 1 else T("%d canciones") % n, "creator": "", "entries": []})
 		return out
 	for ref in playlists[open_playlist].refs:
 		var e := _entry_by_ref(String(ref))
@@ -1452,11 +1707,11 @@ func _setup_name_edit() -> void:
 	name_edit.max_length = 40
 	name_edit.visible = false
 	name_edit.add_theme_font_size_override("font_size", 38)
-	name_edit.add_theme_color_override("font_color", Color(0.12, 0.22, 0.31))
+	name_edit.add_theme_color_override("font_color", pcol("ink"))
 	name_edit.add_theme_color_override("font_placeholder_color", Color(0.5, 0.6, 0.7))
-	name_edit.add_theme_color_override("caret_color", Color(0.02, 0.62, 0.86))
+	name_edit.add_theme_color_override("caret_color", pcol("accent").darkened(0.08))
 	for style_name in ["normal", "focus", "read_only"]:
-		var box := _box(Color(0.88, 0.94, 1), 22)
+		var box := _box(_soft(), 22)
 		box.content_margin_left = 26.0
 		box.content_margin_right = 20.0
 		name_edit.add_theme_stylebox_override(style_name, box)
@@ -1523,10 +1778,10 @@ func _draw_overlay() -> void:
 	draw_rect(Rect2(Vector2.ZERO, viewport_size), Color(0, 0, 0, 0.62))
 	var lay := _overlay_layout()
 	var panel: Rect2 = lay.panel
-	var ink := Color(0.12, 0.22, 0.31)
-	var soft := Color(0.88, 0.94, 1)
-	var accent := Color(0.04, 0.65, 0.88)
-	_panel(panel, Color(0.97, 0.98, 1), 34)
+	var ink := pcol("ink")
+	var soft := _soft()
+	var accent := pcol("accent")
+	_panel(panel, pcol("card"), 34)
 	var title := "Ordenar por"
 	if overlay == "addto":
 		title = "Añadir a lista"
@@ -1540,7 +1795,7 @@ func _draw_overlay() -> void:
 			_text(SORT_MODES[i], Vector2(r.position.x + 36, r.get_center().y + 13), 36, Color.WHITE if i == sort_mode else ink)
 	elif overlay == "addto":
 		if not current_song.is_empty():
-			_text(_fit("%s · %s" % [current_song.get("title", ""), current_song.get("version", "")], panel.size.x - 80, 26), Vector2(panel.position.x + 40, panel.position.y + 124), 26, Color(0.42, 0.52, 0.62))
+			_text(_fit("%s · %s" % [current_song.get("title", ""), current_song.get("version", "")], panel.size.x - 80, 26), Vector2(panel.position.x + 40, panel.position.y + 124), 26, _ink_soft())
 		for i in lay.rows.size():
 			var r2: Rect2 = lay.rows[i]
 			var has: bool = playlists[i].refs.has(_ref(current_song))
@@ -1551,15 +1806,15 @@ func _draw_overlay() -> void:
 				draw_polyline(PackedVector2Array([cc + Vector2(-20, 0), cc + Vector2(-6, 16), cc + Vector2(22, -16)]), Color(0.1, 0.7, 0.45), 9.0)
 		var ex: Dictionary = lay.extra
 		_button(ex["new"], "+ Nueva lista", accent)
-		_button(ex["close"], "Listo", Color(0.17, 0.25, 0.37))
+		_button(ex["close"], "Listo", pcol("button"))
 		if playlists.size() > 6:
-			_text("Solo se muestran las 6 primeras listas.", Vector2(panel.position.x + 40, panel.end.y - 125), 22, Color(0.42, 0.52, 0.62))
+			_text("Solo se muestran las 6 primeras listas.", Vector2(panel.position.x + 40, panel.end.y - 125), 22, _ink_soft())
 	else:
 		var ex2: Dictionary = lay.extra
 		var er: Rect2 = ex2["edit"]
 		name_edit.position = er.position
 		name_edit.size = er.size
-		_button(ex2["cancel"], "Cancelar", Color(0.17, 0.25, 0.37))
+		_button(ex2["cancel"], "Cancelar", pcol("button"))
 		_button(ex2["ok"], "Crear", accent)
 
 func _overlay_tap(pos: Vector2) -> void:
@@ -1775,14 +2030,14 @@ func _draw_home() -> void:
 	var w := viewport_size.x
 	var x := 55.0
 	var cw := w - 110.0
-	var muted := Color(0.62, 0.75, 0.88)
-	var ink := Color(0.12, 0.22, 0.31)
-	var navy := Color(0.025, 0.05, 0.1)
+	var muted := pcol("muted")
+	var ink := pcol("ink")
+	var navy := pcol("bg")
 	var le := _find_entry(String(last_played.get("id", "")), String(last_played.get("version", "")))
 	var hero_h := 620.0 + top_inset
 	# Imagen de la última canción (horizontal) ocupando la parte de arriba.
 	if le.is_empty():
-		draw_rect(Rect2(0, 0, w, hero_h), Color(0.08, 0.16, 0.3))
+		draw_rect(Rect2(0, 0, w, hero_h), pcol("bg").lerp(pcol("accent"), 0.2))
 	else:
 		var path := String(le.get("bg_path", ""))
 		if path != home_tex_path:
@@ -1803,14 +2058,14 @@ func _draw_home() -> void:
 		draw_rect(Rect2(0, hero_h - fade + k * fade / bands, w, fade / bands + 1.0), Color(navy.r, navy.g, navy.b, 0.98 * pow(f2, 1.7)))
 	var title_pos := Vector2(55, 105 + top_inset)
 	draw_string_outline(_font(), title_pos, "TILES FOSS", HORIZONTAL_ALIGNMENT_LEFT, -1, 58, 10, Color(0.02, 0.05, 0.12, 0.9))
-	draw_string(_font(), title_pos, "TILES FOSS", HORIZONTAL_ALIGNMENT_LEFT, -1, 58, Color.WHITE)
+	draw_string(_font(), title_pos, "TILES FOSS", HORIZONTAL_ALIGNMENT_LEFT, -1, 58, pcol("text"))
 	draw_set_transform(Vector2(0, top_inset))
 	if le.is_empty():
 		_text_centered("Aún no has jugado ninguna canción", w / 2, 690, 40, Color.WHITE)
 		_text_centered("Elígela en la pestaña Música.", w / 2, 740, 28, muted)
 	else:
 		_text_centered(_fit(String(le.title), w - 100, 52), w / 2, 690, 52, Color.WHITE)
-		_text_centered(_fit("%s · %s" % [le.artist, le.version], w - 100, 28), w / 2, 738, 28, muted)
+		_text_centered(_fit("%s · %s" % [T(le.artist), le.version], w - 100, 28), w / 2, 738, 28, muted)
 		var box := _box(Color(1, 1, 1, 0.10), 50)
 		box.border_width_left = 4
 		box.border_width_right = 4
@@ -1828,9 +2083,9 @@ func _draw_home() -> void:
 		var e: Dictionary = rec.entry
 		var b: Dictionary = rec.b
 		var y := HOME_ROWS_Y + i * HOME_ROW_STEP
-		_panel(Rect2(x, y, cw, HOME_ROW_H), Color(0.97, 0.98, 1), 24)
+		_panel(Rect2(x, y, cw, HOME_ROW_H), pcol("card"), 24)
 		if rec.inf:
-			_panel(Rect2(x, y, 110, HOME_ROW_H), Color(0.5, 0.38, 0.92), 24)
+			_panel(Rect2(x, y, 110, HOME_ROW_H), pcol("violet"), 24)
 			var n_cr := int(b.get("crowns", 0))
 			var n_st := int(b.get("stars", 0))
 			var kind := "crown" if n_cr > 0 else "star"
@@ -1842,13 +2097,13 @@ func _draw_home() -> void:
 			_panel(Rect2(x, y, 110, HOME_ROW_H), RANK_COLORS[int(b.get("rank", 0))], 24)
 			_text_centered(String(RANKS[int(b.get("rank", 0))]), x + 55, y + 78, 52, Color.WHITE)
 		_text(_fit(String(e.title), cw - 135 - 230, 32), Vector2(x + 135, y + 52), 32, ink)
-		var sub := "%s · %s" % [e.version, DIFFICULTY_LEVELS[int(rec.level)].name]
+		var sub := "%s · %s" % [e.version, T(DIFFICULTY_LEVELS[int(rec.level)].name)]
 		if rec.inf:
-			sub += " · Infinito"
-		_text(_fit(sub, cw - 135 - 230, 23), Vector2(x + 135, y + 92), 23, Color(0.42, 0.52, 0.62))
+			sub += " · " + T("Infinito")
+		_text(_fit(sub, cw - 135 - 230, 23), Vector2(x + 135, y + 92), 23, _ink_soft())
 		var score_txt := str(int(b.get("score", 0)))
 		var sw := _font().get_string_size(score_txt, HORIZONTAL_ALIGNMENT_LEFT, -1, 36).x
-		_text(score_txt, Vector2(x + cw - 28 - sw, y + 74), 36, Color(0.02, 0.55, 0.8))
+		_text(score_txt, Vector2(x + cw - 28 - sw, y + 74), 36, pcol("accent").darkened(0.2))
 	draw_set_transform(Vector2.ZERO)
 
 # --- Archivos (importar, carpeta y exportar) ---------------------------------------
@@ -1874,9 +2129,9 @@ func _draw_files() -> void:
 	var w := viewport_size.x
 	var x := 55.0
 	var cw := w - 110.0
-	var muted := Color(0.62, 0.75, 0.88)
-	var panel_col := Color(0.08, 0.13, 0.22, 0.92)
-	var accent := Color(0.02, 0.68, 0.88)
+	var muted := pcol("muted")
+	var panel_col := acol(pcol("panel"), 0.92)
+	var accent := pcol("accent")
 	var half := _files_half()
 	draw_set_transform(Vector2(0, top_inset))
 	_text("ARCHIVOS", Vector2(55, 105), 58, Color.WHITE)
@@ -1887,10 +2142,10 @@ func _draw_files() -> void:
 	_panel(Rect2(x, 540, cw, 420), panel_col, 34)
 	_text("Carpeta de canciones", Vector2(x + 40, 625), 40, Color.WHITE)
 	var shown_dir := library_dir if library_dir != "" else "Sin configurar (por defecto: Documentos/TilesFOSS)"
-	_text(_fit(shown_dir, cw - 80, 24), Vector2(x + 40, 675), 24, Color(0.5, 0.95, 0.75) if library_dir != "" else muted)
+	_text(_fit(shown_dir, cw - 80, 24), Vector2(x + 40, 675), 24, _ok() if library_dir != "" else muted)
 	_text(_fit("Deja tus .osz en \"Por importar\" y pulsa Recargar.", cw - 80, 24), Vector2(x + 40, 720), 24, muted)
 	_text(_fit("Al reinstalar la app, Recargar restaura lo de \"Importadas\".", cw - 80, 24), Vector2(x + 40, 760), 24, muted)
-	_button(Rect2(x + 40, 810, half, 100), "Elegir carpeta", Color(0.14, 0.22, 0.34))
+	_button(Rect2(x + 40, 810, half, 100), "Elegir carpeta", pcol("button"))
 	_button(Rect2(x + 80 + half, 810, half, 100), "Recargando..." if syncing else "Recargar mapas", accent)
 	_panel(Rect2(x, 1000, cw, 330), panel_col, 34)
 	_text("Exportar canciones", Vector2(x + 40, 1085), 40, Color.WHITE)
@@ -1898,25 +2153,25 @@ func _draw_files() -> void:
 	for g in groups:
 		if g.id != "demo":
 			n_songs += 1
-	_text(_fit("Guarda un .osz de cada canción en \"Importadas\" (%d en la biblioteca)." % n_songs, cw - 80, 24), Vector2(x + 40, 1135), 24, muted)
+	_text(_fit(T("Guarda un .osz de cada canción en \"Importadas\" (%d en la biblioteca).") % n_songs, cw - 80, 24), Vector2(x + 40, 1135), 24, muted)
 	_text(_fit("Así no las pierdes si desinstalas la app.", cw - 80, 24), Vector2(x + 40, 1175), 24, muted)
 	_button(Rect2(x + 40, 1200, cw - 80, 100), "Exportando..." if syncing else "Exportar canciones", accent)
-	_text(_fit("Récords, listas y favoritas se guardan en %s dentro de la carpeta." % PROGRESS_FILE, cw, 22), Vector2(55, 1375), 22, muted)
+	_text(_fit(T("Récords, listas y favoritas se guardan en %s dentro de la carpeta.") % PROGRESS_FILE, cw, 22), Vector2(55, 1375), 22, muted)
 	_text(_fit("Los mapas importados antes de los fondos hay que importarlos otra vez.", cw, 22), Vector2(55, 1415), 22, muted)
 	if status_time > 0.0:
-		_text(_fit(status_text, cw, 26), Vector2(55, 1460), 26, Color(1, 0.45, 0.45) if status_error else Color(0.5, 0.95, 0.75))
+		_text(_fit(status_text, cw, 26), Vector2(55, 1460), 26, _err() if status_error else _ok())
 	draw_set_transform(Vector2.ZERO)
 
 # --- Música ----------------------------------------------------------------------
 
 ## Una tarjeta de canción. kind: song (corazón), remove (quitar de lista), playlist, plain.
 func _draw_card(g: Dictionary, x: float, y: float, w: float, kind: String) -> void:
-	_panel(Rect2(x, y, w, CARD_H), Color(0.97, 0.98, 1), 28)
-	var ink := Color(0.12, 0.22, 0.31)
-	var soft := Color(0.42, 0.52, 0.62)
+	_panel(Rect2(x, y, w, CARD_H), pcol("card"), 28)
+	var ink := pcol("ink")
+	var soft := _ink_soft()
 	var text_w := w - 190 - 150
 	if kind == "playlist":
-		draw_rect(Rect2(x, y, 190, CARD_H), Color(0.45, 0.4, 0.95))
+		draw_rect(Rect2(x, y, 190, CARD_H), pcol("violet"))
 		_draw_nav_icon(1, Vector2(x + 95, y + CARD_H / 2.0), 34.0, Color.WHITE)
 		_text(_fit(g.title, text_w, 38), Vector2(x + 215, y + 82), 38, ink)
 		_text(_fit(g.artist, text_w, 27), Vector2(x + 215, y + 132), 27, soft)
@@ -1930,29 +2185,29 @@ func _draw_card(g: Dictionary, x: float, y: float, w: float, kind: String) -> vo
 		_draw_cover(thumb, Rect2(x, y, 190, CARD_H))
 		if count > 1:
 			draw_rect(Rect2(x, y + CARD_H - 46, 190, 46), Color(0, 0, 0, 0.55))
-			_text_centered("%d dif." % count, x + 95, y + CARD_H - 13, 28, Color.WHITE)
+			_text_centered(T("%d dif.") % count, x + 95, y + CARD_H - 13, 28, Color.WHITE)
 	else:
 		draw_rect(Rect2(x, y, 190, CARD_H), _badge_color(first))
 		if count > 1:
 			_text_centered(first.badge, x + 95, y + CARD_H / 2 - 2, 44, Color.WHITE)
-			_text_centered("%d dif." % count, x + 95, y + CARD_H / 2 + 44, 28, Color(1, 1, 1, 0.9))
+			_text_centered(T("%d dif.") % count, x + 95, y + CARD_H / 2 + 44, 28, Color(1, 1, 1, 0.9))
 		else:
 			_text_centered(first.badge, x + 95, y + CARD_H / 2 + 15, 44, Color.WHITE)
 	_text(_fit(g.title, text_w, 38), Vector2(x + 215, y + 82), 38, ink)
-	var sub: String = ("%s · %d dificultades" % [g.artist, count]) if count > 1 else ("%s · %s" % [g.artist, first.version])
+	var sub: String = (T("%s · %d dificultades") % [T(g.artist), count]) if count > 1 else ("%s · %s" % [T(g.artist), first.version])
 	_text(_fit(sub, text_w, 27), Vector2(x + 215, y + 132), 27, soft)
 	if kind == "song":
-		_draw_heart(Vector2(x + w - 66, y + CARD_H / 2 - 8), 36.0, Color(1.0, 0.28, 0.4) if favorites.has(g.id) else Color(0.8, 0.85, 0.91))
+		_draw_heart(Vector2(x + w - 66, y + CARD_H / 2 - 8), 36.0, pcol("fav") if favorites.has(g.id) else Color(0.8, 0.85, 0.91))
 	elif kind == "remove":
 		var c := Vector2(x + w - 66, y + CARD_H / 2.0)
 		draw_line(c + Vector2(-16, -16), c + Vector2(16, 16), Color(0.85, 0.45, 0.5), 8.0)
 		draw_line(c + Vector2(-16, 16), c + Vector2(16, -16), Color(0.85, 0.45, 0.5), 8.0)
 	else:
 		var pc := Vector2(x + w - 62, y + CARD_H / 2.0)
-		draw_colored_polygon(PackedVector2Array([pc + Vector2(-14, -22), pc + Vector2(-14, 22), pc + Vector2(22, 0)]), Color(0.04, 0.65, 0.88))
+		draw_colored_polygon(PackedVector2Array([pc + Vector2(-14, -22), pc + Vector2(-14, 22), pc + Vector2(22, 0)]), pcol("accent"))
 
 func _draw_music() -> void:
-	var muted := Color(0.62, 0.75, 0.88)
+	var muted := pcol("muted")
 	var x := 55.0
 	var w := viewport_size.x - 110.0
 	for i in view_groups.size():
@@ -1967,7 +2222,7 @@ func _draw_music() -> void:
 			kind = "remove"
 		_draw_card(g, x, y, w, kind)
 	if view_groups.is_empty():
-		var empty_msg := "Sin resultados para \"%s\"" % search_query
+		var empty_msg := T("Sin resultados para \"%s\"") % search_query
 		if search_query.strip_edges() == "":
 			if music_tab == 1:
 				empty_msg = "Aún no tienes favoritas: toca el corazón de una canción."
@@ -1983,23 +2238,23 @@ func _draw_music() -> void:
 	if music_tab == 2 and open_playlist >= 0 and open_playlist < playlists.size():
 		title = String(playlists[open_playlist].name)
 	_text(_fit(title, viewport_size.x - 380, 58), Vector2(55, 105), 58, Color.WHITE)
-	var dark := Color(0.14, 0.22, 0.34)
+	var dark := pcol("button")
 	if search_open:
-		_button(Rect2(viewport_size.x - 300, 150, 245, 95), "Cerrar", Color(0.17, 0.25, 0.37))
+		_button(Rect2(viewport_size.x - 300, 150, 245, 95), "Cerrar", pcol("button"))
 	else:
 		_button(Rect2(viewport_size.x - 300, 40, 245, 80), "Buscar", dark)
-		_button(Rect2(55, 150, 130, 95), "Todas", Color(0.04, 0.65, 0.88) if music_tab == 0 else dark)
-		_button(Rect2(195, 150, 205, 95), "Favoritas", Color(0.9, 0.25, 0.4) if music_tab == 1 else dark)
-		_button(Rect2(410, 150, 160, 95), "Listas", Color(0.45, 0.4, 0.95) if music_tab == 2 else dark)
+		_button(Rect2(55, 150, 130, 95), "Todas", pcol("accent") if music_tab == 0 else dark)
+		_button(Rect2(195, 150, 205, 95), "Favoritas", pcol("fav") if music_tab == 1 else dark)
+		_button(Rect2(410, 150, 160, 95), "Listas", pcol("violet") if music_tab == 2 else dark)
 		if music_tab != 2:
-			_button(Rect2(viewport_size.x - 440, 150, 385, 95), "Orden: %s" % SORT_MODES[sort_mode], dark)
+			_button(Rect2(viewport_size.x - 440, 150, 385, 95), T("Orden: %s") % T(SORT_MODES[sort_mode]), dark)
 		elif open_playlist < 0:
-			_button(Rect2(viewport_size.x - 440, 150, 385, 95), "+ Nueva lista", Color(0.04, 0.65, 0.88))
+			_button(Rect2(viewport_size.x - 440, 150, 385, 95), "+ Nueva lista", pcol("accent"))
 		else:
-			_button(Rect2(viewport_size.x - 440, 150, 385, 95), "¿Seguro?" if delete_armed else "Eliminar lista", Color(0.78, 0.2, 0.3) if delete_armed else dark)
+			_button(Rect2(viewport_size.x - 440, 150, 385, 95), "¿Seguro?" if delete_armed else "Eliminar lista", pcol("danger") if delete_armed else dark)
 	draw_set_transform(Vector2.ZERO)
 	if status_time > 0.0:
-		_text(_fit(status_text, viewport_size.x - 110, 26), Vector2(55, 272 + top_inset), 26, Color(1, 0.45, 0.45) if status_error else Color(0.5, 0.95, 0.75))
+		_text(_fit(status_text, viewport_size.x - 110, 26), Vector2(55, 272 + top_inset), 26, _err() if status_error else _ok())
 
 func _draw_library() -> void:
 	thumb_budget = 2
@@ -2148,6 +2403,13 @@ func _load_settings() -> void:
 			if p is Dictionary and p.has("name") and p.get("refs") is Array:
 				playlists.append({"name": String(p.name), "refs": (p.refs as Array).duplicate()})
 	show_bg = bool(cfg.get_value("display", "show_bg", true))
+	var saved_lang := String(cfg.get_value("display", "lang", lang))
+	if saved_lang == "es" or saved_lang == "en":
+		lang = saved_lang
+	if cfg.has_section("palette"):
+		for pk in cfg.get_section_keys("palette"):
+			if pal.has(pk):
+				pal[pk] = Color.from_string(String(cfg.get_value("palette", pk)), pal[pk])
 	bg_vis = clampf(float(cfg.get_value("display", "bg_vis", 0.30)), 0.1, 0.7)
 	if cfg.has_section("best"):
 		for key in cfg.get_section_keys("best"):
@@ -2172,6 +2434,9 @@ func _save_settings() -> void:
 	cfg.set_value("library", "last_version", String(last_played.get("version", "")))
 	cfg.set_value("library", "playlists", playlists)
 	cfg.set_value("display", "show_bg", show_bg)
+	cfg.set_value("display", "lang", lang)
+	for pk in pal:
+		cfg.set_value("palette", pk, (pal[pk] as Color).to_html(false))
 	cfg.set_value("display", "bg_vis", bg_vis)
 	for key in bests:
 		cfg.set_value("best", key, bests[key])
@@ -2232,6 +2497,7 @@ func _finish_run() -> void:
 	_save_settings()
 
 func _text_centered(value: String, center_x: float, y: float, size: int, color: Color) -> void:
+	value = T(value)
 	var width := _font().get_string_size(value, HORIZONTAL_ALIGNMENT_LEFT, -1, size).x
 	_text(value, Vector2(center_x - width / 2, y), size, color)
 
@@ -2272,6 +2538,7 @@ func _format_time(seconds: float) -> String:
 	return "%d:%02d" % [total / 60, total % 60]
 
 func _fit(value: String, max_width: float, size: int) -> String:
+	value = T(value)
 	var font := _font()
 	if font.get_string_size(value, HORIZONTAL_ALIGNMENT_LEFT, -1, size).x <= max_width:
 		return value
@@ -2284,6 +2551,7 @@ func _draw() -> void:
 	elif screen == Screen.PREPARE: _draw_prepare()
 	elif screen == Screen.GAME: _draw_game()
 	elif screen == Screen.SETTINGS: _draw_settings()
+	elif screen == Screen.PALETTE: _draw_palette()
 	else: _draw_results()
 	draw_set_transform(Vector2.ZERO)
 	if overlay != "" and (screen == Screen.LIBRARY or screen == Screen.PREPARE):
@@ -2292,7 +2560,7 @@ func _draw() -> void:
 func _draw_game() -> void:
 	var lane_w := viewport_size.x / LANES
 	# Fondo base: azul claro; con las 3 estrellas pasa a un verde menta suave (y se queda en las coronas).
-	var base_col := Color(0.74, 0.88, 0.98).lerp(Color(0.78, 0.92, 0.82), bg_blend)
+	var base_col := pcol("field").lerp(Color(0.78, 0.92, 0.82), bg_blend)
 	draw_rect(Rect2(Vector2.ZERO, viewport_size), base_col)
 	if show_bg and bg_texture != null:
 		_draw_cover(bg_texture, Rect2(Vector2.ZERO, viewport_size))
@@ -2322,10 +2590,10 @@ func _draw_game() -> void:
 		var rect := Rect2(note.lane * lane_w + 2, bottom - height, lane_w - 4, height)
 		if note.type == "hold":
 			# Misma silueta cayendo y sosteniendo: solo cambia la intensidad.
-			draw_rect(rect, Color(0.01, 0.035, 0.06) if not note.holding else Color(0.0, 0.07, 0.11))
+			draw_rect(rect, pcol("tile").lerp(pcol("hold"), 0.05 if not note.holding else 0.1))
 			_draw_hold_marks(rect, note.holding)
 		else:
-			draw_rect(rect, Color(0.01,0.01,0.015))
+			draw_rect(rect, pcol("tile"))
 		if resume_pending and i in resume_idxs and not note.holding:
 			draw_rect(rect, Color.WHITE, false, 6.0)
 			_text("Continuar", Vector2(rect.position.x + 18, rect.get_center().y + 12), 35, Color.WHITE)
@@ -2346,7 +2614,7 @@ func _draw_game() -> void:
 	if combo >= 2:
 		var ccol := Color.WHITE
 		if combo >= 100: ccol = Color(1.0, 0.55, 0.85)
-		elif combo >= 50: ccol = Color(1.0, 0.82, 0.2)
+		elif combo >= 50: ccol = pcol("gold")
 		elif combo >= 25: ccol = Color(0.55, 0.95, 1.0)
 		var csize := int(100 + 40 * clampf(combo_pop / 0.18, 0.0, 1.0))
 		_text_outlined(str(combo), viewport_size.x / 2, 200 + top_inset, csize, ccol, Color(0.04, 0.16, 0.32, 0.95), 16)
@@ -2355,9 +2623,9 @@ func _draw_game() -> void:
 	if run_lives == LIVES_MIN:
 		_draw_lives_bars(55, 60 + top_inset, 64, 16, 12)
 	elif run_lives > LIVES_MIN:
-		_text_outlined(str(lives_left), 90, 105 + top_inset, 60, Color(1.0, 0.3, 0.4), Color(0.04, 0.16, 0.32, 0.95), 10)
+		_text_outlined(str(lives_left), 90, 105 + top_inset, 60, _hot(), Color(0.04, 0.16, 0.32, 0.95), 10)
 	if infinite_run:
-		var ltxt := "Vuelta %d · x%.1f" % [lap, lap_factor]
+		var ltxt := T("Vuelta %d · x%.1f") % [lap, lap_factor]
 		var lw := _font().get_string_size(ltxt, HORIZONTAL_ALIGNMENT_LEFT, -1, 30).x
 		_text_outlined(ltxt, 55 + lw / 2.0, 150 + top_inset, 30, Color.WHITE, Color(0.04, 0.16, 0.32, 0.95), 8)
 		for i in stars:
@@ -2376,30 +2644,30 @@ func _draw_game() -> void:
 			_text_outlined(lap_banner_text, viewport_size.x / 2, 960 + top_inset, 72, Color(0.75, 0.6, 1.0, lt), Color(0.02, 0.05, 0.12, 0.95 * lt), 14)
 	var prog := clampf(song_time / maxf(0.1, chart_end), 0.0, 1.0)
 	draw_rect(Rect2(0, top_inset, viewport_size.x, 10), Color(0.04, 0.16, 0.32, 0.45))
-	draw_rect(Rect2(0, top_inset, viewport_size.x * prog, 10), Color(0.02, 0.68, 0.88))
+	draw_rect(Rect2(0, top_inset, viewport_size.x * prog, 10), pcol("accent"))
 	if failed and finished:
 		draw_rect(Rect2(Vector2.ZERO, viewport_size), Color(0, 0, 0, 0.6))
-		_text_outlined(fail_text, viewport_size.x / 2, viewport_size.y / 2, 90, Color(1.0, 0.3, 0.35), Color(0.02, 0.05, 0.12, 0.95), 14)
+		_text_outlined(fail_text, viewport_size.x / 2, viewport_size.y / 2, 90, _hot(), Color(0.02, 0.05, 0.12, 0.95), 14)
 	if life_menu:
 		var lk := 0.45 if life_menu_lock > 0.0 else 1.0
 		draw_rect(Rect2(Vector2.ZERO, viewport_size), Color(0, 0, 0, 0.74))
 		draw_set_transform(Vector2(0, ui_off))
-		_text_outlined("PERDISTE UNA VIDA", viewport_size.x / 2, 520, 62, Color(1.0, 0.3, 0.35), Color(0.02, 0.05, 0.12, 0.95), 12)
+		_text_outlined("PERDISTE UNA VIDA", viewport_size.x / 2, 520, 62, _hot(), Color(0.02, 0.05, 0.12, 0.95), 12)
 		if run_lives == LIVES_MIN:
 			_draw_lives_bars(viewport_size.x / 2 - 249.0, 590, 150, 30, 24)
-			_text_centered("Te quedan %d" % lives_left if lives_left > 0 else "¡Última oportunidad!", viewport_size.x / 2, 700, 34, Color(0.82, 0.91, 1))
+			_text_centered(T("Te quedan %d") % lives_left if lives_left > 0 else "¡Última oportunidad!", viewport_size.x / 2, 700, 34, Color(0.82, 0.91, 1))
 		else:
-			_text_outlined(str(lives_left), viewport_size.x / 2, 680, 150, Color(1.0, 0.3, 0.4), Color(0.02, 0.05, 0.12, 0.95), 14)
+			_text_outlined(str(lives_left), viewport_size.x / 2, 680, 150, _hot(), Color(0.02, 0.05, 0.12, 0.95), 14)
 			_text_centered("vidas restantes" if lives_left > 0 else "¡Última oportunidad!", viewport_size.x / 2, 735, 30, Color(0.82, 0.91, 1))
-		_button(Rect2(170, 760, viewport_size.x - 340, 135), "RENDIRSE", Color(0.62, 0.16, 0.22, lk))
-		_button(Rect2(170, 930, viewport_size.x - 340, 135), "CONTINUAR", Color(0.02, 0.68, 0.88, lk))
+		_button(Rect2(170, 760, viewport_size.x - 340, 135), "RENDIRSE", acol(pcol("danger").darkened(0.25), lk))
+		_button(Rect2(170, 930, viewport_size.x - 340, 135), "CONTINUAR", acol(pcol("accent"), lk))
 		draw_set_transform(Vector2.ZERO)
 	elif paused and not resume_pending:
 		draw_rect(Rect2(Vector2.ZERO,viewport_size), Color(0,0,0,0.74))
 		draw_set_transform(Vector2(0, ui_off))
-		_text("PAUSA", Vector2(viewport_size.x/2-110,600), 62, Color.WHITE)
-		_button(Rect2(170,760,viewport_size.x-340,135), "CONTINUAR", Color(0.02,0.68,0.88))
-		_button(Rect2(170,930,viewport_size.x-340,135), "SALIR", Color(0.22,0.28,0.38))
+		_text_centered("PAUSA", viewport_size.x / 2, 600, 62, Color.WHITE)
+		_button(Rect2(170,760,viewport_size.x-340,135), "CONTINUAR", pcol("accent"))
+		_button(Rect2(170,930,viewport_size.x-340,135), "SALIR", pcol("button"))
 		draw_set_transform(Vector2.ZERO)
 
 ## Línea + círculo de las notas sostenidas. Inactiva (cayendo): cian tenue.
@@ -2407,35 +2675,35 @@ func _draw_game() -> void:
 func _draw_hold_marks(rect: Rect2, active: bool) -> void:
 	var cx := rect.get_center().x
 	var head := Vector2(cx, rect.end.y - 55.0)
-	var color := Color(0.0, 0.95, 1.0, 1.0 if active else 0.5)
+	var color := acol(pcol("hold"), 1.0 if active else 0.5)
 	var width := 7.0 if active else 5.0
 	if head.y - 25.0 > rect.position.y + 25.0:
 		draw_line(Vector2(cx, rect.position.y + 25.0), Vector2(cx, head.y - 15.0), color, width)
 	if active:
-		draw_circle(head, 30.0, Color(0.0, 0.95, 1.0, 0.22))
+		draw_circle(head, 30.0, acol(pcol("hold"), 0.22))
 	draw_arc(head, 30.0, 0, TAU, 40, color, width)
 
 func _draw_difficulty_picker() -> void:
 	draw_rect(Rect2(Vector2.ZERO, viewport_size), Color(0, 0, 0, 0.62))
 	var layout := _picker_layout()
 	var panel: Rect2 = layout.panel
-	_panel(panel, Color(0.97, 0.98, 1), 34)
+	_panel(panel, pcol("card"), 34)
 	var inner_w := panel.size.x - 80.0
-	_text(_fit(open_group.title, inner_w, 44), Vector2(panel.position.x + 40, panel.position.y + 76), 44, Color(0.12, 0.22, 0.31))
+	_text(_fit(open_group.title, inner_w, 44), Vector2(panel.position.x + 40, panel.position.y + 76), 44, pcol("ink"))
 	var sub: String = open_group.artist
 	if not String(open_group.creator).is_empty():
-		sub += " · mapa de %s" % open_group.creator
-	_text(_fit(sub, inner_w, 27), Vector2(panel.position.x + 40, panel.position.y + 125), 27, Color(0.42, 0.52, 0.62))
+		sub += T(" · mapa de %s") % open_group.creator
+	_text(_fit(sub, inner_w, 27), Vector2(panel.position.x + 40, panel.position.y + 125), 27, _ink_soft())
 	for i in layout.rows.size():
 		var r: Rect2 = layout.rows[i]
 		var e: Dictionary = open_group.entries[i]
-		_panel(r, Color(0.88, 0.94, 1), 24)
+		_panel(r, _soft(), 24)
 		var bcol := Color(0.45, 0.52, 0.62)
 		var pb: Dictionary = bests.get(_song_key(e), {})
 		if not pb.is_empty():
 			bcol = RANK_COLORS[int(pb.rank)]
 		elif bests.has(_song_key(e) + "|inf"):
-			bcol = Color(0.5, 0.38, 0.92)
+			bcol = pcol("violet")
 		_panel(Rect2(r.position.x, r.position.y, 130, r.size.y), bcol, 24)
 		var row_best: Dictionary = bests.get(_song_key(e), {})
 		var inf_best: Dictionary = bests.get(_song_key(e) + "|inf", {})
@@ -2452,70 +2720,70 @@ func _draw_difficulty_picker() -> void:
 			var ir := clampf(r.size.y * 0.13, 9.0, 16.0)
 			for k in cnt:
 				_draw_award(kind, Vector2(r.position.x + 65 + (k - (cnt - 1) / 2.0) * (ir * 2.6), r.position.y + r.size.y * 0.80), ir, true)
-		_text(_fit(e.version, r.size.x - 180.0, 34), Vector2(r.position.x + 155, r.get_center().y + 12), 34, Color(0.12, 0.22, 0.31))
+		_text(_fit(e.version, r.size.x - 180.0, 34), Vector2(r.position.x + 155, r.get_center().y + 12), 34, pcol("ink"))
 
 func _draw_prepare() -> void:
-	_background(); draw_set_transform(Vector2(0, ui_off)); _button(Rect2(35,45,180,95),"< Volver",Color(0.14,0.22,0.34))
+	_background(); draw_set_transform(Vector2(0, ui_off)); _button(Rect2(35,45,180,95),"< Volver",pcol("button"))
 	var w := viewport_size.x
-	var muted := Color(0.62, 0.75, 0.88)
-	var prev_col := Color(0.78, 0.2, 0.3) if previewing else Color(0.02, 0.68, 0.88)
+	var muted := pcol("muted")
+	var prev_col := pcol("danger") if previewing else pcol("accent")
 	if audio_stream == null:
-		prev_col = Color(0.14, 0.22, 0.34, 0.4)
+		prev_col = acol(pcol("button"), 0.4)
 	_button(Rect2(w - 365, 45, 330, 95), "Detener" if previewing else "Escuchar", prev_col)
-	_button(Rect2(235, 45, w - 620, 95), "+ A lista", Color(0.45, 0.4, 0.95))
+	_button(Rect2(235, 45, w - 620, 95), "+ A lista", pcol("violet"))
 	var text_w := w - 160
 	_text(_fit(current_song.title, text_w, 58), Vector2(80,370), 58, Color.WHITE)
-	_text(_fit("%s · %s" % [current_song.artist, current_song.version], text_w, 32), Vector2(82,445), 32, Color(0.68,0.84,0.96))
-	_panel(Rect2(80,560,w-160,200),Color(0.08,0.13,0.22,0.92),34)
-	_text("%d notas · %d sostenidas" % [song_stats.notes, song_stats.holds], Vector2(140,645), 38, Color.WHITE)
-	_text("%s · %s" % [_format_time(song_stats.duration), "Con audio" if audio_stream != null else "Sin audio"], Vector2(140,715), 38, Color.WHITE if audio_stream != null else Color(1,0.6,0.6))
+	_text(_fit("%s · %s" % [T(current_song.artist), current_song.version], text_w, 32), Vector2(82,445), 32, pcol("muted"))
+	_panel(Rect2(80,560,w-160,200),acol(pcol("panel"), 0.92),34)
+	_text(T("%d notas · %d sostenidas") % [song_stats.notes, song_stats.holds], Vector2(140,645), 38, Color.WHITE)
+	_text("%s · %s" % [_format_time(song_stats.duration), T("Con audio") if audio_stream != null else T("Sin audio")], Vector2(140,715), 38, Color.WHITE if audio_stream != null else Color(1,0.6,0.6))
 	# Dificultad de notas
 	var cx := w / 2
 	var lvl: Dictionary = DIFFICULTY_LEVELS[diff_level]
 	var demo_song: bool = current_parsed.is_empty()
-	_button(Rect2(100,800,190,110),"-",Color(0.14,0.22,0.34, 0.4 if demo_song else 1.0))
-	_button(Rect2(w-290,800,190,110),"+",Color(0.14,0.22,0.34, 0.4 if demo_song else 1.0))
+	_button(Rect2(100,800,190,110),"-",acol(pcol("button"), 0.4 if demo_song else 1.0))
+	_button(Rect2(w-290,800,190,110),"+",acol(pcol("button"), 0.4 if demo_song else 1.0))
 	_text_centered("Dificultad de notas", cx, 842, 28, muted)
 	_text_centered("—" if demo_song else String(lvl.name), cx, 902, 52, Color(1, 1, 1, 0.4) if demo_song else lvl.color)
 	# Velocidad
-	_button(Rect2(100,950,190,120),"-",Color(0.14,0.22,0.34))
-	_button(Rect2(w-290,950,190,120),"+",Color(0.14,0.22,0.34))
+	_button(Rect2(100,950,190,120),"-",pcol("button"))
+	_button(Rect2(w-290,950,190,120),"+",pcol("button"))
 	_text_centered("Velocidad · AUTO" if speed_auto else "Velocidad · MANUAL (toca: auto)", cx, 992, 28, muted)
-	_text_centered("x%.1f" % _effective_mult(), cx, 1052, 56, Color(0.3,0.9,1.0) if speed_auto else Color.WHITE)
+	_text_centered("x%.1f" % _effective_mult(), cx, 1052, 56, pcol("accent").lightened(0.3) if speed_auto else Color.WHITE)
 	# Modificadores
-	_panel(Rect2(80,1110,w-160,470),Color(0.08,0.13,0.22,0.92),34)
+	_panel(Rect2(80,1110,w-160,470),acol(pcol("panel"), 0.92),34)
 	_text("MODO", Vector2(130,1165), 28, muted)
-	_button(_mode_rect(0), "CASUAL", Color(0.02,0.68,0.88) if not lives_mode else Color(0.17,0.25,0.37))
-	_button(_mode_rect(1), "VIDAS", Color(0.78,0.2,0.3) if lives_mode and not infinite_mode else Color(0.17,0.25,0.37))
-	_button(_mode_rect(2), "INFINITO", Color(0.5,0.38,0.92) if infinite_mode else Color(0.17,0.25,0.37))
+	_button(_mode_rect(0), "CASUAL", pcol("accent") if not lives_mode else pcol("button"))
+	_button(_mode_rect(1), "VIDAS", pcol("danger") if lives_mode and not infinite_mode else pcol("button"))
+	_button(_mode_rect(2), "INFINITO", pcol("violet") if infinite_mode else pcol("button"))
 	if lives_mode:
-		_button(Rect2(130,1340,170,100), "-", Color(0.14,0.22,0.34))
-		_button(Rect2(w-300,1340,170,100), "+", Color(0.14,0.22,0.34))
-		_text_centered("%d vidas" % lives_setting, cx, 1405, 48, Color.WHITE)
+		_button(Rect2(130,1340,170,100), "-", pcol("button"))
+		_button(Rect2(w-300,1340,170,100), "+", pcol("button"))
+		_text_centered(T("%d vidas") % lives_setting, cx, 1405, 48, Color.WHITE)
 		var m := _lives_mult(lives_setting)
-		var pen_text := "Sin penalización de puntos" if lives_setting == LIVES_MIN else "Puntos x%.2f (-%d %%)" % [m, roundi((1.0 - m) * 100.0)]
-		var pen_col := Color(0.5, 0.95, 0.75) if lives_setting == LIVES_MIN else Color(1.0, 0.75, 0.4)
+		var pen_text := "Sin penalización de puntos" if lives_setting == LIVES_MIN else T("Puntos x%.2f (-%d %%)") % [m, roundi((1.0 - m) * 100.0)]
+		var pen_col := _ok() if lives_setting == LIVES_MIN else Color(1.0, 0.75, 0.4)
 		if infinite_mode:
-			_text_centered("3 estrellas en la vuelta 1 y 3 coronas en las vueltas 2 y 3", cx, 1470, 24, Color(1.0, 0.82, 0.3))
-			_text_centered("Cada vuelta acelera notas y canción: x1.0, x1.5, x2.0...", cx, 1500, 24, Color(1.0, 0.82, 0.3))
+			_text_centered("3 estrellas en la vuelta 1 y 3 coronas en las vueltas 2 y 3", cx, 1470, 24, pcol("gold"))
+			_text_centered("Cada vuelta acelera notas y canción: x1.0, x1.5, x2.0...", cx, 1500, 24, pcol("gold"))
 			_text_centered(pen_text, cx, 1532, 26, pen_col)
-			_text_centered("Puedes fallar %d veces y seguir; el siguiente fallo termina." % lives_setting, cx, 1560, 22, muted)
+			_text_centered(T("Puedes fallar %d veces y seguir; el siguiente fallo termina.") % lives_setting, cx, 1560, 22, muted)
 		else:
 			_text_centered(pen_text, cx, 1490, 28, pen_col)
-			_text_centered("Puedes fallar %d veces y seguir; el siguiente fallo termina." % lives_setting, cx, 1545, 24, muted)
+			_text_centered(T("Puedes fallar %d veces y seguir; el siguiente fallo termina.") % lives_setting, cx, 1545, 24, muted)
 	else:
 		_text_centered("Sin límite de fallos", cx, 1405, 40, Color.WHITE)
 		_text_centered("Juega tranquilo: fallar solo rompe el combo. No se guarda.", cx, 1465, 28, muted)
 	_draw_prepare_record(cx)
-	_button(Rect2(100,1640,w-200,145),"JUGAR",Color(0.02,0.68,0.88))
+	_button(Rect2(100,1640,w-200,145),"JUGAR",pcol("accent"))
 
 ## Mejor récord de esta canción para el modo elegido (Casual no guarda).
 func _draw_prepare_record(cx: float) -> void:
 	if not lives_mode:
 		return
 	var key := _song_key(current_song)
-	var muted := Color(0.62, 0.75, 0.88)
-	var gold := Color(1.0, 0.82, 0.3)
+	var muted := pcol("muted")
+	var gold := pcol("gold")
 	if infinite_mode:
 		var b: Dictionary = bests.get(key + "|inf", {})
 		if b.is_empty():
@@ -2523,7 +2791,7 @@ func _draw_prepare_record(cx: float) -> void:
 			return
 		var n_st := mini(int(b.get("stars", 0)), 3)
 		var n_cr := mini(int(b.get("crowns", 0)), 3)
-		var label := "Vuelta %d · %d pts" % [int(b.get("laps", 1)), int(b.get("score", 0))]
+		var label := T("Vuelta %d · %d pts") % [int(b.get("laps", 1)), int(b.get("score", 0))]
 		var ir := 15.0
 		var step := ir * 2.7
 		var icons_w := (n_st + n_cr) * step
@@ -2539,59 +2807,74 @@ func _draw_prepare_record(cx: float) -> void:
 		if b2.is_empty():
 			_text_centered("Récord: sin récord todavía", cx, 1620, 28, muted)
 		else:
-			_text_centered("Récord: %s · %d pts" % [RANKS[int(b2.rank)], int(b2.score)], cx, 1620, 28, gold)
+			_text_centered(T("Récord: %s · %d pts") % [RANKS[int(b2.rank)], int(b2.score)], cx, 1620, 28, gold)
+
+func _lang_rect(i: int) -> Rect2:
+	return Rect2(viewport_size.x - 80.0 - 30.0 - 2.0 * 170.0 - 16.0 + i * 186.0, 1125, 170, 90)
 
 func _draw_settings() -> void:
 	_background(); draw_set_transform(Vector2(0, ui_off))
 	var w := viewport_size.x
-	var muted := Color(0.62, 0.75, 0.88)
+	var muted := pcol("muted")
+	var panel_col := acol(pcol("panel"), 0.92)
+	var on_col := pcol("accent")
+	var off_col := pcol("button")
 	_text("AJUSTES", Vector2(55, 105 + top_inset), 58, Color.WHITE)
-	_panel(Rect2(80, 330, w - 160, 180), Color(0.08, 0.13, 0.22, 0.92), 34)
+	_panel(Rect2(80, 330, w - 160, 180), panel_col, 34)
 	_text("Fondos de los mapas", Vector2(130, 415), 40, Color.WHITE)
 	_text("Imagen del mapa detrás de las teclas", Vector2(130, 465), 26, muted)
-	_button(Rect2(w - 330, 375, 200, 90), "SÍ" if show_bg else "NO", Color(0.02, 0.68, 0.88) if show_bg else Color(0.22, 0.28, 0.38))
+	_button(Rect2(w - 330, 375, 200, 90), "SÍ" if show_bg else "NO", on_col if show_bg else off_col)
 	var a := 1.0 if show_bg else 0.4
-	_panel(Rect2(80, 540, w - 160, 300), Color(0.08, 0.13, 0.22, 0.92 * a), 34)
+	_panel(Rect2(80, 540, w - 160, 300), acol(pcol("panel"), 0.92 * a), 34)
 	_text("Visibilidad del fondo", Vector2(130, 625), 40, Color(1, 1, 1, a))
-	_button(Rect2(130, 690, 170, 110), "-", Color(0.14, 0.22, 0.34, a))
-	_button(Rect2(w - 300, 690, 170, 110), "+", Color(0.14, 0.22, 0.34, a))
+	_button(Rect2(130, 690, 170, 110), "-", acol(off_col, a))
+	_button(Rect2(w - 300, 690, 170, 110), "+", acol(off_col, a))
 	_text_centered("%d %%" % roundi(bg_vis * 100.0), w / 2, 765, 56, Color(1, 1, 1, a))
-	_panel(Rect2(80, 870, w - 160, 180), Color(0.08, 0.13, 0.22, 0.92), 34)
+	_panel(Rect2(80, 870, w - 160, 180), panel_col, 34)
 	_text("Miniaturas de canciones", Vector2(130, 955), 40, Color.WHITE)
 	_text("Imagen del mapa en cada canción de la lista", Vector2(130, 1005), 26, muted)
-	_button(Rect2(w - 330, 915, 200, 90), "SÍ" if show_thumbs else "NO", Color(0.02, 0.68, 0.88) if show_thumbs else Color(0.22, 0.28, 0.38))
-	_text("Las carpetas de canciones, importar y exportar", Vector2(80, 1130), 26, muted)
-	_text("están ahora en la pestaña Archivos.", Vector2(80, 1170), 26, muted)
+	_button(Rect2(w - 330, 915, 200, 90), "SÍ" if show_thumbs else "NO", on_col if show_thumbs else off_col)
+	_panel(Rect2(80, 1080, w - 160, 180), panel_col, 34)
+	_text("Idioma", Vector2(130, 1165), 40, Color.WHITE)
+	_text("Idioma de la aplicación", Vector2(130, 1215), 26, muted)
+	_button(_lang_rect(0), "Español", on_col if lang == "es" else off_col)
+	_button(_lang_rect(1), "English", on_col if lang == "en" else off_col)
+	_panel(Rect2(80, 1290, w - 160, 180), panel_col, 34)
+	_text("Paleta de colores", Vector2(130, 1375), 40, Color.WHITE)
+	_text("Cambia los colores de la app", Vector2(130, 1425), 26, muted)
+	_button(Rect2(w - 330, 1335, 200, 90), "Editar", on_col)
+	_text("Las carpetas de canciones, importar y exportar", Vector2(80, 1530), 26, muted)
+	_text("están ahora en la pestaña Archivos.", Vector2(80, 1570), 26, muted)
 	if status_time > 0.0:
-		_text(_fit(status_text, w - 160, 26), Vector2(80, 1240), 26, Color(1, 0.45, 0.45) if status_error else Color(0.5, 0.95, 0.75))
+		_text(_fit(status_text, w - 160, 26), Vector2(80, 1640), 26, _err() if status_error else _ok())
 	_draw_nav()
 
 func _draw_results_infinite() -> void:
 	_background(); draw_set_transform(Vector2(0, ui_off)); _text_centered("MODO INFINITO", viewport_size.x / 2, 230, 58, Color.WHITE)
 	var w := viewport_size.x
-	_panel(Rect2(90, 300, w - 180, 1010), Color(0.96, 0.98, 1), 38)
-	var dark := Color(0.12, 0.22, 0.32)
-	var muted := Color(0.42, 0.52, 0.62)
+	_panel(Rect2(90, 300, w - 180, 1010), pcol("card"), 38)
+	var dark := pcol("ink")
+	var muted := _ink_soft()
 	_text_centered("Llegaste a la vuelta", w / 2, 410, 32, muted)
-	_text_centered(str(lap), w / 2, 590, 200, Color(0.5, 0.38, 0.92))
-	_text_centered("velocidad x%.1f" % lap_factor, w / 2, 660, 34, dark)
+	_text_centered(str(lap), w / 2, 590, 200, pcol("violet"))
+	_text_centered(T("velocidad x%.1f") % lap_factor, w / 2, 660, 34, dark)
 	_text("Estrellas", Vector2(170, 760), 38, dark)
 	_text("Coronas", Vector2(170, 880), 38, dark)
 	for i in 3:
 		_draw_award("star", Vector2(w - 170 - 270 + 45 + i * 90, 745), 34.0, i < stars)
 		_draw_award("crown", Vector2(w - 170 - 270 + 45 + i * 90, 865), 34.0, i < crowns)
 	if failed:
-		_text_centered(fail_text, w / 2, 980, 32, Color(0.9, 0.2, 0.28))
+		_text_centered(fail_text, w / 2, 980, 32, pcol("danger"))
 	if run_record:
 		_text_centered("¡Nuevo récord!", w / 2, 1030, 34, Color(1.0, 0.6, 0.1))
 	if run_lives > 0:
-		var pen_note := "%d vidas · sin penalización" % run_lives if run_lives == LIVES_MIN else "%d vidas · puntos x%.2f" % [run_lives, run_mult]
+		var pen_note := T("%d vidas · sin penalización") % run_lives if run_lives == LIVES_MIN else T("%d vidas · puntos x%.2f") % [run_lives, run_mult]
 		_text_centered(pen_note, w / 2, 1085, 24, muted)
-	_text("Puntuación", Vector2(170, 1120), 29, muted); _text(str(score), Vector2(170, 1200), 68, Color(0.02, 0.62, 0.86))
+	_text("Puntuación", Vector2(170, 1120), 29, muted); _text(str(score), Vector2(170, 1200), 68, pcol("accent").darkened(0.08))
 	var ib: Dictionary = bests.get(_song_key(current_song) + "|inf", {})
 	if not ib.is_empty():
-		_text_centered("Mejor: vuelta %d · %d pts" % [int(ib.get("laps", 1)), int(ib.get("score", 0))], w / 2, 1270, 28, muted)
-	_button(Rect2(110, 1400, w - 220, 135), "REPETIR", Color(0.02, 0.68, 0.88)); _button(Rect2(110, 1570, w - 220, 120), "CANCIONES", Color(0.17, 0.25, 0.37))
+		_text_centered(T("Mejor: vuelta %d · %d pts") % [int(ib.get("laps", 1)), int(ib.get("score", 0))], w / 2, 1270, 28, muted)
+	_button(Rect2(110, 1400, w - 220, 135), "REPETIR", pcol("accent")); _button(Rect2(110, 1570, w - 220, 120), "CANCIONES", pcol("button"))
 
 func _draw_results() -> void:
 	if infinite_run:
@@ -2599,33 +2882,33 @@ func _draw_results() -> void:
 		return
 	_background(); draw_set_transform(Vector2(0, ui_off)); _text_centered("RESULTADOS", viewport_size.x / 2, 230, 58, Color.WHITE)
 	var w := viewport_size.x
-	_panel(Rect2(90, 300, w - 180, 1010), Color(0.96, 0.98, 1), 38)
-	var dark := Color(0.12, 0.22, 0.32)
-	var muted := Color(0.42, 0.52, 0.62)
+	_panel(Rect2(90, 300, w - 180, 1010), pcol("card"), 38)
+	var dark := pcol("ink")
+	var muted := _ink_soft()
 	# Rango grande
 	var rcol: Color = RANK_COLORS[run_rank]
 	_text_centered(RANKS[run_rank], w / 2, 560, 300, rcol)
-	_text_centered("Precisión %.1f %%" % run_accuracy, w / 2, 640, 40, dark)
+	_text_centered(T("Precisión %.1f %%") % run_accuracy, w / 2, 640, 40, dark)
 	if run_record:
 		_text_centered("¡Nuevo récord!", w / 2, 700, 34, Color(1.0, 0.6, 0.1))
 	if failed:
-		_text_centered(fail_text, w / 2, 745, 32, Color(0.9, 0.2, 0.28))
+		_text_centered(fail_text, w / 2, 745, 32, pcol("danger"))
 	elif run_lives > 0:
-		_text_centered("Modo Vidas · %d vidas · puntos x%.2f" % [run_lives, run_mult], w / 2, 745, 28, muted)
+		_text_centered(T("Modo Vidas · %d vidas · puntos x%.2f") % [run_lives, run_mult], w / 2, 745, 28, muted)
 	else:
 		_text_centered("Casual · esta partida no se guarda", w / 2, 745, 28, muted)
-	_text("Puntuación", Vector2(170, 800), 29, muted); _text(str(score), Vector2(170, 880), 68, Color(0.02, 0.62, 0.86))
+	_text("Puntuación", Vector2(170, 800), 29, muted); _text(str(score), Vector2(170, 880), 68, pcol("accent").darkened(0.08))
 	_text("Perfect: %d" % perfects, Vector2(170, 980), 34, dark); _text("Great: %d" % greats, Vector2(w / 2 + 20, 980), 34, dark)
-	_text("Good: %d" % goods, Vector2(170, 1045), 34, dark); _text("Fallos: %d" % misses, Vector2(w / 2 + 20, 1045), 34, dark)
-	_text("Vacíos: %d" % empties, Vector2(170, 1110), 34, dark); _text("Combo máx: %d" % max_combo, Vector2(w / 2 + 20, 1110), 34, dark)
+	_text("Good: %d" % goods, Vector2(170, 1045), 34, dark); _text(T("Fallos: %d") % misses, Vector2(w / 2 + 20, 1045), 34, dark)
+	_text(T("Vacíos: %d") % empties, Vector2(170, 1110), 34, dark); _text(T("Combo máx: %d") % max_combo, Vector2(w / 2 + 20, 1110), 34, dark)
 	var best: Dictionary = bests.get(_song_key(current_song), {})
 	if run_lives > 0 and not best.is_empty():
-		_text_centered("Mejor: %s · %d" % [RANKS[int(best.rank)], int(best.score)], w / 2, 1215, 32, muted)
-	_button(Rect2(110, 1400, w - 220, 135), "REPETIR", Color(0.02, 0.68, 0.88)); _button(Rect2(110, 1570, w - 220, 120), "CANCIONES", Color(0.17, 0.25, 0.37))
+		_text_centered(T("Mejor: %s · %d") % [RANKS[int(best.rank)], int(best.score)], w / 2, 1215, 32, muted)
+	_button(Rect2(110, 1400, w - 220, 135), "REPETIR", pcol("accent")); _button(Rect2(110, 1570, w - 220, 120), "CANCIONES", pcol("button"))
 
 ## Mismo fondo que _background() pero solo dentro de un rectángulo (para tapar la lista bajo la cabecera).
 func _background_rect(r: Rect2) -> void:
-	draw_rect(r, Color(0.025, 0.05, 0.1))
+	draw_rect(r, pcol("bg"))
 	var rect_poly := PackedVector2Array([r.position, Vector2(r.end.x, r.position.y), r.end, Vector2(r.position.x, r.end.y)])
 	var center := Vector2(viewport_size.x * 0.75, viewport_size.y * 0.22)
 	for i in range(10):
@@ -2634,16 +2917,17 @@ func _background_rect(r: Rect2) -> void:
 		for k in 48:
 			circle.append(center + Vector2(cos(k * TAU / 48.0), sin(k * TAU / 48.0)) * rad)
 		for piece in Geometry2D.intersect_polygons(circle, rect_poly):
-			draw_colored_polygon(piece, Color(0, 0.58, 0.95, 0.025))
+			draw_colored_polygon(piece, acol(pcol("accent"), 0.025))
 
 func _background() -> void:
-	draw_rect(Rect2(Vector2.ZERO,viewport_size),Color(0.025,0.05,0.1))
+	draw_rect(Rect2(Vector2.ZERO,viewport_size),pcol("bg"))
 	if show_bg and bg_texture != null and (screen == Screen.PREPARE or screen == Screen.RESULTS):
 		_draw_cover(bg_texture, Rect2(Vector2.ZERO, viewport_size))
-		draw_rect(Rect2(Vector2.ZERO, viewport_size), Color(0.025, 0.05, 0.1, 0.82))
-	for i in range(10): draw_circle(Vector2(viewport_size.x*0.75,viewport_size.y*0.22),700-i*50,Color(0,0.58,0.95,0.025))
+		draw_rect(Rect2(Vector2.ZERO, viewport_size), acol(pcol("bg"), 0.82))
+	for i in range(10): draw_circle(Vector2(viewport_size.x*0.75,viewport_size.y*0.22),700-i*50,acol(pcol("accent"), 0.025))
 
 func _button(rect: Rect2, label: String, color: Color) -> void:
+	label = T(label)
 	_panel(rect,color,24); var width := _font().get_string_size(label,HORIZONTAL_ALIGNMENT_LEFT,-1,34).x
 	_text(label,Vector2(rect.get_center().x-width/2,rect.get_center().y+12),34,Color.WHITE)
 
@@ -2653,6 +2937,10 @@ func _box(color: Color, radius: float) -> StyleBoxFlat:
 	box.corner_radius_top_left=int(radius); box.corner_radius_top_right=int(radius); box.corner_radius_bottom_left=int(radius); box.corner_radius_bottom_right=int(radius)
 	return box
 func _text_outlined(value: String, center_x: float, y: float, size: int, color: Color, outline_color: Color, outline: int) -> void:
+	value = T(value)
+	if color.r == 1.0 and color.g == 1.0 and color.b == 1.0:
+		var tc := pcol("text")
+		color = Color(tc.r, tc.g, tc.b, color.a)
 	var font := _font()
 	var width := font.get_string_size(value, HORIZONTAL_ALIGNMENT_LEFT, -1, size).x
 	var pos := Vector2(center_x - width / 2.0, y)
@@ -2666,5 +2954,13 @@ func _draw_cover(tex: Texture2D, rect: Rect2, tint := Color.WHITE) -> void:
 	var src_size := rect.size / k
 	draw_texture_rect_region(tex, rect, Rect2((ts - src_size) / 2.0, src_size), tint)
 
-func _text(value: String, pos: Vector2, size: int, color: Color) -> void: draw_string(_font(),pos,value,HORIZONTAL_ALIGNMENT_LEFT,-1,size,color)
+func _text(value: String, pos: Vector2, size: int, color: Color) -> void:
+	if color.r == 1.0 and color.g == 1.0 and color.b == 1.0:   # blanco = "color de texto" de la paleta
+		var tc := pcol("text")
+		color = Color(tc.r, tc.g, tc.b, color.a)
+	draw_string(_font(), pos, T(value), HORIZONTAL_ALIGNMENT_LEFT, -1, size, color)
+
+## Texto sin traducir ni cambiar de color (para etiquetas que ya van con su color de contraste).
+func _text_fixed(value: String, pos: Vector2, size: int, color: Color) -> void:
+	draw_string(_font(), pos, value, HORIZONTAL_ALIGNMENT_LEFT, -1, size, color)
 func _font() -> Font: return ThemeDB.fallback_font
