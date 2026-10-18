@@ -12,6 +12,7 @@ const HIT_MARGIN := 340.0   # distancia de la línea de golpeo al borde inferior
 const OsuImporter = preload("res://scripts/osu_importer.gd")
 const START_TIME := -100.0
 const LIST_TOP := 320.0
+const HIT_LATE := 0.28      # segundos de margen para tocar una tecla tarde
 const CARD_H := 190.0
 const CARD_GAP := 24.0
 const DEMO_ENTRY := {"demo": true, "title": "Tiles FOSS Demo", "artist": "Mapa de prueba", "version": "Normal", "badge": "DEMO"}
@@ -197,7 +198,7 @@ func _update_notes() -> void:
 				note.done = true
 				note.holding = false
 				_hit(note.lane, "PERFECT", 180, hit_y)
-		elif note.type != "start" and song_time > note.time + 0.28:
+		elif note.type != "start" and song_time > note.time + HIT_LATE:
 			var miss_position: float = hit_y + (song_time - note.time) * speed
 			note.done = true
 			_miss(note.lane, miss_position)
@@ -213,7 +214,8 @@ func _update_notes() -> void:
 func _unhandled_input(event: InputEvent) -> void:
 	# En Android cada toque llega dos veces: como InputEventScreenTouch y como un
 	# clic de ratón emulado (device = -1). Nos quedamos solo con el toque real.
-	if (event is InputEventMouseButton or event is InputEventMouseMotion) and event.device == InputEvent.DEVICE_ID_EMULATION:
+	# En móvil no hay ratón real: se ignora todo evento de ratón (son copias emuladas del toque).
+	if (event is InputEventMouseButton or event is InputEventMouseMotion) and (OS.has_feature("mobile") or event.device == InputEvent.DEVICE_ID_EMULATION):
 		return
 	if event is InputEventScreenTouch:
 		_pointer(event.position, event.pressed, event.index)
@@ -318,16 +320,21 @@ func _try_hit(lane: int, input_id: int) -> void:
 				return
 		_effect(lane, hit_y, Color(1.0, 0.15, 0.18, 0.84))
 		return
+	# La tecla se dibuja con su borde inferior en la línea de golpeo al llegar su hora,
+	# así que el cuerpo (alto NORMAL_HEIGHT) se ve ANTES. Se puede tocar en cualquier
+	# parte del cuerpo: la ventana "temprana" equivale al tiempo que tarda en caer su alto.
 	var best: Dictionary = {}
 	var best_diff := 999.0
 	for i in range(first_idx, notes.size()):
 		var note: Dictionary = notes[i]
-		if note.type != "start" and note.time - song_time > 0.3: break
+		if note.type != "start" and note.time - song_time > 0.6: break
 		if note.done or note.type == "start" or note.lane != lane: continue
-		var diff: float = abs(song_time - note.time)
-		if diff < best_diff:
-			best_diff = diff; best = note
-	if best.is_empty() or best_diff > 0.28:
+		var early: float = clampf(float(note.height) / speed, 0.3, 0.6)
+		var signed_diff: float = song_time - note.time
+		if signed_diff < -early or signed_diff > HIT_LATE: continue
+		best_diff = abs(signed_diff); best = note
+		break  # la más antigua pendiente del carril
+	if best.is_empty():
 		combo = 0; last_judgement = "VACÍO"; judgement_time = 0.35
 		_effect(lane, hit_y, Color(1.0, 0.15, 0.18, 0.84))
 		return
@@ -742,6 +749,8 @@ func _draw_library() -> void:
 		_button(Rect2(viewport_size.x - 670, 150, 245, 95), "Buscar", Color(0.14, 0.22, 0.34))
 		_button(Rect2(viewport_size.x - 405, 150, 350, 95), "Importar .osz", Color(0.04, 0.65, 0.88))
 	draw_set_transform(Vector2.ZERO)
+	var sa := DisplayServer.get_display_safe_area()
+	_text("build 3 | vp %dx%d | win %s | safe %s" % [viewport_size.x, viewport_size.y, DisplayServer.window_get_size(), sa], Vector2(20, viewport_size.y - 70), 26, Color(1, 1, 1, 0.75))
 	if not open_group.is_empty():
 		_draw_difficulty_picker()
 	if status_time > 0.0:
