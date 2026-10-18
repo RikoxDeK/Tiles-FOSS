@@ -18,6 +18,8 @@ const DEMO_ENTRY := {"demo": true, "title": "Tiles FOSS Demo", "artist": "Mapa d
 
 var screen := Screen.LIBRARY
 var viewport_size := Vector2(1080, 1920)
+var ui_off := 0.0        # desplazamiento vertical para centrar los menús (pantallas más altas que 16:9)
+var top_inset := 0.0     # margen superior por cámara frontal / muesca, en unidades del viewport
 var notes: Array = []
 var active_inputs: Dictionary = {}
 var effects: Array = []
@@ -131,8 +133,14 @@ func _go_back() -> void:
 func _resize() -> void:
 	viewport_size = get_viewport_rect().size
 	hit_y = viewport_size.y - HIT_MARGIN
+	ui_off = maxf(0.0, (viewport_size.y - 1920.0) / 2.0)
+	top_inset = 0.0
+	var win_w := float(DisplayServer.window_get_size().x)
+	if win_w > 0.0:
+		var safe := DisplayServer.get_display_safe_area()
+		top_inset = maxf(0.0, float(safe.position.y)) * viewport_size.x / win_w
 	if search_edit != null:
-		search_edit.position = Vector2(55, 140)
+		search_edit.position = Vector2(55, 140 + top_inset)
 		search_edit.size = Vector2(viewport_size.x - 375.0, 105)
 	queue_redraw()
 
@@ -247,6 +255,8 @@ func _pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
 	if not pressed:
 		active_inputs.erase(input_id)
 		return
+	if screen == Screen.PREPARE or screen == Screen.RESULTS:
+		pos.y -= ui_off
 	if screen == Screen.PREPARE:
 		if Rect2(100, 1360, viewport_size.x - 200, 145).has_point(pos): _start_game()
 		elif Rect2(35, 45, 180, 95).has_point(pos): screen = Screen.LIBRARY
@@ -254,10 +264,11 @@ func _pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
 		elif Rect2(viewport_size.x - 290, 1130, 190, 120).has_point(pos): _adjust_speed(SPEED_STEP)
 		elif Rect2(310, 1130, viewport_size.x - 620, 120).has_point(pos): speed_auto = not speed_auto; _save_settings()
 	elif screen == Screen.GAME:
-		if Rect2(viewport_size.x - 145, 35, 110, 100).has_point(pos):
+		if Rect2(viewport_size.x - 145, 35 + top_inset, 110, 100).has_point(pos):
 			_set_paused(not paused)
 			return
 		if paused:
+			pos.y -= ui_off
 			if Rect2(170, 760, viewport_size.x - 340, 135).has_point(pos): _set_paused(false)
 			elif Rect2(170, 930, viewport_size.x - 340, 135).has_point(pos): _go_library()
 			return
@@ -503,14 +514,14 @@ func _library_tap(pos: Vector2) -> void:
 		return
 	search_edit.release_focus()
 	if search_open:
-		if Rect2(viewport_size.x - 300, 150, 245, 95).has_point(pos):
+		if Rect2(viewport_size.x - 300, 150 + top_inset, 245, 95).has_point(pos):
 			_close_search()
 			return
 	else:
-		if Rect2(viewport_size.x - 670, 150, 245, 95).has_point(pos):
+		if Rect2(viewport_size.x - 670, 150 + top_inset, 245, 95).has_point(pos):
 			_open_search()
 			return
-		if Rect2(viewport_size.x - 405, 150, 350, 95).has_point(pos):
+		if Rect2(viewport_size.x - 405, 150 + top_inset, 350, 95).has_point(pos):
 			file_dialog.popup_centered_ratio(0.85)
 			return
 	if pos.y < LIST_TOP - 22.0 or pos.x < 55.0 or pos.x > viewport_size.x - 55.0:
@@ -630,6 +641,7 @@ func _draw() -> void:
 	elif screen == Screen.PREPARE: _draw_prepare()
 	elif screen == Screen.GAME: _draw_game()
 	else: _draw_results()
+	draw_set_transform(Vector2.ZERO)
 
 func _draw_game() -> void:
 	var lane_w := viewport_size.x / LANES
@@ -666,15 +678,17 @@ func _draw_game() -> void:
 		draw_rect(Rect2(center-half, half*2.0), color, false, 7.0)
 	if judgement_time > 0:
 		var color := Color(1,0.2,0.22) if last_judgement in ["MISS","VACÍO"] else Color(0.08,0.15,0.22)
-		_text(last_judgement, Vector2(viewport_size.x/2-110,340), 48, color)
-	_text(str(hits), Vector2(viewport_size.x/2-25,155), 72, Color(1,0.22,0.28))
-	_text("Combo %d" % combo, Vector2(35,95), 30, Color(0.12,0.22,0.32))
-	_button(Rect2(viewport_size.x-145,35,110,100), "II", Color(0.06,0.12,0.2,0.72))
+		_text(last_judgement, Vector2(viewport_size.x/2-110,340+top_inset), 48, color)
+	_text(str(hits), Vector2(viewport_size.x/2-25,155+top_inset), 72, Color(1,0.22,0.28))
+	_text("Combo %d" % combo, Vector2(35,95+top_inset), 30, Color(0.12,0.22,0.32))
+	_button(Rect2(viewport_size.x-145,35+top_inset,110,100), "II", Color(0.06,0.12,0.2,0.72))
 	if paused:
 		draw_rect(Rect2(Vector2.ZERO,viewport_size), Color(0,0,0,0.74))
+		draw_set_transform(Vector2(0, ui_off))
 		_text("PAUSA", Vector2(viewport_size.x/2-110,600), 62, Color.WHITE)
 		_button(Rect2(170,760,viewport_size.x-340,135), "CONTINUAR", Color(0.02,0.68,0.88))
 		_button(Rect2(170,930,viewport_size.x-340,135), "SALIR", Color(0.22,0.28,0.38))
+		draw_set_transform(Vector2.ZERO)
 
 ## Línea + círculo de las notas sostenidas. Inactiva (cayendo): cian tenue.
 ## Activa (sostenida): cian brillante y círculo relleno.
@@ -719,6 +733,7 @@ func _draw_library() -> void:
 		_text("o arrastra el archivo a la ventana (PC).", Vector2(x, hint_y + 44), 28, Color(0.62, 0.75, 0.88))
 	# La cabecera tapa las tarjetas que suben por debajo.
 	draw_rect(Rect2(0, 0, viewport_size.x, LIST_TOP - 22), bg)
+	draw_set_transform(Vector2(0, top_inset))
 	_text("TILES FOSS", Vector2(55, 105), 58, Color.WHITE)
 	if search_open:
 		_button(Rect2(viewport_size.x - 300, 150, 245, 95), "Cerrar", Color(0.17, 0.25, 0.37))
@@ -726,10 +741,11 @@ func _draw_library() -> void:
 		_text("Canciones", Vector2(55, 205), 42, Color(0.82, 0.91, 1))
 		_button(Rect2(viewport_size.x - 670, 150, 245, 95), "Buscar", Color(0.14, 0.22, 0.34))
 		_button(Rect2(viewport_size.x - 405, 150, 350, 95), "Importar .osz", Color(0.04, 0.65, 0.88))
+	draw_set_transform(Vector2.ZERO)
 	if not open_group.is_empty():
 		_draw_difficulty_picker()
 	if status_time > 0.0:
-		_text(_fit(status_text, viewport_size.x - 110, 26), Vector2(55, 272), 26, Color(1, 0.45, 0.45) if status_error else Color(0.5, 0.95, 0.75))
+		_text(_fit(status_text, viewport_size.x - 110, 26), Vector2(55, 272 + top_inset), 26, Color(1, 0.45, 0.45) if status_error else Color(0.5, 0.95, 0.75))
 
 func _draw_difficulty_picker() -> void:
 	draw_rect(Rect2(Vector2.ZERO, viewport_size), Color(0, 0, 0, 0.62))
@@ -751,7 +767,7 @@ func _draw_difficulty_picker() -> void:
 		_text(_fit(e.version, r.size.x - 180, 34), Vector2(r.position.x + 155, r.get_center().y + 12), 34, Color(0.12, 0.22, 0.31))
 
 func _draw_prepare() -> void:
-	_background(); _button(Rect2(35,45,180,95),"< Volver",Color(0.14,0.22,0.34))
+	_background(); draw_set_transform(Vector2(0, ui_off)); _button(Rect2(35,45,180,95),"< Volver",Color(0.14,0.22,0.34))
 	var text_w := viewport_size.x - 160
 	_text(_fit(current_song.title, text_w, 58), Vector2(80,370), 58, Color.WHITE)
 	_text(_fit("%s · %s" % [current_song.artist, current_song.version], text_w, 32), Vector2(82,445), 32, Color(0.68,0.84,0.96))
@@ -770,7 +786,7 @@ func _draw_prepare() -> void:
 	_button(Rect2(100,1360,viewport_size.x-200,145),"JUGAR",Color(0.02,0.68,0.88))
 
 func _draw_results() -> void:
-	_background(); _text("RESULTADOS",Vector2(310,230),58,Color.WHITE)
+	_background(); draw_set_transform(Vector2(0, ui_off)); _text("RESULTADOS",Vector2(310,230),58,Color.WHITE)
 	_panel(Rect2(90,350,viewport_size.x-180,760),Color(0.96,0.98,1),38)
 	_text("Puntuación",Vector2(170,590),29,Color(0.42,0.52,0.62)); _text(str(score),Vector2(170,680),68,Color(0.02,0.62,0.86))
 	_text("Aciertos: %d"%hits,Vector2(170,820),34,Color(0.12,0.22,0.32)); _text("Fallos: %d"%misses,Vector2(170,890),34,Color(0.12,0.22,0.32))
