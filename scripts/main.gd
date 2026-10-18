@@ -80,6 +80,7 @@ var diff_level := 1          # índice en DIFFICULTY_LEVELS (1 = Normal)
 var current_parsed: Dictionary = {}   # mapa .osu parseado de la canción abierta
 var library_dir := ""        # carpeta de canciones elegida ("" = sin configurar)
 var syncing := false
+var perm_asked := false   # ya pedimos el permiso de archivos en esta sesión
 var folder_dialog: FileDialog
 var infinite_mode := false   # ajuste: modo Infinito (usa las vidas)
 var infinite_run := false    # esta partida es infinita
@@ -903,7 +904,9 @@ func _default_library_dir() -> String:
 
 func _set_library_dir(path: String) -> void:
 	if path == "" or path.begins_with("content://"):
-		_show_status("No se pudo usar esa carpeta. Elige otra del almacenamiento (ej. Documentos).", true, 8.0)
+		library_dir = _default_library_dir()
+		_save_settings()
+		_show_status("Android no deja usar esa carpeta. Se usa la de por defecto: %s" % library_dir, true, 8.0)
 		return
 	library_dir = path
 	_save_settings()
@@ -943,6 +946,19 @@ func _sync_folder() -> void:
 	if library_dir == "":
 		library_dir = _default_library_dir()
 		_save_settings()
+	# En Android 11+ la app puede crear la carpeta sin permiso, pero sin "acceso a todos
+	# los archivos" no ve los .osz que no creó ella (los tuyos ni los de una instalación previa).
+	if OS.has_feature("android") and not perm_asked:
+		var has_all := false
+		for perm in OS.get_granted_permissions():
+			if String(perm).contains("MANAGE_EXTERNAL_STORAGE"):
+				has_all = true
+		if not has_all:
+			perm_asked = true
+			OS.request_permissions()
+			_show_status("Concede \"acceso a todos los archivos\" a la app y vuelve a pulsar Recargar.", true, 12.0)
+			syncing = false
+			return
 	var inbox := library_dir.path_join(INBOX_NAME)
 	var backup := library_dir.path_join(BACKUP_NAME)
 	DirAccess.make_dir_recursive_absolute(inbox)
@@ -988,12 +1004,13 @@ func _sync_folder() -> void:
 		else:
 			failed += 1
 	_refresh_library()
-	var msg := "Listo: %d importadas, %d restauradas" % [imported, restored]
+	var msg := "Listo: %d importadas, %d restauradas (vi %d en Por importar y %d en Importadas)" % [imported, restored, inbox_files.size(), backup_files.size()]
 	if failed > 0:
 		msg += ", %d con error" % failed
 	if total == 0:
-		msg = "Carpeta lista. Deja tus .osz en \"%s\" y pulsa Recargar." % INBOX_NAME
-	_show_status(msg, failed > 0, 8.0)
+		msg = "No veo ningún .osz en \"%s\" ni en \"%s\" (%s). Deja ahí tus .osz y pulsa Recargar. Si ya están, falta el permiso: Ajustes de Android, Apps, Tiles FOSS, Permisos, Archivos, permitir administrar todos los archivos." % [INBOX_NAME, BACKUP_NAME, library_dir]
+		failed = 1
+	_show_status(msg, failed > 0, 14.0 if total == 0 else 8.0)
 	syncing = false
 
 func _on_files_dropped(files: PackedStringArray) -> void:
