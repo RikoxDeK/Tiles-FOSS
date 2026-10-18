@@ -8,7 +8,7 @@ const SETTINGS_PATH := "user://settings.cfg"
 const SPEED_MIN := 0.5
 const SPEED_MAX := 3.0
 const SPEED_STEP := 0.1
-const HIT_Y := 1580.0
+const HIT_MARGIN := 340.0   # distancia de la línea de golpeo al borde inferior de la pantalla
 const OsuImporter = preload("res://scripts/osu_importer.gd")
 const START_TIME := -100.0
 const LIST_TOP := 320.0
@@ -44,7 +44,8 @@ var first_note_time := 0.0
 
 # Velocidad de caída (px/s = BASE_SPEED * multiplicador)
 var speed := BASE_SPEED
-var ahead := HIT_Y / BASE_SPEED + 0.15   # segundos de notas visibles por delante
+var hit_y := 1580.0         # se recalcula en _resize según el alto real de la pantalla
+var ahead := 1580.0 / BASE_SPEED + 0.15   # segundos de notas visibles por delante
 var speed_auto := true      # true: usa el multiplicador sugerido para el mapa
 var speed_mult := 1.0       # multiplicador manual (se guarda en disco)
 var auto_mult := 1.0        # multiplicador sugerido para la canción elegida
@@ -105,8 +106,31 @@ func _ready() -> void:
 	_refresh_library()
 	_resize()
 
+func _notification(what: int) -> void:
+	if what == NOTIFICATION_WM_GO_BACK_REQUEST:
+		_go_back()
+
+## Botón "atrás" de Android: retrocede una pantalla en vez de cerrar el juego.
+func _go_back() -> void:
+	match screen:
+		Screen.GAME:
+			_set_paused(not paused)
+		Screen.PREPARE:
+			screen = Screen.LIBRARY
+		Screen.RESULTS:
+			open_group = {}
+			screen = Screen.LIBRARY
+		Screen.LIBRARY:
+			if not open_group.is_empty():
+				open_group = {}
+			elif search_open:
+				_close_search()
+			else:
+				get_tree().quit()
+
 func _resize() -> void:
 	viewport_size = get_viewport_rect().size
+	hit_y = viewport_size.y - HIT_MARGIN
 	if search_edit != null:
 		search_edit.position = Vector2(55, 140)
 		search_edit.size = Vector2(viewport_size.x - 375.0, 105)
@@ -160,13 +184,13 @@ func _update_notes() -> void:
 			if not held and song_time < note.time + note.duration - 0.12:
 				note.done = true
 				note.holding = false
-				_miss(note.lane, HIT_Y)
+				_miss(note.lane, hit_y)
 			elif song_time >= note.time + note.duration:
 				note.done = true
 				note.holding = false
-				_hit(note.lane, "PERFECT", 180, HIT_Y)
+				_hit(note.lane, "PERFECT", 180, hit_y)
 		elif note.type != "start" and song_time > note.time + 0.28:
-			var miss_position: float = HIT_Y + (song_time - note.time) * speed
+			var miss_position: float = hit_y + (song_time - note.time) * speed
 			note.done = true
 			_miss(note.lane, miss_position)
 	while first_idx < notes.size() and notes[first_idx].done:
@@ -179,6 +203,10 @@ func _update_notes() -> void:
 			screen = Screen.RESULTS
 
 func _unhandled_input(event: InputEvent) -> void:
+	# En Android cada toque llega dos veces: como InputEventScreenTouch y como un
+	# clic de ratón emulado (device = -1). Nos quedamos solo con el toque real.
+	if (event is InputEventMouseButton or event is InputEventMouseMotion) and event.device == InputEvent.DEVICE_ID_EMULATION:
+		return
 	if event is InputEventScreenTouch:
 		_pointer(event.position, event.pressed, event.index)
 	elif event is InputEventScreenDrag:
@@ -244,9 +272,9 @@ func _start_game() -> void:
 	_stop_audio()
 	screen = Screen.GAME
 	speed = BASE_SPEED * _effective_mult()
-	ahead = HIT_Y / speed + 0.15
+	ahead = hit_y / speed + 0.15
 	# Que la primera nota entre desde arriba justo al empezar.
-	lead_in = maxf(0.0, HIT_Y / speed + 0.05 - first_note_time) if use_lead_in else 0.0
+	lead_in = maxf(0.0, hit_y / speed + 0.05 - first_note_time) if use_lead_in else 0.0
 	notes.clear()
 	for data in chart:
 		var note: Dictionary = data.duplicate(true)
@@ -275,9 +303,9 @@ func _try_hit(lane: int, input_id: int) -> void:
 		for note in notes:
 			if note.type == "start" and note.lane == lane and not note.done:
 				note.done = true; started = true; song_time = -lead_in; audio_started = false
-				_hit(lane, "COMENZAR", 0, HIT_Y)
+				_hit(lane, "COMENZAR", 0, hit_y)
 				return
-		_effect(lane, HIT_Y, Color(1.0, 0.15, 0.18, 0.84))
+		_effect(lane, hit_y, Color(1.0, 0.15, 0.18, 0.84))
 		return
 	var best: Dictionary = {}
 	var best_diff := 999.0
@@ -290,17 +318,17 @@ func _try_hit(lane: int, input_id: int) -> void:
 			best_diff = diff; best = note
 	if best.is_empty() or best_diff > 0.28:
 		combo = 0; last_judgement = "VACÍO"; judgement_time = 0.35
-		_effect(lane, HIT_Y, Color(1.0, 0.15, 0.18, 0.84))
+		_effect(lane, hit_y, Color(1.0, 0.15, 0.18, 0.84))
 		return
 	if best.type == "hold":
 		best.holding = true; best.input_id = input_id
 		last_judgement = "MANTÉN"; judgement_time = 0.4
-		_effect(lane, HIT_Y, Color(1, 1, 1, 0.82))
+		_effect(lane, hit_y, Color(1, 1, 1, 0.82))
 	else:
 		best.done = true
 		var judgement := "PERFECT" if best_diff <= 0.09 else ("GREAT" if best_diff <= 0.18 else "GOOD")
 		var points := 100 if judgement == "PERFECT" else (75 if judgement == "GREAT" else 50)
-		_hit(lane, judgement, points, HIT_Y)
+		_hit(lane, judgement, points, hit_y)
 
 func _hit(lane: int, text: String, points: int, effect_y: float) -> void:
 	hits += 1; combo += 1; max_combo = max(max_combo, combo); score += points + min(combo, 50)
@@ -471,6 +499,8 @@ func _library_tap(pos: Vector2) -> void:
 				_select_song(open_group.entries[i])
 				return
 		return
+	if search_edit.visible and search_edit.get_global_rect().has_point(pos):
+		return
 	search_edit.release_focus()
 	if search_open:
 		if Rect2(viewport_size.x - 300, 150, 245, 95).has_point(pos):
@@ -611,13 +641,13 @@ func _draw_game() -> void:
 		var note: Dictionary = notes[i]
 		if note.type != "start" and note.time - song_time > ahead: break
 		if note.done or (note.type == "start" and started): continue
-		var bottom: float = viewport_size.y if note.type == "start" and not started else HIT_Y - (note.time - song_time) * speed
+		var bottom: float = viewport_size.y if note.type == "start" and not started else hit_y - (note.time - song_time) * speed
 		var height: float = note.height
 		if note.type == "hold":
 			if note.holding:
 				var remaining: float = max(0.0, note.time + note.duration - song_time)
 				height = max(90.0, remaining * speed)
-				bottom = HIT_Y
+				bottom = hit_y
 			else:
 				height = maxf(120.0, note.duration * speed)
 		var rect := Rect2(note.lane * lane_w + 2, bottom - height, lane_w - 4, height)

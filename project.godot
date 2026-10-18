@@ -13,6 +13,7 @@ config_version=5
 config/name="Tiles FOSS"
 run/main_scene="res://scenes/Main.tscn"
 config/features=PackedStringArray("4.7", "GL Compatibility")
+config/quit_on_go_back=false
 
 [display]
 
@@ -21,6 +22,7 @@ window/size/viewport_height=1920
 window/size/window_width_override=432
 window/size/window_height_override=768
 window/stretch/mode="canvas_items"
+window/stretch/aspect="expand"
 window/handheld/orientation=1
 
 [input]
