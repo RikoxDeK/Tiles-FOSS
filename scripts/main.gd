@@ -68,6 +68,11 @@ var combo_pop := 0.0
 var show_bg := true          # ajuste: mostrar la imagen de fondo del mapa
 var bg_vis := 0.30           # ajuste: cuánto se ve la imagen (0.1 - 0.7)
 var bg_texture: Texture2D = null
+var show_thumbs := true      # ajuste: miniaturas en las canciones de la biblioteca
+var fav_only := false        # pestaña "Favoritas" activa
+var favorites: Dictionary = {}   # id de canción -> true
+var thumb_cache: Dictionary = {} # ruta de imagen -> Texture2D (o null si no se pudo leer)
+var thumb_budget := 1            # miniaturas que se pueden decodificar por fotograma
 
 # Canción actual
 var chart: Array = []
@@ -364,6 +369,8 @@ func _pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
 		if Rect2(35, 45, 180, 95).has_point(pos): screen = Screen.LIBRARY
 		elif Rect2(80, 330, viewport_size.x - 160, 180).has_point(pos):
 			show_bg = not show_bg; _reload_bg(); _save_settings()
+		elif Rect2(80, 870, viewport_size.x - 160, 180).has_point(pos):
+			show_thumbs = not show_thumbs; _save_settings()
 		elif show_bg and Rect2(130, 690, 170, 110).has_point(pos): _adjust_bg(-0.05)
 		elif show_bg and Rect2(viewport_size.x - 300, 690, 170, 110).has_point(pos): _adjust_bg(0.05)
 	elif screen == Screen.RESULTS:
@@ -614,12 +621,53 @@ func _group_entries(entries: Array) -> Array:
 
 func _apply_filter() -> void:
 	var words := search_query.strip_edges().to_lower().split(" ", false)
+	var base: Array = groups
+	if fav_only:
+		base = groups.filter(func(g): return favorites.has(g.id))
 	if words.is_empty():
-		view_groups = groups
+		view_groups = base
 	else:
-		view_groups = groups.filter(func(g): return _group_matches(g, words))
+		view_groups = base.filter(func(g): return _group_matches(g, words))
 	scroll_y = 0.0
 	_clamp_scroll()
+
+func _toggle_favorite(id: String) -> void:
+	if favorites.has(id):
+		favorites.erase(id)
+	else:
+		favorites[id] = true
+	var keep := scroll_y
+	_apply_filter()
+	scroll_y = keep
+	_clamp_scroll()
+	_save_settings()
+
+## Miniatura de una canción: la imagen de fondo de su primera dificultad que la tenga.
+## Se decodifica pequeña y de una en una por fotograma para no trabar el scroll.
+func _group_thumb(g: Dictionary) -> Texture2D:
+	var path := ""
+	for e in g.entries:
+		var bp := String(e.get("bg_path", ""))
+		if bp != "":
+			path = bp
+			break
+	if path == "":
+		return null
+	if thumb_cache.has(path):
+		return thumb_cache[path]
+	if thumb_budget <= 0:
+		return null
+	thumb_budget -= 1
+	if thumb_cache.size() >= 60:
+		thumb_cache.erase(thumb_cache.keys()[0])
+	var tex: Texture2D = OsuImporter.load_image(path, 360)
+	thumb_cache[path] = tex
+	return tex
+
+func _draw_heart(c: Vector2, sz: float, color: Color) -> void:
+	draw_circle(c + Vector2(-0.24 * sz, -0.12 * sz), 0.30 * sz, color)
+	draw_circle(c + Vector2(0.24 * sz, -0.12 * sz), 0.30 * sz, color)
+	draw_colored_polygon(PackedVector2Array([c + Vector2(-0.52 * sz, -0.01 * sz), c + Vector2(0.52 * sz, -0.01 * sz), c + Vector2(0.0, 0.58 * sz)]), color)
 
 func _group_matches(g: Dictionary, words: PackedStringArray) -> bool:
 	var hay := "%s %s %s" % [g.title, g.artist, g.creator]
@@ -751,7 +799,13 @@ func _library_tap(pos: Vector2) -> void:
 		if Rect2(viewport_size.x - 300, 40 + top_inset, 245, 80).has_point(pos):
 			screen = Screen.SETTINGS
 			return
-		if Rect2(viewport_size.x - 670, 150 + top_inset, 245, 95).has_point(pos):
+		if Rect2(55, 150 + top_inset, 130, 95).has_point(pos):
+			fav_only = false; _apply_filter()
+			return
+		if Rect2(195, 150 + top_inset, 205, 95).has_point(pos):
+			fav_only = true; _apply_filter()
+			return
+		if Rect2(viewport_size.x - 645, 150 + top_inset, 220, 95).has_point(pos):
 			_open_search()
 			return
 		if Rect2(viewport_size.x - 405, 150 + top_inset, 350, 95).has_point(pos):
@@ -763,6 +817,9 @@ func _library_tap(pos: Vector2) -> void:
 	var idx := int(offset / (CARD_H + CARD_GAP))
 	if offset >= 0.0 and fmod(offset, CARD_H + CARD_GAP) <= CARD_H and idx < view_groups.size():
 		var g: Dictionary = view_groups[idx]
+		if pos.x > viewport_size.x - 55.0 - 140.0:   # zona del corazón
+			_toggle_favorite(String(g.id))
+			return
 		if g.entries.size() == 1:
 			_select_song(g.entries[0])
 		else:
@@ -833,6 +890,11 @@ func _load_settings() -> void:
 	speed_mult = clampf(float(cfg.get_value("speed", "mult", 1.0)), SPEED_MIN, SPEED_MAX)
 	lives_mode = bool(cfg.get_value("mods", "lives_mode", false))
 	lives_setting = clampi(int(cfg.get_value("mods", "lives", 3)), LIVES_MIN, LIVES_MAX)
+	show_thumbs = bool(cfg.get_value("display", "show_thumbs", true))
+	var fav_list = cfg.get_value("library", "favorites", [])
+	if fav_list is Array:
+		for fid in fav_list:
+			favorites[String(fid)] = true
 	show_bg = bool(cfg.get_value("display", "show_bg", true))
 	bg_vis = clampf(float(cfg.get_value("display", "bg_vis", 0.30)), 0.1, 0.7)
 	if cfg.has_section("best"):
@@ -847,6 +909,8 @@ func _save_settings() -> void:
 	cfg.set_value("speed", "mult", speed_mult)
 	cfg.set_value("mods", "lives_mode", lives_mode)
 	cfg.set_value("mods", "lives", lives_setting)
+	cfg.set_value("display", "show_thumbs", show_thumbs)
+	cfg.set_value("library", "favorites", favorites.keys())
 	cfg.set_value("display", "show_bg", show_bg)
 	cfg.set_value("display", "bg_vis", bg_vis)
 	for key in bests:
@@ -1046,6 +1110,7 @@ func _draw_hold_marks(rect: Rect2, active: bool) -> void:
 	draw_arc(head, 30.0, 0, TAU, 40, color, width)
 
 func _draw_library() -> void:
+	thumb_budget = 1
 	var bg := Color(0.025, 0.05, 0.1)
 	draw_rect(Rect2(Vector2.ZERO, viewport_size), bg)
 	var x := 55.0
@@ -1057,18 +1122,29 @@ func _draw_library() -> void:
 		var y := LIST_TOP + i * (CARD_H + CARD_GAP) - scroll_y
 		if y + CARD_H < 0.0 or y > viewport_size.y: continue
 		_panel(Rect2(x, y, w, CARD_H), Color(0.97, 0.98, 1), 28)
-		draw_rect(Rect2(x, y, 190, CARD_H), _badge_color(first))
-		if count > 1:
-			_text_centered(first.badge, x + 95, y + CARD_H / 2 - 2, 44, Color.WHITE)
-			_text_centered("%d dif." % count, x + 95, y + CARD_H / 2 + 44, 28, Color(1, 1, 1, 0.9))
+		var thumb: Texture2D = _group_thumb(g) if show_thumbs else null
+		if thumb != null:
+			_draw_cover(thumb, Rect2(x, y, 190, CARD_H))
+			if count > 1:
+				draw_rect(Rect2(x, y + CARD_H - 46, 190, 46), Color(0, 0, 0, 0.55))
+				_text_centered("%d dif." % count, x + 95, y + CARD_H - 13, 28, Color.WHITE)
 		else:
-			_text_centered(first.badge, x + 95, y + CARD_H / 2 + 15, 44, Color.WHITE)
-		var text_w := w - 190 - 60
+			draw_rect(Rect2(x, y, 190, CARD_H), _badge_color(first))
+			if count > 1:
+				_text_centered(first.badge, x + 95, y + CARD_H / 2 - 2, 44, Color.WHITE)
+				_text_centered("%d dif." % count, x + 95, y + CARD_H / 2 + 44, 28, Color(1, 1, 1, 0.9))
+			else:
+				_text_centered(first.badge, x + 95, y + CARD_H / 2 + 15, 44, Color.WHITE)
+		var text_w := w - 190 - 150
 		_text(_fit(g.title, text_w, 38), Vector2(x + 215, y + 82), 38, Color(0.12, 0.22, 0.31))
 		var sub: String = ("%s · %d dificultades" % [g.artist, count]) if count > 1 else ("%s · %s" % [g.artist, first.version])
 		_text(_fit(sub, text_w, 27), Vector2(x + 215, y + 132), 27, Color(0.42, 0.52, 0.62))
+		_draw_heart(Vector2(x + w - 66, y + CARD_H / 2 - 8), 36.0, Color(1.0, 0.28, 0.4) if favorites.has(g.id) else Color(0.8, 0.85, 0.91))
 	if view_groups.is_empty():
-		_text(_fit("Sin resultados para \"%s\"" % search_query, w, 30), Vector2(x, LIST_TOP + 70), 30, Color(0.62, 0.75, 0.88))
+		var empty_msg := "Sin resultados para \"%s\"" % search_query
+		if search_query.strip_edges() == "" and fav_only:
+			empty_msg = "Aún no tienes favoritas: toca el corazón de una canción."
+		_text(_fit(empty_msg, w, 30), Vector2(x, LIST_TOP + 70), 30, Color(0.62, 0.75, 0.88))
 	elif groups.size() == 1 and not search_open:
 		var hint_y := LIST_TOP + CARD_H + CARD_GAP + 70.0 - scroll_y
 		_text("Importa un mapa de osu! (.osz) con el botón de arriba.", Vector2(x, hint_y), 28, Color(0.62, 0.75, 0.88))
@@ -1080,12 +1156,11 @@ func _draw_library() -> void:
 		_button(Rect2(viewport_size.x - 300, 150, 245, 95), "Cerrar", Color(0.17, 0.25, 0.37))
 	else:
 		_button(Rect2(viewport_size.x - 300, 40, 245, 80), "Ajustes", Color(0.14, 0.22, 0.34))
-		_text("Canciones", Vector2(55, 205), 42, Color(0.82, 0.91, 1))
-		_button(Rect2(viewport_size.x - 670, 150, 245, 95), "Buscar", Color(0.14, 0.22, 0.34))
+		_button(Rect2(55, 150, 130, 95), "Todas", Color(0.04, 0.65, 0.88) if not fav_only else Color(0.14, 0.22, 0.34))
+		_button(Rect2(195, 150, 205, 95), "Favoritas", Color(0.9, 0.25, 0.4) if fav_only else Color(0.14, 0.22, 0.34))
+		_button(Rect2(viewport_size.x - 645, 150, 220, 95), "Buscar", Color(0.14, 0.22, 0.34))
 		_button(Rect2(viewport_size.x - 405, 150, 350, 95), "Importar .osz", Color(0.04, 0.65, 0.88))
 	draw_set_transform(Vector2.ZERO)
-	var sa := DisplayServer.get_display_safe_area()
-	_text("build 3 | vp %dx%d | win %s | safe %s" % [viewport_size.x, viewport_size.y, DisplayServer.window_get_size(), sa], Vector2(20, viewport_size.y - 70), 26, Color(1, 1, 1, 0.75))
 	if not open_group.is_empty():
 		_draw_difficulty_picker()
 	if status_time > 0.0:
@@ -1170,8 +1245,12 @@ func _draw_settings() -> void:
 	_button(Rect2(130, 690, 170, 110), "-", Color(0.14, 0.22, 0.34, a))
 	_button(Rect2(w - 300, 690, 170, 110), "+", Color(0.14, 0.22, 0.34, a))
 	_text_centered("%d %%" % roundi(bg_vis * 100.0), w / 2, 765, 56, Color(1, 1, 1, a))
-	_text("Los mapas importados antes de esta versión", Vector2(80, 920), 26, muted)
-	_text("hay que importarlos otra vez para que traigan su imagen.", Vector2(80, 960), 26, muted)
+	_panel(Rect2(80, 870, w - 160, 180), Color(0.08, 0.13, 0.22, 0.92), 34)
+	_text("Miniaturas de canciones", Vector2(130, 955), 40, Color.WHITE)
+	_text("Imagen del mapa en cada canción de la lista", Vector2(130, 1005), 26, muted)
+	_button(Rect2(w - 330, 915, 200, 90), "SÍ" if show_thumbs else "NO", Color(0.02, 0.68, 0.88) if show_thumbs else Color(0.22, 0.28, 0.38))
+	_text("Los mapas importados antes de esta versión", Vector2(80, 1130), 26, muted)
+	_text("hay que importarlos otra vez para que traigan su imagen.", Vector2(80, 1170), 26, muted)
 
 func _draw_results() -> void:
 	_background(); draw_set_transform(Vector2(0, ui_off)); _text_centered("RESULTADOS", viewport_size.x / 2, 230, 58, Color.WHITE)
