@@ -59,7 +59,7 @@ var run_lives := 0           # vidas con las que empezó esta partida (0 = casua
 var life_menu := false       # menú "perdiste una vida"
 var life_menu_lock := 0.0    # evita tocar sin querer el menú justo al aparecer
 var resume_pending := false  # tras continuar: la siguiente tecla hace de "Continuar"
-var resume_idx := -1
+var resume_idxs: Array = []   # índices de las notas (acorde) que hacen de "Continuar"
 var grace_time := 0.0        # tras continuar, un segundo sin perder vidas
 var failed := false
 var fail_text := ""
@@ -231,19 +231,21 @@ func _update_notes() -> void:
 			continue
 		if note.type == "hold" and note.holding:
 			var held: bool = note.input_id in active_inputs and active_inputs[note.input_id] == note.lane
-			if not held and song_time < note.time + note.duration - 0.12:
-				note.done = true
-				note.holding = false
-				_miss(note.lane, hit_y)
-			elif song_time >= note.time + note.duration:
+			var end_time: float = note.time + note.duration
+			if not held and song_time < end_time - 0.12:
+				_release_hold(note)
+			elif song_time >= end_time:
 				note.done = true
 				note.holding = false
 				_hit(note.lane, "PERFECT", 180, hit_y)
 		elif note.type != "start" and song_time > note.time + HIT_LATE:
 			var miss_position: float = hit_y + (song_time - note.time) * speed
 			note.done = true
+			if note.type == "hold":   # la larga entera se queda atrás, apagada
+				note.released = true
+				note.release_time = note.time
 			_miss(note.lane, miss_position)
-	while first_idx < notes.size() and notes[first_idx].done:
+	while first_idx < notes.size() and notes[first_idx].done and not _ghost_visible(notes[first_idx]):
 		first_idx += 1
 	if song_time > chart_end and not finished:
 		finished = true
@@ -252,6 +254,26 @@ func _update_notes() -> void:
 			_stop_audio()
 			_finish_run()
 			screen = Screen.RESULTS
+
+## Soltar una larga antes de tiempo NO cuesta vida: Great si la sostuviste al menos la mitad
+## (el combo sigue), Good si la soltaste muy pronto (se rompe el combo). Lo que queda de la
+## larga se queda atrás, apagada y sin poder tocarse.
+func _release_hold(note: Dictionary) -> void:
+	var frac: float = clampf((song_time - float(note.time)) / maxf(0.05, float(note.duration)), 0.0, 1.0)
+	note.done = true
+	note.holding = false
+	note.released = true
+	note.release_time = song_time
+	if frac >= 0.5:
+		_hit(note.lane, "GREAT", 120, hit_y)
+	else:
+		_hit(note.lane, "GOOD", 50, hit_y)
+		combo = 0
+
+func _ghost_visible(note: Dictionary) -> bool:
+	if not note.get("released", false):
+		return false
+	return song_time < float(note.time) + float(note.duration) + (viewport_size.y - hit_y) / speed + 0.1
 
 func _unhandled_input(event: InputEvent) -> void:
 	# En Android cada toque llega dos veces: como InputEventScreenTouch y como un
@@ -380,7 +402,7 @@ func _start_game() -> void:
 	perfects = 0; greats = 0; goods = 0; empties = 0
 	run_lives = lives_setting if lives_mode else 0
 	lives_left = run_lives
-	life_menu = false; life_menu_lock = 0.0; resume_pending = false; resume_idx = -1; grace_time = 0.0
+	life_menu = false; life_menu_lock = 0.0; resume_pending = false; resume_idxs = []; grace_time = 0.0
 	failed = false; fail_text = ""; run_mult = 1.0
 
 func _try_hit(lane: int, input_id: int) -> void:
@@ -459,10 +481,11 @@ func _miss(lane: int, effect_y: float) -> void:
 func _lose_life() -> void:
 	if run_lives <= 0 or finished or life_menu or grace_time > 0.0:
 		return
-	lives_left -= 1
+	# Con N vidas se pueden fallar N veces y seguir; el fallo N+1 (con 0 vidas) termina.
 	if lives_left <= 0:
 		_game_over("SIN VIDAS")
 	else:
+		lives_left -= 1
 		life_menu = true
 		life_menu_lock = 0.7
 		_set_paused(true)
@@ -492,30 +515,47 @@ func _continue_after_life() -> void:
 	active_inputs.clear()
 	# La siguiente nota pendiente se marca como "Continuar": al tocarla se cuenta como
 	# esa nota y la canción sigue desde ahí.
-	resume_idx = -1
+	resume_idxs = []
+	var first_pending := -1
 	for i in range(first_idx, notes.size()):
 		if not notes[i].done and notes[i].type != "start":
-			resume_idx = i
+			first_pending = i
 			break
-	if resume_idx < 0:
+	if first_pending < 0:
 		grace_time = GRACE_AFTER_CONTINUE
 		_set_paused(false)
-	else:
-		# La escena queda congelada tal como se verá al seguir: la nota a retomar y las
-		# que vienen detrás se ven en su sitio, así puedes colocar los dedos antes de tocar.
-		song_time = float(notes[resume_idx].time) - RESUME_BACKOFF
-		resume_pending = true   # sigue pausado hasta que se toque esa tecla
+		return
+	# Todas las notas del mismo instante (acorde) hay que tocarlas para seguir.
+	var t0: float = notes[first_pending].time
+	for j in range(first_pending, notes.size()):
+		if float(notes[j].time) - t0 > 0.03:
+			break
+		if not notes[j].done and notes[j].type != "start":
+			resume_idxs.append(j)
+	# La escena queda congelada tal como se verá al seguir: la nota a retomar y las
+	# que vienen detrás se ven en su sitio, así puedes colocar los dedos antes de tocar.
+	song_time = t0 - RESUME_BACKOFF
+	resume_pending = true   # sigue pausado hasta que se toquen esas teclas
 
 func _resume_with(lane: int, input_id: int) -> void:
-	if resume_idx < 0 or lane != int(notes[resume_idx].lane):
+	var tapped := false
+	for k in resume_idxs:
+		var n: Dictionary = notes[k]
+		if n.done or n.holding or int(n.lane) != lane:
+			continue
+		if n.type == "hold":
+			n.holding = true; n.input_id = input_id
+		else:
+			n.done = true
+		_effect(lane, hit_y, Color(1, 1, 1, 0.82))
+		tapped = true
+		break
+	if not tapped:
 		return
-	var n: Dictionary = notes[resume_idx]
-	resume_pending = false; resume_idx = -1
-	if n.type == "hold":
-		n.holding = true; n.input_id = input_id
-	else:
-		n.done = true
-	_effect(lane, hit_y, Color(1, 1, 1, 0.82))
+	for k in resume_idxs:
+		if not notes[k].done and not notes[k].holding:
+			return   # faltan teclas del acorde
+	resume_pending = false; resume_idxs = []
 	grace_time = GRACE_AFTER_CONTINUE
 	_set_paused(false)
 	if audio_stream != null and audio_started:
@@ -843,11 +883,11 @@ func _rank_for(acc: float, miss_count: int) -> int:
 
 func _finish_run() -> void:
 	run_accuracy = _accuracy()
-	run_rank = _rank_for(run_accuracy, misses)
+	run_rank = _rank_for(run_accuracy, misses + empties)
 	run_mult = _lives_mult(run_lives) if run_lives > 0 else 1.0
 	if run_lives > 0:
 		score = roundi(score * run_mult)
-	if failed:
+	if failed or run_lives <= 0:   # solo el modo Vidas guarda récords
 		run_record = false
 		return
 	var key := _song_key(current_song)
@@ -912,6 +952,11 @@ func _draw_game() -> void:
 	for i in range(first_idx, notes.size()):
 		var note: Dictionary = notes[i]
 		if note.type != "start" and note.time - song_time > ahead: break
+		if note.done and note.get("released", false):
+			var gb: float = hit_y + (song_time - float(note.release_time)) * speed
+			var gh: float = maxf(0.0, (float(note.time) + float(note.duration) - float(note.release_time)) * speed)
+			draw_rect(Rect2(note.lane * lane_w + 2, gb - gh, lane_w - 4, gh), Color(0.42, 0.47, 0.55, 0.32))
+			continue
 		if note.done or (note.type == "start" and started): continue
 		var bottom: float = viewport_size.y if note.type == "start" and not started else hit_y - (note.time - song_time) * speed
 		var height: float = note.height
@@ -929,7 +974,7 @@ func _draw_game() -> void:
 			_draw_hold_marks(rect, note.holding)
 		else:
 			draw_rect(rect, Color(0.01,0.01,0.015))
-		if resume_pending and i == resume_idx:
+		if resume_pending and i in resume_idxs and not note.holding:
 			draw_rect(rect, Color.WHITE, false, 6.0)
 			_text("Continuar", Vector2(rect.position.x + 18, rect.get_center().y + 12), 35, Color.WHITE)
 		if note.type == "start": _text("Comenzar", Vector2(rect.position.x+18,rect.get_center().y+12), 35, Color.WHITE)
@@ -959,6 +1004,9 @@ func _draw_game() -> void:
 		_draw_lives_bars(55, 60 + top_inset, 64, 16, 12)
 	elif run_lives > LIVES_MIN:
 		_text_outlined(str(lives_left), 90, 105 + top_inset, 60, Color(1.0, 0.3, 0.4), Color(0.04, 0.16, 0.32, 0.95), 10)
+	var prog := clampf(song_time / maxf(0.1, chart_end), 0.0, 1.0)
+	draw_rect(Rect2(0, top_inset, viewport_size.x, 10), Color(0.04, 0.16, 0.32, 0.45))
+	draw_rect(Rect2(0, top_inset, viewport_size.x * prog, 10), Color(0.02, 0.68, 0.88))
 	if failed and finished:
 		draw_rect(Rect2(Vector2.ZERO, viewport_size), Color(0, 0, 0, 0.6))
 		_text_outlined(fail_text, viewport_size.x / 2, viewport_size.y / 2, 90, Color(1.0, 0.3, 0.35), Color(0.02, 0.05, 0.12, 0.95), 14)
@@ -969,10 +1017,10 @@ func _draw_game() -> void:
 		_text_outlined("PERDISTE UNA VIDA", viewport_size.x / 2, 520, 62, Color(1.0, 0.3, 0.35), Color(0.02, 0.05, 0.12, 0.95), 12)
 		if run_lives == LIVES_MIN:
 			_draw_lives_bars(viewport_size.x / 2 - 249.0, 590, 150, 30, 24)
-			_text_centered("Te quedan %d" % lives_left, viewport_size.x / 2, 700, 34, Color(0.82, 0.91, 1))
+			_text_centered("Te quedan %d" % lives_left if lives_left > 0 else "¡Última oportunidad!", viewport_size.x / 2, 700, 34, Color(0.82, 0.91, 1))
 		else:
 			_text_outlined(str(lives_left), viewport_size.x / 2, 680, 150, Color(1.0, 0.3, 0.4), Color(0.02, 0.05, 0.12, 0.95), 14)
-			_text_centered("vidas restantes", viewport_size.x / 2, 735, 30, Color(0.82, 0.91, 1))
+			_text_centered("vidas restantes" if lives_left > 0 else "¡Última oportunidad!", viewport_size.x / 2, 735, 30, Color(0.82, 0.91, 1))
 		_button(Rect2(170, 760, viewport_size.x - 340, 135), "RENDIRSE", Color(0.62, 0.16, 0.22, lk))
 		_button(Rect2(170, 930, viewport_size.x - 340, 135), "CONTINUAR", Color(0.02, 0.68, 0.88, lk))
 		draw_set_transform(Vector2.ZERO)
@@ -1023,8 +1071,7 @@ func _draw_library() -> void:
 		_text(_fit("Sin resultados para \"%s\"" % search_query, w, 30), Vector2(x, LIST_TOP + 70), 30, Color(0.62, 0.75, 0.88))
 	elif groups.size() == 1 and not search_open:
 		var hint_y := LIST_TOP + CARD_H + CARD_GAP + 70.0 - scroll_y
-		_text("Importa un mapa de osu! (.osz) con el botón de arriba", Vector2(x, hint_y), 28, Color(0.62, 0.75, 0.88))
-		_text("o arrastra el archivo a la ventana (PC).", Vector2(x, hint_y + 44), 28, Color(0.62, 0.75, 0.88))
+		_text("Importa un mapa de osu! (.osz) con el botón de arriba.", Vector2(x, hint_y), 28, Color(0.62, 0.75, 0.88))
 	# La cabecera tapa las tarjetas que suben por debajo.
 	draw_rect(Rect2(0, 0, viewport_size.x, LIST_TOP - 22), bg)
 	draw_set_transform(Vector2(0, top_inset))
@@ -1059,13 +1106,17 @@ func _draw_difficulty_picker() -> void:
 		var r: Rect2 = layout.rows[i]
 		var e: Dictionary = open_group.entries[i]
 		_panel(r, Color(0.88, 0.94, 1), 24)
-		_panel(Rect2(r.position.x, r.position.y, 130, r.size.y), _badge_color(e), 24)
-		_text_centered(e.badge, r.position.x + 65, r.get_center().y + 12, 34, Color.WHITE)
+		var bcol := Color(0.45, 0.52, 0.62)
+		var pb: Dictionary = bests.get(_song_key(e), {})
+		if not pb.is_empty():
+			bcol = RANK_COLORS[int(pb.rank)]
+		_panel(Rect2(r.position.x, r.position.y, 130, r.size.y), bcol, 24)
 		var row_best: Dictionary = bests.get(_song_key(e), {})
-		var name_w := r.size.x - 180.0 - (90.0 if not row_best.is_empty() else 0.0)
-		_text(_fit(e.version, name_w, 34), Vector2(r.position.x + 155, r.get_center().y + 12), 34, Color(0.12, 0.22, 0.31))
-		if not row_best.is_empty():
-			_text_centered(RANKS[int(row_best.rank)], r.end.x - 55, r.get_center().y + 18, 52, RANK_COLORS[int(row_best.rank)])
+		if row_best.is_empty():
+			_text_centered("–", r.position.x + 65, r.get_center().y + 14, 50, Color(1, 1, 1, 0.55))
+		else:
+			_text_centered(RANKS[int(row_best.rank)], r.position.x + 65, r.get_center().y + 16, 56, Color.WHITE)
+		_text(_fit(e.version, r.size.x - 180.0, 34), Vector2(r.position.x + 155, r.get_center().y + 12), 34, Color(0.12, 0.22, 0.31))
 
 func _draw_prepare() -> void:
 	_background(); draw_set_transform(Vector2(0, ui_off)); _button(Rect2(35,45,180,95),"< Volver",Color(0.14,0.22,0.34))
@@ -1077,9 +1128,6 @@ func _draw_prepare() -> void:
 	_panel(Rect2(80,560,w-160,340),Color(0.08,0.13,0.22,0.92),34)
 	_text("%d notas · %d sostenidas" % [song_stats.notes, song_stats.holds], Vector2(140,645), 38, Color.WHITE)
 	_text("%s · %s" % [_format_time(song_stats.duration), "Con audio" if audio_stream != null else "Sin audio"], Vector2(140,715), 38, Color.WHITE if audio_stream != null else Color(1,0.6,0.6))
-	if song_stats.dropped > 0:
-		_text(_fit("Adaptado a %d dedos: se quitaron %d de %d notas" % [OsuImporter.DEFAULT_MAX_FINGERS, song_stats.dropped, song_stats.total], w - 280, 28), Vector2(140,775), 28, muted)
-	_text("PC: D · F · J · K", Vector2(140,860), 28, muted)
 	# Velocidad
 	var cx := w / 2
 	_button(Rect2(100,950,190,120),"-",Color(0.14,0.22,0.34))
@@ -1100,7 +1148,7 @@ func _draw_prepare() -> void:
 			_text_centered("Sin penalización de puntos", cx, 1490, 28, Color(0.5, 0.95, 0.75))
 		else:
 			_text_centered("Puntos x%.2f (-%d %%)" % [m, roundi((1.0 - m) * 100.0)], cx, 1490, 28, Color(1.0, 0.75, 0.4))
-		_text_centered("Cada fallo cuesta una vida. Al llegar a 0, se acaba.", cx, 1535, 24, muted)
+		_text_centered("Puedes fallar %d veces y seguir; el siguiente fallo termina." % lives_setting, cx, 1535, 24, muted)
 	else:
 		_text_centered("Sin límite de fallos", cx, 1405, 40, Color.WHITE)
 		_text_centered("Juega tranquilo: fallar solo rompe el combo.", cx, 1465, 28, muted)
@@ -1141,12 +1189,14 @@ func _draw_results() -> void:
 		_text_centered(fail_text, w / 2, 745, 32, Color(0.9, 0.2, 0.28))
 	elif run_lives > 0:
 		_text_centered("Modo Vidas · %d vidas · puntos x%.2f" % [run_lives, run_mult], w / 2, 745, 28, muted)
+	else:
+		_text_centered("Casual · esta partida no se guarda", w / 2, 745, 28, muted)
 	_text("Puntuación", Vector2(170, 800), 29, muted); _text(str(score), Vector2(170, 880), 68, Color(0.02, 0.62, 0.86))
 	_text("Perfect: %d" % perfects, Vector2(170, 980), 34, dark); _text("Great: %d" % greats, Vector2(w / 2 + 20, 980), 34, dark)
 	_text("Good: %d" % goods, Vector2(170, 1045), 34, dark); _text("Fallos: %d" % misses, Vector2(w / 2 + 20, 1045), 34, dark)
 	_text("Vacíos: %d" % empties, Vector2(170, 1110), 34, dark); _text("Combo máx: %d" % max_combo, Vector2(w / 2 + 20, 1110), 34, dark)
 	var best: Dictionary = bests.get(_song_key(current_song), {})
-	if not best.is_empty():
+	if run_lives > 0 and not best.is_empty():
 		_text_centered("Mejor: %s · %d" % [RANKS[int(best.rank)], int(best.score)], w / 2, 1215, 32, muted)
 	_button(Rect2(110, 1400, w - 220, 135), "REPETIR", Color(0.02, 0.68, 0.88)); _button(Rect2(110, 1570, w - 220, 120), "CANCIONES", Color(0.17, 0.25, 0.37))
 
