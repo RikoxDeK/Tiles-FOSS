@@ -32,8 +32,8 @@ const DEFAULT_MAX_FINGERS := 2
 ## Reglas de comodidad (carriles 0..3 = 1..4 en pantalla):
 ##  - Dobles: no se permiten en dos carriles pegados de un costado (1+2 ni 3+4).
 ##    Sí valen el centro (2+3), con un espacio (1+3, 2+4) y los extremos (1+4).
-##  - Nota sostenida + nota normal a la vez: solo si la sostenida está en uno de
-##    los dos carriles izquierdos (el pulgar izquierdo sostiene, el derecho toca).
+##  - Nota sostenida + nota normal a la vez: deben estar en lados opuestos.
+##    Sostenida en 1-2 -> normales solo en 3-4; sostenida en 3-4 -> normales solo en 1-2.
 const HOLD_SIDE_MAX_LANE := 1
 
 ## Velocidad base del juego (px/s) y separación visual objetivo entre filas de notas.
@@ -212,8 +212,11 @@ static func _pair_ok(lane_a: int, hold_a: bool, lane_b: int, hold_b: bool) -> bo
 	if (lo == 0 and hi == 1) or (lo == 2 and hi == 3):
 		return false
 	if hold_a != hold_b:
+		# Sostenida y normal a la vez: cada una en un lado distinto de la pantalla
+		# (sostenida en 1-2 -> normal en 3-4, sostenida en 3-4 -> normal en 1-2).
 		var hold_lane := lane_a if hold_a else lane_b
-		if hold_lane > HOLD_SIDE_MAX_LANE:
+		var tap_lane := lane_b if hold_a else lane_a
+		if (hold_lane <= HOLD_SIDE_MAX_LANE) == (tap_lane <= HOLD_SIDE_MAX_LANE):
 			return false
 	return true
 

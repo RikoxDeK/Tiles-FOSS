@@ -6,12 +6,16 @@ const NORMAL_HEIGHT := 455.0
 const BASE_SPEED := 760.0
 const SETTINGS_PATH := "user://settings.cfg"
 const SPEED_MIN := 0.5
-const SPEED_MAX := 3.0
+const SPEED_MAX := 5.0
 const SPEED_STEP := 0.1
 const HIT_MARGIN := 340.0   # distancia de la línea de golpeo al borde inferior de la pantalla
 const OsuImporter = preload("res://scripts/osu_importer.gd")
 const START_TIME := -100.0
 const LIST_TOP := 320.0
+const RANKS := ["D", "C", "B", "A", "S", "SS"]
+const RANK_COLORS := [Color(0.55, 0.6, 0.68), Color(0.35, 0.75, 0.55), Color(0.2, 0.7, 0.95), Color(0.55, 0.5, 1.0), Color(1.0, 0.75, 0.2), Color(1.0, 0.45, 0.75)]
+const PERFECT_WINDOW := 0.12
+const GREAT_WINDOW := 0.20
 const HIT_LATE := 0.28      # segundos de margen para tocar una tecla tarde
 const CARD_H := 190.0
 const CARD_GAP := 24.0
@@ -33,6 +37,14 @@ var combo := 0
 var max_combo := 0
 var hits := 0
 var misses := 0
+var perfects := 0
+var greats := 0
+var goods := 0
+var empties := 0
+var run_rank := 0
+var run_accuracy := 0.0
+var run_record := false
+var bests: Dictionary = {}   # clave de mapa -> {"score", "rank", "acc"}
 var last_judgement := ""
 var judgement_time := 0.0
 
@@ -209,6 +221,7 @@ func _update_notes() -> void:
 		await get_tree().create_timer(0.7).timeout
 		if screen == Screen.GAME:
 			_stop_audio()
+			_finish_run()
 			screen = Screen.RESULTS
 
 func _unhandled_input(event: InputEvent) -> void:
@@ -310,6 +323,7 @@ func _start_game() -> void:
 	active_inputs.clear(); effects.clear()
 	song_time = -lead_in; started = false; paused = false; finished = false
 	score = 0; combo = 0; max_combo = 0; hits = 0; misses = 0
+	perfects = 0; greats = 0; goods = 0; empties = 0
 
 func _try_hit(lane: int, input_id: int) -> void:
 	if not started:
@@ -329,13 +343,13 @@ func _try_hit(lane: int, input_id: int) -> void:
 		var note: Dictionary = notes[i]
 		if note.type != "start" and note.time - song_time > 0.6: break
 		if note.done or note.type == "start" or note.lane != lane: continue
-		var early: float = clampf(float(note.height) / speed, 0.3, 0.6)
+		var early: float = clampf(float(note.height) / speed, 0.2, 0.6)
 		var signed_diff: float = song_time - note.time
 		if signed_diff < -early or signed_diff > HIT_LATE: continue
 		best_diff = abs(signed_diff); best = note
 		break  # la más antigua pendiente del carril
 	if best.is_empty():
-		combo = 0; last_judgement = "VACÍO"; judgement_time = 0.35
+		combo = 0; empties += 1; last_judgement = "VACÍO"; judgement_time = 0.35
 		_effect(lane, hit_y, Color(1.0, 0.15, 0.18, 0.84))
 		return
 	if best.type == "hold":
@@ -344,13 +358,17 @@ func _try_hit(lane: int, input_id: int) -> void:
 		_effect(lane, hit_y, Color(1, 1, 1, 0.82))
 	else:
 		best.done = true
-		var judgement := "PERFECT" if best_diff <= 0.09 else ("GREAT" if best_diff <= 0.18 else "GOOD")
+		var judgement := "PERFECT" if best_diff <= PERFECT_WINDOW else ("GREAT" if best_diff <= GREAT_WINDOW else "GOOD")
 		var points := 100 if judgement == "PERFECT" else (75 if judgement == "GREAT" else 50)
 		_hit(lane, judgement, points, hit_y)
 
 func _hit(lane: int, text: String, points: int, effect_y: float) -> void:
 	hits += 1; combo += 1; max_combo = max(max_combo, combo); score += points + min(combo, 50)
 	last_judgement = text; judgement_time = 0.48
+	match text:
+		"PERFECT": perfects += 1
+		"GREAT": greats += 1
+		"GOOD": goods += 1
 	_effect(lane, effect_y, Color(1, 1, 1, 0.82))
 
 func _miss(lane: int, effect_y: float) -> void:
@@ -604,12 +622,51 @@ func _load_settings() -> void:
 		return
 	speed_auto = cfg.get_value("speed", "auto", true)
 	speed_mult = clampf(float(cfg.get_value("speed", "mult", 1.0)), SPEED_MIN, SPEED_MAX)
+	if cfg.has_section("best"):
+		for key in cfg.get_section_keys("best"):
+			var v = cfg.get_value("best", key)
+			if v is Dictionary:
+				bests[key] = v
 
 func _save_settings() -> void:
 	var cfg := ConfigFile.new()
 	cfg.set_value("speed", "auto", speed_auto)
 	cfg.set_value("speed", "mult", speed_mult)
+	for key in bests:
+		cfg.set_value("best", key, bests[key])
 	cfg.save(SETTINGS_PATH)
+
+# --- Puntaje y rangos ----------------------------------------------------
+
+func _song_key(entry: Dictionary) -> String:
+	return "%s|%s" % [entry.get("set_id", "demo"), entry.get("version", "")]
+
+## Precisión 0..100: Perfect 100 %, Great 80 %, Good 50 %, cada VACÍO resta 25 % de una nota.
+func _accuracy() -> float:
+	var total: int = maxi(1, int(song_stats.notes))
+	var pts := perfects * 100.0 + greats * 80.0 + goods * 50.0 - empties * 25.0
+	return clampf(pts / (total * 100.0) * 100.0, 0.0, 100.0)
+
+func _rank_for(acc: float, miss_count: int) -> int:
+	if acc >= 98.0 and miss_count == 0: return 5   # SS
+	if acc >= 95.0: return 4                       # S
+	if acc >= 90.0: return 3                       # A
+	if acc >= 80.0: return 2                       # B
+	if acc >= 70.0: return 1                       # C
+	return 0                                       # D
+
+func _finish_run() -> void:
+	run_accuracy = _accuracy()
+	run_rank = _rank_for(run_accuracy, misses)
+	var key := _song_key(current_song)
+	var old: Dictionary = bests.get(key, {})
+	run_record = score > int(old.get("score", 0))
+	if run_record or old.is_empty():
+		bests[key] = {"score": score, "rank": maxi(run_rank, int(old.get("rank", 0))), "acc": run_accuracy}
+	elif run_rank > int(old.get("rank", 0)):
+		old["rank"] = run_rank
+		bests[key] = old
+	_save_settings()
 
 func _text_centered(value: String, center_x: float, y: float, size: int, color: Color) -> void:
 	var width := _font().get_string_size(value, HORIZONTAL_ALIGNMENT_LEFT, -1, size).x
@@ -773,7 +830,11 @@ func _draw_difficulty_picker() -> void:
 		_panel(r, Color(0.88, 0.94, 1), 24)
 		_panel(Rect2(r.position.x, r.position.y, 130, r.size.y), _badge_color(e), 24)
 		_text_centered(e.badge, r.position.x + 65, r.get_center().y + 12, 34, Color.WHITE)
-		_text(_fit(e.version, r.size.x - 180, 34), Vector2(r.position.x + 155, r.get_center().y + 12), 34, Color(0.12, 0.22, 0.31))
+		var row_best: Dictionary = bests.get(_song_key(e), {})
+		var name_w := r.size.x - 180.0 - (90.0 if not row_best.is_empty() else 0.0)
+		_text(_fit(e.version, name_w, 34), Vector2(r.position.x + 155, r.get_center().y + 12), 34, Color(0.12, 0.22, 0.31))
+		if not row_best.is_empty():
+			_text_centered(RANKS[int(row_best.rank)], r.end.x - 55, r.get_center().y + 18, 52, RANK_COLORS[int(row_best.rank)])
 
 func _draw_prepare() -> void:
 	_background(); draw_set_transform(Vector2(0, ui_off)); _button(Rect2(35,45,180,95),"< Volver",Color(0.14,0.22,0.34))
@@ -795,12 +856,25 @@ func _draw_prepare() -> void:
 	_button(Rect2(100,1360,viewport_size.x-200,145),"JUGAR",Color(0.02,0.68,0.88))
 
 func _draw_results() -> void:
-	_background(); draw_set_transform(Vector2(0, ui_off)); _text("RESULTADOS",Vector2(310,230),58,Color.WHITE)
-	_panel(Rect2(90,350,viewport_size.x-180,760),Color(0.96,0.98,1),38)
-	_text("Puntuación",Vector2(170,590),29,Color(0.42,0.52,0.62)); _text(str(score),Vector2(170,680),68,Color(0.02,0.62,0.86))
-	_text("Aciertos: %d"%hits,Vector2(170,820),34,Color(0.12,0.22,0.32)); _text("Fallos: %d"%misses,Vector2(170,890),34,Color(0.12,0.22,0.32))
-	_text("Combo máximo: %d"%max_combo,Vector2(170,960),34,Color(0.12,0.22,0.32))
-	_button(Rect2(110,1400,viewport_size.x-220,135),"REPETIR",Color(0.02,0.68,0.88)); _button(Rect2(110,1570,viewport_size.x-220,120),"CANCIONES",Color(0.17,0.25,0.37))
+	_background(); draw_set_transform(Vector2(0, ui_off)); _text_centered("RESULTADOS", viewport_size.x / 2, 230, 58, Color.WHITE)
+	var w := viewport_size.x
+	_panel(Rect2(90, 300, w - 180, 1010), Color(0.96, 0.98, 1), 38)
+	var dark := Color(0.12, 0.22, 0.32)
+	var muted := Color(0.42, 0.52, 0.62)
+	# Rango grande
+	var rcol: Color = RANK_COLORS[run_rank]
+	_text_centered(RANKS[run_rank], w / 2, 560, 300, rcol)
+	_text_centered("Precisión %.1f %%" % run_accuracy, w / 2, 640, 40, dark)
+	if run_record:
+		_text_centered("¡Nuevo récord!", w / 2, 700, 34, Color(1.0, 0.6, 0.1))
+	_text("Puntuación", Vector2(170, 800), 29, muted); _text(str(score), Vector2(170, 880), 68, Color(0.02, 0.62, 0.86))
+	_text("Perfect: %d" % perfects, Vector2(170, 980), 34, dark); _text("Great: %d" % greats, Vector2(w / 2 + 20, 980), 34, dark)
+	_text("Good: %d" % goods, Vector2(170, 1045), 34, dark); _text("Fallos: %d" % misses, Vector2(w / 2 + 20, 1045), 34, dark)
+	_text("Vacíos: %d" % empties, Vector2(170, 1110), 34, dark); _text("Combo máx: %d" % max_combo, Vector2(w / 2 + 20, 1110), 34, dark)
+	var best: Dictionary = bests.get(_song_key(current_song), {})
+	if not best.is_empty():
+		_text_centered("Mejor: %s · %d" % [RANKS[int(best.rank)], int(best.score)], w / 2, 1215, 32, muted)
+	_button(Rect2(110, 1400, w - 220, 135), "REPETIR", Color(0.02, 0.68, 0.88)); _button(Rect2(110, 1570, w - 220, 120), "CANCIONES", Color(0.17, 0.25, 0.37))
 
 func _background() -> void:
 	draw_rect(Rect2(Vector2.ZERO,viewport_size),Color(0.025,0.05,0.1))
