@@ -851,8 +851,8 @@ func _pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
 		elif _lang_rect(1).has_point(pos): _set_lang("en")
 		elif Rect2(80, 1290, viewport_size.x - 160, 180).has_point(pos): _open_palette()
 	elif screen == Screen.RESULTS:
-		if Rect2(110, 1400, viewport_size.x - 220, 135).has_point(pos): _start_game()
-		elif Rect2(110, 1570, viewport_size.x - 220, 120).has_point(pos): open_group = {}; screen = Screen.LIBRARY
+		if _results_retry_rect().has_point(pos): _start_game()
+		elif _results_songs_rect().grow(20).has_point(pos): open_group = {}; screen = Screen.LIBRARY
 
 ## Un tap no debe solaparse con la siguiente nota de su carril.
 func _assign_tap_heights() -> void:
@@ -2583,15 +2583,14 @@ func _draw_game() -> void:
 		if note.type == "hold":
 			if note.holding:
 				var remaining: float = max(0.0, note.time + note.duration - song_time)
-				height = max(90.0, remaining * speed)
+				height = maxf(90.0, remaining * speed)
 				bottom = hit_y
 			else:
-				height = maxf(120.0, note.duration * speed)
+				height = maxf(lane_w * 0.83 + 90.0, note.duration * speed)
 		var rect := Rect2(note.lane * lane_w + 2, bottom - height, lane_w - 4, height)
 		if note.type == "hold":
 			# Misma silueta cayendo y sosteniendo: solo cambia la intensidad.
-			draw_rect(rect, pcol("tile").lerp(pcol("hold"), 0.05 if not note.holding else 0.1))
-			_draw_hold_marks(rect, note.holding)
+			_draw_hold_tile(rect, note.holding)
 		else:
 			draw_rect(rect, pcol("tile"))
 		if resume_pending and i in resume_idxs and not note.holding:
@@ -2670,18 +2669,49 @@ func _draw_game() -> void:
 		_button(Rect2(170,930,viewport_size.x-340,135), "SALIR", pcol("button"))
 		draw_set_transform(Vector2.ZERO)
 
-## Línea + círculo de las notas sostenidas. Inactiva (cayendo): cian tenue.
-## Activa (sostenida): cian brillante y círculo relleno.
-func _draw_hold_marks(rect: Rect2, active: bool) -> void:
-	var cx := rect.get_center().x
-	var head := Vector2(cx, rect.end.y - 55.0)
-	var color := acol(pcol("hold"), 1.0 if active else 0.5)
-	var width := 7.0 if active else 5.0
-	if head.y - 25.0 > rect.position.y + 25.0:
-		draw_line(Vector2(cx, rect.position.y + 25.0), Vector2(cx, head.y - 15.0), color, width)
+## Tecla larga: degradado (claro arriba, oscuro abajo), línea que baja hasta un círculo
+## con brillo. El círculo queda bien despegado del borde inferior y la línea termina
+## justo antes de tocarlo (no se mete dentro).
+func _draw_hold_tile(rect: Rect2, active: bool) -> void:
+	var light := pcol("hold").lerp(pcol("nav_home"), 0.35)
 	if active:
-		draw_circle(head, 30.0, acol(pcol("hold"), 0.22))
-	draw_arc(head, 30.0, 0, TAU, 40, color, width)
+		light = light.lerp(Color.WHITE, 0.12)
+	var dark := pcol("tile")
+	var fade_h := minf(rect.size.y, 460.0)
+	var solid_h := rect.size.y - fade_h
+	if solid_h > 0.0:
+		draw_rect(Rect2(rect.position, Vector2(rect.size.x, solid_h)), light)
+	var gy := rect.position.y + solid_h
+	var gx := rect.position.x
+	var gw := rect.size.x
+	draw_polygon(
+		PackedVector2Array([Vector2(gx, gy), Vector2(gx + gw, gy), Vector2(gx + gw, rect.end.y), Vector2(gx, rect.end.y)]),
+		PackedColorArray([light, light, dark, dark]))
+	var cx := rect.get_center().x
+	var radius := 34.0
+	var head_off := minf(viewport_size.x / LANES * 0.83, maxf(45.0, rect.size.y - 45.0))
+	var head := Vector2(cx, rect.end.y - head_off)
+	var glow := pcol("hold").lightened(0.3)
+	# Línea: tenue arriba, más intensa cerca del círculo; termina antes del aro.
+	var line_top := rect.position.y + 30.0
+	var line_end := head.y - radius - 8.0
+	if line_end > line_top + 10.0:
+		var lc := pcol("hold").lightened(0.55)
+		var a_bot := 0.95 if active else 0.7
+		var hw := 2.5
+		draw_polygon(
+			PackedVector2Array([Vector2(cx - hw, line_top), Vector2(cx + hw, line_top), Vector2(cx + hw, line_end), Vector2(cx - hw, line_end)]),
+			PackedColorArray([acol(lc, 0.12), acol(lc, 0.12), acol(lc, a_bot), acol(lc, a_bot)]))
+	# Brillo (halo) alrededor del círculo.
+	var halo_a := 0.16 if active else 0.09
+	for k in 5:
+		var rr := radius + 30.0 - k * 6.0
+		draw_circle(head, rr, acol(glow, halo_a * (0.4 + 0.15 * k)))
+	draw_circle(head, radius, acol(Color(0, 0.02, 0.05), 0.55))
+	if active:
+		draw_circle(head, radius, acol(glow, 0.3))
+	draw_arc(head, radius, 0, TAU, 48, acol(glow, 1.0 if active else 0.9), 6.0, true)
+	draw_arc(head, radius - 5.0, 0, TAU, 48, Color(1, 1, 1, 0.55), 2.0, true)
 
 func _draw_difficulty_picker() -> void:
 	draw_rect(Rect2(Vector2.ZERO, viewport_size), Color(0, 0, 0, 0.62))
@@ -2849,62 +2879,118 @@ func _draw_settings() -> void:
 		_text(_fit(status_text, w - 160, 26), Vector2(80, 1640), 26, _err() if status_error else _ok())
 	_draw_nav()
 
+## Pantalla de resultados (también al perder): fondo de la canción arriba con borde curvo,
+## título, estrellas/coronas (Infinito) o rango (Casual/Vidas), puntaje y mejor, y abajo
+## los botones de repetir y de ir a canciones.
 func _draw_results_infinite() -> void:
-	_background(); draw_set_transform(Vector2(0, ui_off)); _text_centered("MODO INFINITO", viewport_size.x / 2, 230, 58, Color.WHITE)
-	var w := viewport_size.x
-	_panel(Rect2(90, 300, w - 180, 1010), pcol("card"), 38)
-	var dark := pcol("ink")
-	var muted := _ink_soft()
-	_text_centered("Llegaste a la vuelta", w / 2, 410, 32, muted)
-	_text_centered(str(lap), w / 2, 590, 200, pcol("violet"))
-	_text_centered(T("velocidad x%.1f") % lap_factor, w / 2, 660, 34, dark)
-	_text("Estrellas", Vector2(170, 760), 38, dark)
-	_text("Coronas", Vector2(170, 880), 38, dark)
-	for i in 3:
-		_draw_award("star", Vector2(w - 170 - 270 + 45 + i * 90, 745), 34.0, i < stars)
-		_draw_award("crown", Vector2(w - 170 - 270 + 45 + i * 90, 865), 34.0, i < crowns)
-	if failed:
-		_text_centered(fail_text, w / 2, 980, 32, pcol("danger"))
-	if run_record:
-		_text_centered("¡Nuevo récord!", w / 2, 1030, 34, Color(1.0, 0.6, 0.1))
-	if run_lives > 0:
-		var pen_note := T("%d vidas · sin penalización") % run_lives if run_lives == LIVES_MIN else T("%d vidas · puntos x%.2f") % [run_lives, run_mult]
-		_text_centered(pen_note, w / 2, 1085, 24, muted)
-	_text("Puntuación", Vector2(170, 1120), 29, muted); _text(str(score), Vector2(170, 1200), 68, pcol("accent").darkened(0.08))
-	var ib: Dictionary = bests.get(_song_key(current_song) + "|inf", {})
-	if not ib.is_empty():
-		_text_centered(T("Mejor: vuelta %d · %d pts") % [int(ib.get("laps", 1)), int(ib.get("score", 0))], w / 2, 1270, 28, muted)
-	_button(Rect2(110, 1400, w - 220, 135), "REPETIR", pcol("accent")); _button(Rect2(110, 1570, w - 220, 120), "CANCIONES", pcol("button"))
+	_draw_results_screen()
 
 func _draw_results() -> void:
-	if infinite_run:
-		_draw_results_infinite()
-		return
-	_background(); draw_set_transform(Vector2(0, ui_off)); _text_centered("RESULTADOS", viewport_size.x / 2, 230, 58, Color.WHITE)
+	_draw_results_screen()
+
+func _results_curve_y(x: float, base: float) -> float:
+	var t := (x - viewport_size.x / 2.0) / (viewport_size.x / 2.0)
+	return base + 90.0 * (1.0 - t * t)
+
+func _draw_results_screen() -> void:
 	var w := viewport_size.x
-	_panel(Rect2(90, 300, w - 180, 1010), pcol("card"), 38)
-	var dark := pcol("ink")
-	var muted := _ink_soft()
-	# Rango grande
-	var rcol: Color = RANK_COLORS[run_rank]
-	_text_centered(RANKS[run_rank], w / 2, 560, 300, rcol)
-	_text_centered(T("Precisión %.1f %%") % run_accuracy, w / 2, 640, 40, dark)
-	if run_record:
-		_text_centered("¡Nuevo récord!", w / 2, 700, 34, Color(1.0, 0.6, 0.1))
+	var h := viewport_size.y
+	var base := 1100.0
+	draw_rect(Rect2(Vector2.ZERO, viewport_size), pcol("bg"))
+	if show_bg and bg_texture != null:
+		_draw_cover(bg_texture, Rect2(0, 0, w, base + 120.0))
+	var cur := PackedVector2Array()
+	var steps := 40
+	for k in range(steps + 1):
+		var x := w * k / float(steps)
+		cur.append(Vector2(x, _results_curve_y(x, base)))
+	# Zona de arriba oscurecida (se sigue viendo el fondo de la canción).
+	var top_poly := PackedVector2Array([Vector2(0, 0), Vector2(w, 0)])
+	for k in range(steps, -1, -1):
+		top_poly.append(cur[k])
+	var shade := pcol("bg").darkened(0.35)
+	draw_colored_polygon(top_poly, acol(shade, 0.62 if (show_bg and bg_texture != null) else 1.0))
+	# Zona de abajo: sólida, con el borde curvo.
+	var bot_poly := PackedVector2Array()
+	for k in range(steps + 1):
+		bot_poly.append(cur[k])
+	bot_poly.append(Vector2(w, h))
+	bot_poly.append(Vector2(0, h))
+	draw_colored_polygon(bot_poly, pcol("bg"))
+	draw_set_transform(Vector2(0, ui_off))
+	var muted := pcol("muted")
+	# Título de la canción.
+	var title := String(current_song.get("title", ""))
+	var ver := String(current_song.get("version", ""))
+	if ver != "":
+		title += " · " + ver
+	_text_centered(_fit(title, w - 140.0, 44), w / 2, 170 + top_inset, 44, Color.WHITE)
 	if failed:
-		_text_centered(fail_text, w / 2, 745, 32, pcol("danger"))
-	elif run_lives > 0:
-		_text_centered(T("Modo Vidas · %d vidas · puntos x%.2f") % [run_lives, run_mult], w / 2, 745, 28, muted)
+		_text_centered(fail_text, w / 2, 235 + top_inset, 32, _hot())
+	elif run_record:
+		_text_centered("¡Nuevo récord!", w / 2, 235 + top_inset, 34, Color(1.0, 0.6, 0.1))
+	# Estrellas/coronas (Infinito) o rango (Casual y Vidas).
+	var cy := 470.0
+	if infinite_run:
+		for i in 3:
+			_draw_award("star", Vector2(w / 2 + (i - 1) * 190.0, cy - 60.0), 70.0, i < stars)
+		for i in 3:
+			_draw_award("crown", Vector2(w / 2 + (i - 1) * 190.0, cy + 120.0), 62.0, i < crowns)
 	else:
-		_text_centered("Casual · esta partida no se guarda", w / 2, 745, 28, muted)
-	_text("Puntuación", Vector2(170, 800), 29, muted); _text(str(score), Vector2(170, 880), 68, pcol("accent").darkened(0.08))
-	_text("Perfect: %d" % perfects, Vector2(170, 980), 34, dark); _text("Great: %d" % greats, Vector2(w / 2 + 20, 980), 34, dark)
-	_text("Good: %d" % goods, Vector2(170, 1045), 34, dark); _text(T("Fallos: %d") % misses, Vector2(w / 2 + 20, 1045), 34, dark)
-	_text(T("Vacíos: %d") % empties, Vector2(170, 1110), 34, dark); _text(T("Combo máx: %d") % max_combo, Vector2(w / 2 + 20, 1110), 34, dark)
-	var best: Dictionary = bests.get(_song_key(current_song), {})
-	if run_lives > 0 and not best.is_empty():
-		_text_centered(T("Mejor: %s · %d") % [RANKS[int(best.rank)], int(best.score)], w / 2, 1215, 32, muted)
-	_button(Rect2(110, 1400, w - 220, 135), "REPETIR", pcol("accent")); _button(Rect2(110, 1570, w - 220, 120), "CANCIONES", pcol("button"))
+		_text_centered(RANKS[run_rank], w / 2, cy + 90.0, 340, RANK_COLORS[run_rank])
+	# Puntaje y mejor.
+	_text_centered(str(score), w / 2, 840, 190, Color.WHITE)
+	var best_txt := ""
+	if infinite_run:
+		var ib: Dictionary = bests.get(_song_key(current_song) + "|inf", {})
+		if not ib.is_empty():
+			best_txt = T("Mejor: vuelta %d · %d pts") % [int(ib.get("laps", 1)), int(ib.get("score", 0))]
+	else:
+		var best: Dictionary = bests.get(_song_key(current_song), {})
+		if not best.is_empty():
+			best_txt = T("Mejor: %s · %d") % [RANKS[int(best.rank)], int(best.score)] if run_lives > 0 else T("Mejor %d") % int(best.score)
+	if best_txt != "":
+		_text_centered(best_txt, w / 2, 910, 42, muted)
+	# Detalle pequeño.
+	var info := ""
+	if infinite_run:
+		info = T("Llegaste a la vuelta") + " " + str(lap) + " · " + T("velocidad x%.1f") % lap_factor
+	else:
+		info = T("Precisión %.1f %%") % run_accuracy + " · Perfect %d · Great %d · Good %d · " % [perfects, greats, goods] + T("Fallos: %d") % misses
+	_text_centered(_fit(info, w - 100.0, 28), w / 2, 975 + top_inset * 0.0, 28, muted)
+	var note_txt := ""
+	if run_lives > 0:
+		if infinite_run:
+			note_txt = T("%d vidas · sin penalización") % run_lives if run_lives == LIVES_MIN else T("%d vidas · puntos x%.2f") % [run_lives, run_mult]
+		else:
+			note_txt = T("Modo Vidas · %d vidas · puntos x%.2f") % [run_lives, run_mult]
+	elif not infinite_run:
+		note_txt = T("Casual · esta partida no se guarda")
+	if note_txt != "":
+		_text_centered(_fit(note_txt, w - 100.0, 26), w / 2, 1020, 26, muted)
+	# Botones: canciones (círculo) a la izquierda y repetir (píldora) al lado.
+	var by := 1290.0
+	var bh := 150.0
+	var ring := _results_songs_rect()
+	var retry := _results_retry_rect()
+	var bcol := pcol("accent")
+	draw_circle(ring.get_center(), bh / 2.0, bcol)
+	draw_circle(ring.get_center(), bh / 2.0 - 9.0, pcol("bg"))
+	var ic := ring.get_center()
+	for k in 3:
+		draw_rect(Rect2(ic.x - 32.0, ic.y - 30.0 + k * 26.0, 64.0, 10.0), bcol)
+	_panel(retry, bcol, bh / 2.0)
+	var rc := retry.get_center()
+	draw_arc(rc, 34.0, deg_to_rad(-40.0), deg_to_rad(250.0), 36, Color.WHITE, 11.0, true)
+	var tip := rc + Vector2(cos(deg_to_rad(-40.0)), sin(deg_to_rad(-40.0))) * 34.0
+	draw_colored_polygon(PackedVector2Array([tip + Vector2(-6, -30), tip + Vector2(34, 4), tip + Vector2(-14, 20)]), Color.WHITE)
+	draw_set_transform(Vector2.ZERO)
+
+func _results_songs_rect() -> Rect2:
+	return Rect2(70, 1290, 150, 150)
+
+func _results_retry_rect() -> Rect2:
+	return Rect2(250, 1290, viewport_size.x - 320, 150)
 
 ## Mismo fondo que _background() pero solo dentro de un rectángulo (para tapar la lista bajo la cabecera).
 func _background_rect(r: Rect2) -> void:

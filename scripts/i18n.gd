@@ -185,6 +185,7 @@ const EN := {
 	"Vacíos: %d": "Empties: %d",
 	"Combo máx: %d": "Max combo: %d",
 	"Mejor: %s · %d": "Best: %s · %d",
+	"Mejor %d": "Best %d",
 	"Modo no soportado (solo osu!mania y osu!standard)": "Unsupported mode (osu!mania and osu!standard only)",
 	"El mapa no declara archivo de audio": "The map declares no audio file",
 	"El mapa no tiene notas": "The map has no notes",
