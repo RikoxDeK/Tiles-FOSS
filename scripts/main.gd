@@ -59,7 +59,7 @@ var notes: Array = []
 var active_inputs: Dictionary = {}
 var effects: Array = []
 var dying: Array = []   # teclas recién tocadas que se deshacen desde el centro
-const DIE_TIME := 0.32
+const DIE_TIME := 0.27
 var song_time := 0.0
 var started := false
 var paused := false
@@ -599,6 +599,7 @@ func _update_notes() -> void:
 			elif song_time >= end_time:
 				note.done = true
 				note.holding = false
+				dying.append({"lane": note.lane, "time": float(note.time), "height": maxf(viewport_size.x / LANES * 0.83 + 90.0, float(note.duration) * speed), "t": 0.0, "kind": "hold"})
 				_hit(note.lane, "PERFECT", 180, hit_y)
 		elif note.type != "start" and song_time > note.time + HIT_LATE * play_rate:
 			var miss_position: float = hit_y + (song_time - note.time) * speed
@@ -2587,12 +2588,7 @@ func _draw_game() -> void:
 		var bottom: float = viewport_size.y if note.type == "start" and not started else hit_y - (note.time - song_time) * speed
 		var height: float = note.height
 		if note.type == "hold":
-			if note.holding:
-				var remaining: float = max(0.0, note.time + note.duration - song_time)
-				height = maxf(90.0, remaining * speed)
-				bottom = hit_y
-			else:
-				height = maxf(lane_w * 0.83 + 90.0, note.duration * speed)
+			height = maxf(lane_w * 0.83 + 90.0, note.duration * speed)
 		var rect := Rect2(note.lane * lane_w + 2, bottom - height, lane_w - 4, height)
 		if note.type == "hold":
 			# Misma silueta cayendo y sosteniendo: solo cambia la intensidad.
@@ -2605,6 +2601,12 @@ func _draw_game() -> void:
 		if note.type == "start": _text("Comenzar", Vector2(rect.position.x+18,rect.get_center().y+12), 35, Color.WHITE)
 	for d in dying:
 		var p: float = clampf(float(d.t) / DIE_TIME, 0.0, 1.0)
+		if d.get("kind", "") == "hold":
+			var hb: float = hit_y - (float(d.time) - song_time) * speed
+			var hr := Rect2(int(d.lane) * lane_w + 2, hb - float(d.height), lane_w - 4, float(d.height))
+			var hf := pcol("hold").lerp(pcol("nav_home"), 0.35).lerp(Color.WHITE, 0.35)
+			draw_rect(hr, acol(hf, 1.0 - p))
+			continue
 		var dbottom: float = hit_y - (float(d.time) - song_time) * speed
 		var dr := Rect2(int(d.lane) * lane_w + 2, dbottom - float(d.height), lane_w - 4, float(d.height))
 		var tc := acol(pcol("tile"), 1.0 - 0.6 * p)
@@ -2687,20 +2689,21 @@ func _draw_game() -> void:
 		_button(Rect2(170,930,viewport_size.x-340,135), "SALIR", pcol("button"))
 		draw_set_transform(Vector2.ZERO)
 
-## Tecla larga: degradado (claro arriba, oscuro abajo), línea que baja hasta un círculo
-## con brillo. El círculo queda bien despegado del borde inferior y la línea termina
-## justo antes de tocarlo (no se mete dentro).
+## Tecla larga: degradado (claro arriba, oscuro abajo) con línea y círculo con brillo.
+## Al sostenerla mantiene su tamaño y sigue bajando: lo que pasa de la línea de golpeo se
+## rellena de un azul más claro con borde curvo hacia arriba (como un dedo) hasta completarla.
 func _draw_hold_tile(rect: Rect2, active: bool) -> void:
 	var light := pcol("hold").lerp(pcol("nav_home"), 0.35)
-	if active:
-		light = light.lerp(Color.WHITE, 0.12)
 	var dark := pcol("tile")
+	if active:
+		dark = light.lerp(dark, 0.3)
 	var cx := rect.get_center().x
 	var radius := 34.0
 	var head_off := minf(viewport_size.x / LANES * 0.83, maxf(45.0, rect.size.y - 45.0))
 	var head := Vector2(cx, rect.end.y - head_off)
-	# Degradado: oscuro desde abajo hasta la mitad del círculo y luego sube despacio a claro.
 	var g_bot := head.y
+	if active:
+		g_bot = minf(hit_y, rect.end.y)
 	var fade_len := 640.0
 	var g_top := maxf(rect.position.y, g_bot - fade_len)
 	if rect.end.y > g_bot:
@@ -2715,9 +2718,27 @@ func _draw_hold_tile(rect: Rect2, active: bool) -> void:
 		draw_polygon(PackedVector2Array([Vector2(gx, g_mid), Vector2(gx2, g_mid), Vector2(gx2, g_bot), Vector2(gx, g_bot)]), PackedColorArray([mid_col, mid_col, dark, dark]))
 		draw_polygon(PackedVector2Array([Vector2(gx, g_top), Vector2(gx2, g_top), Vector2(gx2, g_mid), Vector2(gx, g_mid)]), PackedColorArray([light, light, mid_col, mid_col]))
 	var glow := pcol("hold").lightened(0.3)
-	# Línea: tenue arriba, más intensa cerca del círculo; termina antes del aro.
+	var cap_h := 0.0
+	var fill_h := rect.end.y - hit_y
+	if active and fill_h > 2.0:
+		var fill_top := light.lerp(Color.WHITE, 0.4)
+		var fill_bot := light.lerp(Color.WHITE, 0.28)
+		cap_h = minf(48.0, fill_h)
+		var fx := rect.position.x
+		var fx2 := rect.end.x
+		draw_polygon(PackedVector2Array([Vector2(fx, hit_y), Vector2(fx2, hit_y), Vector2(fx2, rect.end.y), Vector2(fx, rect.end.y)]), PackedColorArray([fill_top, fill_top, fill_bot, fill_bot]))
+		var cap := PackedVector2Array()
+		var n := 24
+		for k in range(n + 1):
+			var u := -1.0 + 2.0 * k / float(n)
+			cap.append(Vector2(cx + u * rect.size.x / 2.0, hit_y - cap_h * (1.0 - u * u)))
+		draw_colored_polygon(cap, fill_top)
+		draw_polyline(cap, acol(glow, 0.95), 5.0, true)
+	# Línea: tenue arriba, más intensa abajo; termina antes del aro o de la cúpula.
 	var line_top := rect.position.y + 30.0
 	var line_end := head.y - radius - 8.0
+	if active:
+		line_end = hit_y - cap_h - 8.0
 	if line_end > line_top + 10.0:
 		var lc := pcol("hold").lightened(0.55)
 		var a_bot := 0.95 if active else 0.7
@@ -2725,15 +2746,14 @@ func _draw_hold_tile(rect: Rect2, active: bool) -> void:
 		draw_polygon(
 			PackedVector2Array([Vector2(cx - hw, line_top), Vector2(cx + hw, line_top), Vector2(cx + hw, line_end), Vector2(cx - hw, line_end)]),
 			PackedColorArray([acol(lc, 0.12), acol(lc, 0.12), acol(lc, a_bot), acol(lc, a_bot)]))
-	# Brillo (halo) alrededor del círculo.
-	var halo_a := 0.16 if active else 0.09
+	if active:
+		return
+	# Círculo con brillo (solo antes de tocarla).
 	for k in 5:
 		var rr := radius + 30.0 - k * 6.0
-		draw_circle(head, rr, acol(glow, halo_a * (0.4 + 0.15 * k)))
+		draw_circle(head, rr, acol(glow, 0.09 * (0.4 + 0.15 * k)))
 	draw_circle(head, radius, acol(Color(0, 0.02, 0.05), 0.55))
-	if active:
-		draw_circle(head, radius, acol(glow, 0.3))
-	draw_arc(head, radius, 0, TAU, 48, acol(glow, 1.0 if active else 0.9), 6.0, true)
+	draw_arc(head, radius, 0, TAU, 48, acol(glow, 0.9), 6.0, true)
 	draw_arc(head, radius - 5.0, 0, TAU, 48, Color(1, 1, 1, 0.55), 2.0, true)
 
 func _draw_difficulty_picker() -> void:
