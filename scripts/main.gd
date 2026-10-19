@@ -65,7 +65,7 @@ var fade_tween: Tween = null
 var input_y: Dictionary = {}   # altura (y) del dedo de cada toque, para dibujar la larga donde lo pones
 var effects: Array = []
 var marks: Array = []   # círculos rojos suaves donde tocaste en vacío
-const MARK_TIME := 0.06
+const MARK_TIME := 0.09
 var input_x: Dictionary = {}
 var dying: Array = []   # teclas recién tocadas que se deshacen desde el centro
 const DIE_TIME := 0.04
@@ -185,6 +185,11 @@ var search_edit: LineEdit
 var file_dialog: FileDialog
 var scroll_y := 0.0
 var press_id := -999
+var press_ms := 0
+var sel_mode := false            # selección múltiple de canciones (para eliminar)
+var sel_ids: Dictionary = {}
+var menu_group: Dictionary = {}  # canción del menú de mantener pulsado
+var del_ids: Array = []          # canciones pendientes de confirmar eliminación
 var press_pos := Vector2.ZERO
 var dragged := false
 var status_text := ""
@@ -535,6 +540,8 @@ func _resize() -> void:
 	queue_redraw()
 
 func _process(delta: float) -> void:
+	if screen == Screen.LIBRARY and press_id != -999 and not dragged and tab == TAB_MUSIC and overlay == "" and open_group.is_empty() and Time.get_ticks_msec() - press_ms > 480:
+		_long_press()
 	if screen == Screen.GAME and started and not paused and not finished:
 		song_time += delta * play_rate
 		_sync_audio()
@@ -1623,6 +1630,8 @@ func _nav_tap(pos: Vector2) -> bool:
 
 func _go_tab(i: int) -> void:
 	open_group = {}
+	sel_mode = false
+	sel_ids = {}
 	overlay = ""
 	scroll_vel = 0.0
 	if i == 3:
@@ -1702,6 +1711,99 @@ func _entry_by_ref(ref: String) -> Dictionary:
 
 func _find_entry(set_id: String, version: String) -> Dictionary:
 	return _entry_by_ref("%s|%s" % [set_id, version])
+
+func _card_at(pos: Vector2) -> Dictionary:
+	var w := viewport_size.x
+	if pos.y < LIST_TOP - 22.0 or pos.y > _list_bottom() or pos.x < 55.0 or pos.x > w - 55.0:
+		return {}
+	var offset := pos.y - LIST_TOP + scroll_y
+	var idx := int(offset / (CARD_H + CARD_GAP))
+	if offset >= 0.0 and fmod(offset, CARD_H + CARD_GAP) <= CARD_H and idx < view_groups.size():
+		return view_groups[idx]
+	return {}
+
+func _deletable(g: Dictionary) -> bool:
+	return not g.is_empty() and not g.has("playlist_idx") and not g.get("in_playlist", false) and String(g.get("id", "")) != "demo"
+
+## Mantener pulsada una canción: abre el menú de opciones (Seleccionar / Eliminar).
+func _long_press() -> void:
+	var pos := press_pos
+	press_id = -999
+	if sel_mode:
+		return
+	var g := _card_at(pos)
+	if not _deletable(g):
+		return
+	Input.vibrate_handheld(40)
+	menu_group = g
+	overlay = "songmenu"
+
+func _exit_select() -> void:
+	sel_mode = false
+	sel_ids = {}
+
+func _ask_delete(ids: Array) -> void:
+	if ids.is_empty():
+		return
+	del_ids = ids.duplicate()
+	overlay = "delconfirm"
+
+func _sel_cancel_rect() -> Rect2:
+	return Rect2(viewport_size.x - 300, 150.0 + top_inset, 245, 95)
+
+func _sel_delete_rect() -> Rect2:
+	return Rect2(viewport_size.x - 590, 150.0 + top_inset, 270, 95)
+
+func _remove_dir_recursive(path: String) -> void:
+	if not DirAccess.dir_exists_absolute(path):
+		return
+	for f in DirAccess.get_files_at(path):
+		DirAccess.remove_absolute(path.path_join(f))
+	for d in DirAccess.get_directories_at(path):
+		_remove_dir_recursive(path.path_join(d))
+	DirAccess.remove_absolute(path)
+
+## Borra canciones con todas sus dificultades: la carpeta extraída, su copia en Importadas
+## (si no, "Recargar" la restauraría), sus récords, favoritas y apariciones en listas.
+func _delete_songs(ids: Array) -> void:
+	if library_dir != "" and not progress_merged:
+		progress_merged = true
+		_merge_progress_file()   # antes de borrar, para que el archivo de progreso no reviva récords
+	var count := 0
+	for raw in ids:
+		var sid := String(raw)
+		if sid == "" or sid == "demo":
+			continue
+		count += 1
+		_remove_dir_recursive(OsuImporter.SONGS_DIR.path_join(sid))
+		if library_dir != "":
+			for folder in [library_dir.path_join(BACKUP_NAME), library_dir.path_join(INBOX_NAME)]:
+				if not DirAccess.dir_exists_absolute(folder):
+					continue
+				for f in _osz_files(folder):
+					var fpath: String = folder.path_join(f)
+					var fid := _id_from_name(f)
+					if fid == "":
+						fid = FileAccess.get_md5(fpath).substr(0, 10)
+					if fid == sid:
+						DirAccess.remove_absolute(fpath)
+		for key in bests.keys():
+			if String(key).begins_with(sid + "|"):
+				bests.erase(key)
+		favorites.erase(sid)
+		for pl in playlists:
+			var kept: Array = []
+			for r in pl.refs:
+				if not String(r).begins_with(sid + "|"):
+					kept.append(r)
+			pl.refs = kept
+		if String(last_played.get("id", "")) == sid:
+			last_played = {}
+	_exit_select()
+	overlay = ""
+	_refresh_library()
+	_save_settings()
+	_show_status(T("Eliminadas: %d") % count, false)
 
 func _group_of(set_id: String) -> Dictionary:
 	for g in groups:
@@ -1808,6 +1910,17 @@ func _overlay_layout() -> Dictionary:
 		py = (viewport_size.y - h) / 2.0
 		for i in n_sort:
 			rows.append(Rect2(px + 30, py + 140 + i * 114.0, pw - 60, 100))
+	elif overlay == "songmenu":
+		h = 160.0 + 2 * 114.0 + 10.0
+		py = (viewport_size.y - h) / 2.0
+		for i in 2:
+			rows.append(Rect2(px + 30, py + 140 + i * 114.0, pw - 60, 100))
+	elif overlay == "delconfirm":
+		h = 560.0
+		py = (viewport_size.y - h) / 2.0
+		var bw2 := (pw - 90.0) / 2.0
+		extra["cancel"] = Rect2(px + 30, py + h - 140, bw2, 100)
+		extra["ok"] = Rect2(px + 60 + bw2, py + h - 140, bw2, 100)
 	elif overlay == "addto":
 		var n_pl := mini(playlists.size(), 6)
 		h = 160.0 + (n_pl + 1) * 114.0 + 120.0
@@ -1839,12 +1952,36 @@ func _draw_overlay() -> void:
 		title = "Añadir a lista"
 	elif overlay == "newlist":
 		title = "Nueva lista"
+	elif overlay == "songmenu":
+		title = _fit(String(menu_group.get("title", "")), panel.size.x - 80, 44)
+	elif overlay == "delconfirm":
+		title = "Eliminar canciones"
 	_text(title, Vector2(panel.position.x + 40, panel.position.y + 86), 44, ink)
 	if overlay == "sort":
 		for i in lay.rows.size():
 			var r: Rect2 = lay.rows[i]
 			_panel(r, accent if i == sort_mode else soft, 22)
 			_text(SORT_MODES[i], Vector2(r.position.x + 36, r.get_center().y + 13), 36, Color.WHITE if i == sort_mode else ink)
+	elif overlay == "songmenu":
+		var r0: Rect2 = lay.rows[0]
+		_panel(r0, soft, 22)
+		_text("Seleccionar", Vector2(r0.position.x + 36, r0.get_center().y + 13), 36, ink)
+		var r1: Rect2 = lay.rows[1]
+		_panel(r1, pcol("danger"), 22)
+		_text("Eliminar", Vector2(r1.position.x + 36, r1.get_center().y + 13), 36, Color.WHITE)
+	elif overlay == "delconfirm":
+		var who := ""
+		if del_ids.size() == 1:
+			var gg := _group_of(String(del_ids[0]))
+			who = String(gg.get("title", ""))
+		else:
+			who = T("%d canciones") % del_ids.size()
+		_text(_fit(who, panel.size.x - 80, 38), Vector2(panel.position.x + 40, panel.position.y + 160), 38, ink)
+		_text("Se borran con todas sus dificultades", Vector2(panel.position.x + 40, panel.position.y + 225), 28, _ink_soft())
+		_text("y todos sus récords. No se puede deshacer.", Vector2(panel.position.x + 40, panel.position.y + 270), 28, _ink_soft())
+		var exd: Dictionary = lay.extra
+		_button(exd["cancel"], "Cancelar", pcol("button"))
+		_button(exd["ok"], "Eliminar", pcol("danger"))
 	elif overlay == "addto":
 		if not current_song.is_empty():
 			_text(_fit("%s · %s" % [current_song.get("title", ""), current_song.get("version", "")], panel.size.x - 80, 26), Vector2(panel.position.x + 40, panel.position.y + 124), 26, _ink_soft())
@@ -1883,6 +2020,20 @@ func _overlay_tap(pos: Vector2) -> void:
 				return
 		if not panel.has_point(pos):
 			overlay = ""
+	elif overlay == "songmenu":
+		if lay.rows[0].has_point(pos):
+			sel_mode = true
+			sel_ids = {String(menu_group.id): true}
+			overlay = ""
+		elif lay.rows[1].has_point(pos):
+			_ask_delete([String(menu_group.id)])
+		elif not panel.has_point(pos):
+			overlay = ""
+	elif overlay == "delconfirm":
+		if ex["ok"].has_point(pos):
+			_delete_songs(del_ids)
+		elif ex["cancel"].has_point(pos) or not panel.has_point(pos):
+			overlay = ""
 	elif overlay == "addto":
 		for i in lay.rows.size():
 			if lay.rows[i].has_point(pos):
@@ -1906,6 +2057,7 @@ func _list_bottom() -> float:
 func _library_pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
 	if pressed:
 		press_id = input_id; press_pos = pos; dragged = false; scroll_vel = 0.0
+		press_ms = Time.get_ticks_msec()
 		drag_ms = Time.get_ticks_msec()
 	elif input_id == press_id:
 		press_id = -999
@@ -1966,6 +2118,20 @@ func _music_tap(pos: Vector2) -> void:
 	if search_edit.visible and search_edit.get_global_rect().has_point(pos):
 		return
 	search_edit.release_focus()
+	if sel_mode:
+		if _sel_cancel_rect().has_point(pos):
+			_exit_select()
+		elif _sel_delete_rect().has_point(pos):
+			_ask_delete(sel_ids.keys())
+		else:
+			var gs := _card_at(pos)
+			if _deletable(gs):
+				var sid2 := String(gs.id)
+				if sel_ids.has(sid2):
+					sel_ids.erase(sid2)
+				else:
+					sel_ids[sid2] = true
+		return
 	if search_open:
 		if Rect2(w - 300, hy, 245, 95).has_point(pos):
 			_close_search()
@@ -2218,6 +2384,8 @@ func _draw_files() -> void:
 
 ## Una tarjeta de canción. kind: song (corazón), remove (quitar de lista), playlist, plain.
 func _draw_card(g: Dictionary, x: float, y: float, w: float, kind: String) -> void:
+	if sel_mode and sel_ids.has(g.id):
+		_panel(Rect2(x - 7, y - 7, w + 14, CARD_H + 14), pcol("accent"), 33)
 	_panel(Rect2(x, y, w, CARD_H), pcol("card"), 28)
 	var ink := pcol("ink")
 	var soft := _ink_soft()
@@ -2248,7 +2416,16 @@ func _draw_card(g: Dictionary, x: float, y: float, w: float, kind: String) -> vo
 	_text(_fit(g.title, text_w, 38), Vector2(x + 215, y + 82), 38, ink)
 	var sub: String = (T("%s · %d dificultades") % [T(g.artist), count]) if count > 1 else ("%s · %s" % [T(g.artist), first.version])
 	_text(_fit(sub, text_w, 27), Vector2(x + 215, y + 132), 27, soft)
-	if kind == "song":
+	if kind == "song" and sel_mode:
+		var bc := Vector2(x + w - 66, y + CARD_H / 2.0)
+		if g.id == "demo":
+			pass
+		elif sel_ids.has(g.id):
+			draw_circle(bc, 32.0, pcol("accent"))
+			draw_polyline(PackedVector2Array([bc + Vector2(-14, 0), bc + Vector2(-4, 12), bc + Vector2(16, -12)]), Color.WHITE, 7.0)
+		else:
+			draw_arc(bc, 30.0, 0, TAU, 32, Color(0.75, 0.8, 0.88), 6.0, true)
+	elif kind == "song":
 		_draw_heart(Vector2(x + w - 66, y + CARD_H / 2 - 8), 36.0, pcol("fav") if favorites.has(g.id) else Color(0.8, 0.85, 0.91))
 	elif kind == "remove":
 		var c := Vector2(x + w - 66, y + CARD_H / 2.0)
@@ -2289,9 +2466,14 @@ func _draw_music() -> void:
 	var title := "MÚSICA"
 	if music_tab == 2 and open_playlist >= 0 and open_playlist < playlists.size():
 		title = String(playlists[open_playlist].name)
+	if sel_mode:
+		title = T("%d seleccionadas") % sel_ids.size()
 	_text(_fit(title, viewport_size.x - 380, 58), Vector2(55, 105), 58, Color.WHITE)
 	var dark := pcol("button")
-	if search_open:
+	if sel_mode:
+		_button(Rect2(viewport_size.x - 590, 150, 270, 95), "Eliminar", pcol("danger"))
+		_button(Rect2(viewport_size.x - 300, 150, 245, 95), "Cancelar", dark)
+	elif search_open:
 		_button(Rect2(viewport_size.x - 300, 150, 245, 95), "Cerrar", pcol("button"))
 	else:
 		_button(Rect2(viewport_size.x - 300, 40, 245, 80), "Buscar", dark)
@@ -2764,10 +2946,10 @@ func _draw_game() -> void:
 		draw_rect(Rect2(dr.position + Vector2(ho.x + hs.x, ho.y), Vector2(ho.x, hs.y)), tc)
 		draw_rect(Rect2(dr.position + ho, hs), Color(1, 1, 1, 0.45 * (1.0 - p)), false, 4.0)
 	for m in marks:
-		var fa: float = 1.0 - clampf(float(m.t) / MARK_TIME, 0.0, 1.0)
+		var fa: float = 0.35 + 0.65 * (1.0 - clampf(float(m.t) / MARK_TIME, 0.0, 1.0))
 		var mc := pcol("miss")
-		draw_circle(m.pos, 70.0, acol(mc, 0.16 * fa))
-		draw_circle(m.pos, 44.0, acol(mc, 0.30 * fa))
+		draw_circle(m.pos, 95.0, acol(mc, 0.28 * fa))
+		draw_circle(m.pos, 60.0, acol(mc, 0.50 * fa))
 	for effect in effects:
 		var progress: float = 1.0 - float(effect.time) / float(effect.duration)
 		var color: Color = effect.color; color.a *= 1.0 - progress
