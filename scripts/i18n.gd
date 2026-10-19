@@ -186,6 +186,8 @@ const EN := {
 	"Combo máx: %d": "Max combo: %d",
 	"Mejor: %s · %d": "Best: %s · %d",
 	"Mejor %d": "Best %d",
+	"Efectos de sonido": "Sound effects",
+	"Sonidos al perder y al perder una vida": "Sounds when you lose and when you lose a life",
 	"Modo no soportado (solo osu!mania y osu!standard)": "Unsupported mode (osu!mania and osu!standard only)",
 	"El mapa no declara archivo de audio": "The map declares no audio file",
 	"El mapa no tiene notas": "The map has no notes",

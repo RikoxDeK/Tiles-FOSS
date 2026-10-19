@@ -57,10 +57,15 @@ var ui_off := 0.0        # desplazamiento vertical para centrar los menús (pant
 var top_inset := 0.0     # margen superior por cámara frontal / muesca, en unidades del viewport
 var notes: Array = []
 var active_inputs: Dictionary = {}
+var sfx_on := true               # ajuste: efectos de sonido al perder
+var sfx_player: AudioStreamPlayer = null
+var sfx_fail: AudioStreamWAV = null
+var sfx_life: AudioStreamWAV = null
+var fade_tween: Tween = null
 var input_y: Dictionary = {}   # altura (y) del dedo de cada toque, para dibujar la larga donde lo pones
 var effects: Array = []
 var dying: Array = []   # teclas recién tocadas que se deshacen desde el centro
-const DIE_TIME := 0.13
+const DIE_TIME := 0.08
 var song_time := 0.0
 var started := false
 var paused := false
@@ -445,6 +450,10 @@ func _ready() -> void:
 	get_viewport().size_changed.connect(_resize)
 	player = AudioStreamPlayer.new()
 	add_child(player)
+	sfx_player = AudioStreamPlayer.new()
+	add_child(sfx_player)
+	sfx_fail = _gen_fail()
+	sfx_life = _gen_life()
 	file_dialog = FileDialog.new()
 	file_dialog.file_mode = FileDialog.FILE_MODE_OPEN_FILE
 	file_dialog.access = FileDialog.ACCESS_FILESYSTEM
@@ -626,7 +635,8 @@ func _update_notes() -> void:
 		return
 	if song_time > chart_end and not finished:
 		finished = true
-		await get_tree().create_timer(0.7).timeout
+		_fade_out(1.2)
+		await get_tree().create_timer(1.2).timeout
 		if screen == Screen.GAME:
 			_stop_audio()
 			_finish_run()
@@ -870,6 +880,8 @@ func _pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
 		elif _lang_rect(0).has_point(pos): _set_lang("es")
 		elif _lang_rect(1).has_point(pos): _set_lang("en")
 		elif Rect2(80, 1290, viewport_size.x - 160, 180).has_point(pos): _open_palette()
+		elif Rect2(80, 1500, viewport_size.x - 160, 180).has_point(pos):
+			sfx_on = not sfx_on; _save_settings()
 	elif screen == Screen.RESULTS:
 		if _results_retry_rect().has_point(pos): _start_game()
 		elif _results_songs_rect().grow(20).has_point(pos): open_group = {}; screen = Screen.LIBRARY
@@ -1000,10 +1012,13 @@ func _lose_life() -> void:
 		lives_left -= 1
 		life_menu = true
 		life_menu_lock = 0.7
-		_set_paused(true)
+		_play_sfx(sfx_life)
+		_pause_with_fade()
 
 func _game_over(text: String) -> void:
 	failed = true; fail_text = text; finished = true
+	_play_sfx(sfx_fail)
+	_fade_slow(0.85)
 	await get_tree().create_timer(0.9).timeout
 	if screen == Screen.GAME:
 		_stop_audio()
@@ -2410,6 +2425,7 @@ func _load_settings() -> void:
 	library_dir = String(cfg.get_value("library", "dir", ""))
 	lives_setting = clampi(int(cfg.get_value("mods", "lives", 3)), LIVES_MIN, LIVES_MAX)
 	show_thumbs = bool(cfg.get_value("display", "show_thumbs", true))
+	sfx_on = bool(cfg.get_value("display", "sfx", true))
 	var fav_list = cfg.get_value("library", "favorites", [])
 	if fav_list is Array:
 		for fid in fav_list:
@@ -2447,6 +2463,7 @@ func _save_settings() -> void:
 	cfg.set_value("library", "dir", library_dir)
 	cfg.set_value("mods", "lives", lives_setting)
 	cfg.set_value("display", "show_thumbs", show_thumbs)
+	cfg.set_value("display", "sfx", sfx_on)
 	cfg.set_value("library", "favorites", favorites.keys())
 	cfg.set_value("library", "sort", sort_mode)
 	cfg.set_value("library", "last_id", String(last_played.get("id", "")))
@@ -2524,13 +2541,112 @@ func _text_centered(value: String, center_x: float, y: float, size: int, color: 
 
 func _set_paused(value: bool) -> void:
 	paused = value
-	player.stream_paused = value
+	_kill_fade()
+	if value:
+		player.volume_db = 0.0
+		player.stream_paused = true
+	else:
+		# Al reanudar el volumen vuelve suave (evita un golpe seco).
+		player.stream_paused = false
+		player.volume_db = -18.0
+		fade_tween = create_tween()
+		fade_tween.tween_property(player, "volume_db", 0.0, 0.15)
+
+func _kill_fade() -> void:
+	if fade_tween != null and fade_tween.is_valid():
+		fade_tween.kill()
+	fade_tween = null
+
+## Perder una vida: el volumen baja en 0.3 s y luego se pausa el audio. La partida queda
+## congelada al instante; solo el sonido se apaga con suavidad. No toca el tono.
+func _pause_with_fade() -> void:
+	paused = true
+	_kill_fade()
+	fade_tween = create_tween()
+	fade_tween.tween_property(player, "volume_db", -40.0, 0.3)
+	fade_tween.tween_callback(_pause_stream_if_paused)
+
+func _pause_stream_if_paused() -> void:
+	if paused:
+		player.stream_paused = true
+
+## Perder del todo: la canción se frena y se apaga como un disco que se detiene.
+func _fade_slow(duration: float) -> void:
+	_kill_fade()
+	fade_tween = create_tween().set_parallel(true)
+	fade_tween.tween_property(player, "pitch_scale", 0.35, duration).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_IN)
+	fade_tween.tween_property(player, "volume_db", -32.0, duration)
+
+## Final de la canción: desvanecimiento suave.
+func _fade_out(duration: float) -> void:
+	_kill_fade()
+	fade_tween = create_tween()
+	fade_tween.tween_property(player, "volume_db", -40.0, duration)
 
 func _stop_audio() -> void:
 	previewing = false
+	_kill_fade()
 	player.stop()
 	player.stream_paused = false
+	player.volume_db = 0.0
+	player.pitch_scale = 1.0
 	audio_started = false
+
+# --- Efectos de sonido (generados por código, sin archivos) --------------
+
+func _play_sfx(stream: AudioStreamWAV) -> void:
+	if not sfx_on or sfx_player == null or stream == null:
+		return
+	sfx_player.stream = stream
+	sfx_player.play()
+
+func _make_wav(samples: PackedFloat32Array) -> AudioStreamWAV:
+	var data := PackedByteArray()
+	data.resize(samples.size() * 2)
+	for i in samples.size():
+		data.encode_s16(i * 2, int(clampf(samples[i], -1.0, 1.0) * 32767.0))
+	var wav := AudioStreamWAV.new()
+	wav.format = AudioStreamWAV.FORMAT_16_BITS
+	wav.mix_rate = 22050
+	wav.stereo = false
+	wav.data = data
+	return wav
+
+## Derrota: tono que cae de agudo a grave con un golpe grave al inicio.
+func _gen_fail() -> AudioStreamWAV:
+	var rate := 22050
+	var dur := 0.9
+	var n := int(rate * dur)
+	var out := PackedFloat32Array()
+	out.resize(n)
+	var ph := 0.0
+	for i in n:
+		var t := float(i) / rate
+		var k := t / dur
+		var f := 420.0 * pow(0.16, k)
+		ph += TAU * f / rate
+		var env := pow(1.0 - k, 1.6) * minf(1.0, t * 80.0)
+		var thud := sin(TAU * 55.0 * t) * exp(-t * 9.0) * 0.6
+		out[i] = (sin(ph) * 0.6 + sin(ph * 2.0) * 0.18 + thud) * env * 0.85
+	return _make_wav(out)
+
+## Perder una vida: golpe corto y seco.
+func _gen_life() -> AudioStreamWAV:
+	var rate := 22050
+	var dur := 0.28
+	var n := int(rate * dur)
+	var out := PackedFloat32Array()
+	out.resize(n)
+	var ph := 0.0
+	for i in n:
+		var t := float(i) / rate
+		var k := t / dur
+		var f := 320.0 * pow(0.38, k)
+		ph += TAU * f / rate
+		var env := pow(1.0 - k, 2.0)
+		var click := (randf() * 2.0 - 1.0) * exp(-t * 45.0) * 0.3
+		out[i] = (sin(ph) * 0.75 + click) * env * 0.9
+	return _make_wav(out)
 
 ## Escuchar solo el audio de la canción abierta (sin jugar).
 func _toggle_preview() -> void:
@@ -2928,10 +3044,12 @@ func _draw_settings() -> void:
 	_text("Paleta de colores", Vector2(130, 1375), 40, Color.WHITE)
 	_text("Cambia los colores de la app", Vector2(130, 1425), 26, muted)
 	_button(Rect2(w - 330, 1335, 200, 90), "Editar", on_col)
-	_text("Las carpetas de canciones, importar y exportar", Vector2(80, 1530), 26, muted)
-	_text("están ahora en la pestaña Archivos.", Vector2(80, 1570), 26, muted)
+	_panel(Rect2(80, 1500, w - 160, 180), panel_col, 34)
+	_text("Efectos de sonido", Vector2(130, 1585), 40, Color.WHITE)
+	_text("Sonidos al perder y al perder una vida", Vector2(130, 1635), 26, muted)
+	_button(Rect2(w - 330, 1545, 200, 90), "SÍ" if sfx_on else "NO", on_col if sfx_on else off_col)
 	if status_time > 0.0:
-		_text(_fit(status_text, w - 160, 26), Vector2(80, 1640), 26, _err() if status_error else _ok())
+		_text(_fit(status_text, w - 160, 26), Vector2(80, 1722), 26, _err() if status_error else _ok())
 	_draw_nav()
 
 ## Pantalla de resultados (también al perder): fondo de la canción arriba con borde curvo,
