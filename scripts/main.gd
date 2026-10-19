@@ -58,6 +58,8 @@ var top_inset := 0.0     # margen superior por cámara frontal / muesca, en unid
 var notes: Array = []
 var active_inputs: Dictionary = {}
 var effects: Array = []
+var dying: Array = []   # teclas recién tocadas que se deshacen desde el centro
+const DIE_TIME := 0.32
 var song_time := 0.0
 var started := false
 var paused := false
@@ -556,6 +558,11 @@ func _process(delta: float) -> void:
 	for i in range(effects.size() - 1, -1, -1):
 		if effects[i].time <= 0.0:
 			effects.remove_at(i)
+	for d in dying:
+		d.t += delta
+	for i in range(dying.size() - 1, -1, -1):
+		if dying[i].t >= DIE_TIME:
+			dying.remove_at(i)
 	queue_redraw()
 
 func _sync_audio() -> void:
@@ -891,7 +898,7 @@ func _start_game() -> void:
 	_assign_tap_heights()
 	first_idx = 0
 	player.stream = audio_stream
-	active_inputs.clear(); effects.clear()
+	active_inputs.clear(); effects.clear(); dying.clear()
 	song_time = -lead_in; started = false; paused = false; finished = false
 	score = 0; combo = 0; max_combo = 0; hits = 0; misses = 0
 	perfects = 0; greats = 0; goods = 0; empties = 0
@@ -935,9 +942,9 @@ func _try_hit(lane: int, input_id: int) -> void:
 		return
 	if best.type == "hold":
 		best.holding = true; best.input_id = input_id
-		_effect(lane, hit_y, Color(1, 1, 1, 0.82))
 	else:
 		best.done = true
+		dying.append({"lane": lane, "time": float(best.time), "height": float(best.height), "t": 0.0})
 		var judgement := "PERFECT" if best_diff <= PERFECT_WINDOW * play_rate else ("GREAT" if best_diff <= GREAT_WINDOW * play_rate else "GOOD")
 		var points := 100 if judgement == "PERFECT" else (75 if judgement == "GREAT" else 50)
 		_hit(lane, judgement, points, hit_y)
@@ -949,7 +956,6 @@ func _hit(lane: int, text: String, points: int, effect_y: float) -> void:
 		"PERFECT": perfects += 1
 		"GREAT": greats += 1
 		"GOOD": goods += 1
-	_effect(lane, effect_y, Color(1, 1, 1, 0.82))
 
 func _set_judgement(text: String, duration: float) -> void:
 	last_judgement = text; judgement_time = duration; judgement_total = duration
@@ -2597,6 +2603,18 @@ func _draw_game() -> void:
 			draw_rect(rect, Color.WHITE, false, 6.0)
 			_text("Continuar", Vector2(rect.position.x + 18, rect.get_center().y + 12), 35, Color.WHITE)
 		if note.type == "start": _text("Comenzar", Vector2(rect.position.x+18,rect.get_center().y+12), 35, Color.WHITE)
+	for d in dying:
+		var p: float = clampf(float(d.t) / DIE_TIME, 0.0, 1.0)
+		var dbottom: float = hit_y - (float(d.time) - song_time) * speed
+		var dr := Rect2(int(d.lane) * lane_w + 2, dbottom - float(d.height), lane_w - 4, float(d.height))
+		var tc := acol(pcol("tile"), 1.0 - 0.6 * p)
+		var hs := dr.size * p
+		var ho := (dr.size - hs) / 2.0
+		draw_rect(Rect2(dr.position, Vector2(dr.size.x, ho.y)), tc)
+		draw_rect(Rect2(dr.position + Vector2(0, ho.y + hs.y), Vector2(dr.size.x, ho.y)), tc)
+		draw_rect(Rect2(dr.position + Vector2(0, ho.y), Vector2(ho.x, hs.y)), tc)
+		draw_rect(Rect2(dr.position + Vector2(ho.x + hs.x, ho.y), Vector2(ho.x, hs.y)), tc)
+		draw_rect(Rect2(dr.position + ho, hs), Color(1, 1, 1, 0.45 * (1.0 - p)), false, 4.0)
 	for effect in effects:
 		var progress: float = 1.0 - float(effect.time) / float(effect.duration)
 		var color: Color = effect.color; color.a *= 1.0 - progress
@@ -2677,20 +2695,25 @@ func _draw_hold_tile(rect: Rect2, active: bool) -> void:
 	if active:
 		light = light.lerp(Color.WHITE, 0.12)
 	var dark := pcol("tile")
-	var fade_h := minf(rect.size.y, 460.0)
-	var solid_h := rect.size.y - fade_h
-	if solid_h > 0.0:
-		draw_rect(Rect2(rect.position, Vector2(rect.size.x, solid_h)), light)
-	var gy := rect.position.y + solid_h
-	var gx := rect.position.x
-	var gw := rect.size.x
-	draw_polygon(
-		PackedVector2Array([Vector2(gx, gy), Vector2(gx + gw, gy), Vector2(gx + gw, rect.end.y), Vector2(gx, rect.end.y)]),
-		PackedColorArray([light, light, dark, dark]))
 	var cx := rect.get_center().x
 	var radius := 34.0
 	var head_off := minf(viewport_size.x / LANES * 0.83, maxf(45.0, rect.size.y - 45.0))
 	var head := Vector2(cx, rect.end.y - head_off)
+	# Degradado: oscuro desde abajo hasta la mitad del círculo y luego sube despacio a claro.
+	var g_bot := head.y
+	var fade_len := 640.0
+	var g_top := maxf(rect.position.y, g_bot - fade_len)
+	if rect.end.y > g_bot:
+		draw_rect(Rect2(rect.position.x, g_bot, rect.size.x, rect.end.y - g_bot), dark)
+	if g_top > rect.position.y:
+		draw_rect(Rect2(rect.position.x, rect.position.y, rect.size.x, g_top - rect.position.y), light)
+	if g_bot > g_top:
+		var g_mid := g_bot - (g_bot - g_top) * 0.5
+		var mid_col := dark.lerp(light, 0.22)
+		var gx := rect.position.x
+		var gx2 := rect.end.x
+		draw_polygon(PackedVector2Array([Vector2(gx, g_mid), Vector2(gx2, g_mid), Vector2(gx2, g_bot), Vector2(gx, g_bot)]), PackedColorArray([mid_col, mid_col, dark, dark]))
+		draw_polygon(PackedVector2Array([Vector2(gx, g_top), Vector2(gx2, g_top), Vector2(gx2, g_mid), Vector2(gx, g_mid)]), PackedColorArray([light, light, mid_col, mid_col]))
 	var glow := pcol("hold").lightened(0.3)
 	# Línea: tenue arriba, más intensa cerca del círculo; termina antes del aro.
 	var line_top := rect.position.y + 30.0
