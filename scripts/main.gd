@@ -57,9 +57,10 @@ var ui_off := 0.0        # desplazamiento vertical para centrar los menús (pant
 var top_inset := 0.0     # margen superior por cámara frontal / muesca, en unidades del viewport
 var notes: Array = []
 var active_inputs: Dictionary = {}
+var input_y: Dictionary = {}   # altura (y) del dedo de cada toque, para dibujar la larga donde lo pones
 var effects: Array = []
 var dying: Array = []   # teclas recién tocadas que se deshacen desde el centro
-const DIE_TIME := 0.27
+const DIE_TIME := 0.22
 var song_time := 0.0
 var started := false
 var paused := false
@@ -436,6 +437,9 @@ func _drag_any(pos: Vector2, relative: Vector2, input_id: int) -> void:
 		if input_id == pal_drag_id:
 			_pal_drag_to(pos.x)
 		return
+	if screen == Screen.GAME and input_id in active_inputs:
+		input_y[input_id] = pos.y
+		return
 	_library_drag(pos, relative, input_id)
 
 func _ready() -> void:
@@ -584,6 +588,13 @@ func _sync_audio() -> void:
 	else:
 		song_time += error * 0.1
 
+## Altura del dedo que sostiene una larga (con teclado: la línea de golpeo).
+func _hold_y(note: Dictionary) -> float:
+	var iid = note.get("input_id", null)
+	if iid != null and input_y.has(iid):
+		return clampf(float(input_y[iid]), 0.0, hit_y)
+	return hit_y
+
 func _update_notes() -> void:
 	for i in range(first_idx, notes.size()):
 		var note: Dictionary = notes[i]
@@ -593,7 +604,7 @@ func _update_notes() -> void:
 			continue
 		if note.type == "hold" and note.holding:
 			var held: bool = note.input_id in active_inputs and active_inputs[note.input_id] == note.lane
-			var end_time: float = note.time + note.duration
+			var end_time: float = note.time + note.duration - clampf((hit_y - _hold_y(note)) / speed, 0.0, 0.35)
 			if not held and song_time < end_time - 0.12:
 				_release_hold(note)
 			elif song_time >= end_time:
@@ -835,6 +846,7 @@ func _pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
 		if resume_pending:
 			var rl: int = clampi(int(pos.x / (viewport_size.x / LANES)), 0, LANES - 1)
 			active_inputs[input_id] = rl
+			input_y[input_id] = pos.y
 			_try_hit(rl, input_id)
 			return
 		if Rect2(viewport_size.x - 145, 35 + top_inset, 110, 100).has_point(pos):
@@ -847,6 +859,7 @@ func _pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
 			return
 		var lane: int = clampi(int(pos.x / (viewport_size.x / LANES)), 0, LANES - 1)
 		active_inputs[input_id] = lane
+		input_y[input_id] = pos.y
 		_try_hit(lane, input_id)
 	elif screen == Screen.SETTINGS:
 		if Rect2(80, 330, viewport_size.x - 160, 180).has_point(pos):
@@ -2592,7 +2605,7 @@ func _draw_game() -> void:
 		var rect := Rect2(note.lane * lane_w + 2, bottom - height, lane_w - 4, height)
 		if note.type == "hold":
 			# Misma silueta cayendo y sosteniendo: solo cambia la intensidad.
-			_draw_hold_tile(rect, note.holding)
+			_draw_hold_tile(rect, note.holding, _hold_y(note) if note.holding else hit_y)
 		else:
 			draw_rect(rect, pcol("tile"))
 		if resume_pending and i in resume_idxs and not note.holding:
@@ -2692,7 +2705,7 @@ func _draw_game() -> void:
 ## Tecla larga: degradado (claro arriba, oscuro abajo) con línea y círculo con brillo.
 ## Al sostenerla mantiene su tamaño y sigue bajando: lo que pasa de la línea de golpeo se
 ## rellena de un azul más claro con borde curvo hacia arriba (como un dedo) hasta completarla.
-func _draw_hold_tile(rect: Rect2, active: bool) -> void:
+func _draw_hold_tile(rect: Rect2, active: bool, line_y: float) -> void:
 	var light := pcol("hold").lerp(pcol("nav_home"), 0.35)
 	var dark := pcol("tile")
 	if active:
@@ -2703,7 +2716,7 @@ func _draw_hold_tile(rect: Rect2, active: bool) -> void:
 	var head := Vector2(cx, rect.end.y - head_off)
 	var g_bot := head.y
 	if active:
-		g_bot = minf(hit_y, rect.end.y)
+		g_bot = minf(line_y, rect.end.y)
 	var fade_len := 640.0
 	var g_top := maxf(rect.position.y, g_bot - fade_len)
 	if rect.end.y > g_bot:
@@ -2719,26 +2732,26 @@ func _draw_hold_tile(rect: Rect2, active: bool) -> void:
 		draw_polygon(PackedVector2Array([Vector2(gx, g_top), Vector2(gx2, g_top), Vector2(gx2, g_mid), Vector2(gx, g_mid)]), PackedColorArray([light, light, mid_col, mid_col]))
 	var glow := pcol("hold").lightened(0.3)
 	var cap_h := 0.0
-	var fill_h := rect.end.y - hit_y
+	var fill_h := rect.end.y - line_y
 	if active and fill_h > 2.0:
 		var fill_top := light.lerp(Color.WHITE, 0.4)
 		var fill_bot := light.lerp(Color.WHITE, 0.28)
 		cap_h = minf(48.0, fill_h)
 		var fx := rect.position.x
 		var fx2 := rect.end.x
-		draw_polygon(PackedVector2Array([Vector2(fx, hit_y), Vector2(fx2, hit_y), Vector2(fx2, rect.end.y), Vector2(fx, rect.end.y)]), PackedColorArray([fill_top, fill_top, fill_bot, fill_bot]))
+		draw_polygon(PackedVector2Array([Vector2(fx, line_y), Vector2(fx2, line_y), Vector2(fx2, rect.end.y), Vector2(fx, rect.end.y)]), PackedColorArray([fill_top, fill_top, fill_bot, fill_bot]))
 		var cap := PackedVector2Array()
 		var n := 24
 		for k in range(n + 1):
 			var u := -1.0 + 2.0 * k / float(n)
-			cap.append(Vector2(cx + u * rect.size.x / 2.0, hit_y - cap_h * (1.0 - u * u)))
+			cap.append(Vector2(cx + u * rect.size.x / 2.0, line_y - cap_h * (1.0 - u * u)))
 		draw_colored_polygon(cap, fill_top)
 		draw_polyline(cap, acol(glow, 0.95), 5.0, true)
 	# Línea: tenue arriba, más intensa abajo; termina antes del aro o de la cúpula.
 	var line_top := rect.position.y + 30.0
 	var line_end := head.y - radius - 8.0
 	if active:
-		line_end = hit_y - cap_h - 8.0
+		line_end = line_y - cap_h - 8.0
 	if line_end > line_top + 10.0:
 		var lc := pcol("hold").lightened(0.55)
 		var a_bot := 0.95 if active else 0.7
