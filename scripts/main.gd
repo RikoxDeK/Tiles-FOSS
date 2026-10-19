@@ -64,6 +64,9 @@ var sfx_life: AudioStreamWAV = null
 var fade_tween: Tween = null
 var input_y: Dictionary = {}   # altura (y) del dedo de cada toque, para dibujar la larga donde lo pones
 var effects: Array = []
+var marks: Array = []   # círculos rojos suaves donde tocaste en vacío
+const MARK_TIME := 0.06
+var input_x: Dictionary = {}
 var dying: Array = []   # teclas recién tocadas que se deshacen desde el centro
 const DIE_TIME := 0.04
 var song_time := 0.0
@@ -570,6 +573,11 @@ func _process(delta: float) -> void:
 	for i in range(effects.size() - 1, -1, -1):
 		if effects[i].time <= 0.0:
 			effects.remove_at(i)
+	for m in marks:
+		m.t += delta
+	for i in range(marks.size() - 1, -1, -1):
+		if marks[i].t >= MARK_TIME:
+			marks.remove_at(i)
 	for d in dying:
 		d.t += delta
 	for i in range(dying.size() - 1, -1, -1):
@@ -856,6 +864,7 @@ func _pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
 			var rl: int = clampi(int(pos.x / (viewport_size.x / LANES)), 0, LANES - 1)
 			active_inputs[input_id] = rl
 			input_y[input_id] = pos.y
+			input_x[input_id] = pos.x
 			_try_hit(rl, input_id)
 			return
 		if Rect2(viewport_size.x - 145, 35 + top_inset, 110, 100).has_point(pos):
@@ -869,6 +878,7 @@ func _pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
 		var lane: int = clampi(int(pos.x / (viewport_size.x / LANES)), 0, LANES - 1)
 		active_inputs[input_id] = lane
 		input_y[input_id] = pos.y
+		input_x[input_id] = pos.x
 		_try_hit(lane, input_id)
 	elif screen == Screen.SETTINGS:
 		if Rect2(80, 330, viewport_size.x - 160, 180).has_point(pos):
@@ -923,7 +933,7 @@ func _start_game() -> void:
 	_assign_tap_heights()
 	first_idx = 0
 	player.stream = audio_stream
-	active_inputs.clear(); effects.clear(); dying.clear()
+	active_inputs.clear(); effects.clear(); dying.clear(); marks.clear()
 	song_time = -lead_in; started = false; paused = false; finished = false
 	score = 0; combo = 0; max_combo = 0; hits = 0; misses = 0
 	perfects = 0; greats = 0; goods = 0; empties = 0
@@ -944,7 +954,7 @@ func _try_hit(lane: int, input_id: int) -> void:
 				note.done = true; started = true; song_time = -lead_in; audio_started = false
 				_hit(lane, "COMENZAR", 0, hit_y)
 				return
-		_effect(lane, hit_y, acol(pcol("miss"), 0.84))
+		_mark(lane, input_id)
 		return
 	# La tecla se dibuja con su borde inferior en la línea de golpeo al llegar su hora,
 	# así que el cuerpo (alto NORMAL_HEIGHT) se ve ANTES. Se puede tocar en cualquier
@@ -962,7 +972,7 @@ func _try_hit(lane: int, input_id: int) -> void:
 		break  # la más antigua pendiente del carril
 	if best.is_empty():
 		combo = 0; empties += 1; _set_judgement("VACÍO", 0.4)
-		_effect(lane, hit_y, acol(pcol("miss"), 0.84))
+		_mark(lane, input_id)
 		_lose_life()
 		return
 	if best.type == "hold":
@@ -995,7 +1005,6 @@ func _judgement_color(text: String) -> Color:
 
 func _miss(lane: int, effect_y: float) -> void:
 	misses += 1; combo = 0; _set_judgement("MISS", 0.6)
-	_effect(lane, effect_y, acol(pcol("miss"), 0.84))
 	_lose_life()
 
 # --- Modo Vidas ----------------------------------------------------------
@@ -1074,7 +1083,6 @@ func _resume_with(lane: int, input_id: int) -> void:
 			n.holding = true; n.input_id = input_id
 		else:
 			n.done = true
-		_effect(lane, hit_y, Color(1, 1, 1, 0.82))
 		tapped = true
 		break
 	if not tapped:
@@ -1106,6 +1114,16 @@ func _draw_lives_bars(x: float, y: float, bar_w: float, bar_h: float, gap: float
 		var r := Rect2(x + i * (bar_w + gap), y, bar_w, bar_h)
 		draw_rect(r.grow(3.0), Color(0.04, 0.16, 0.32, 0.9))
 		draw_rect(r, _hot() if i < lives_left else Color(0.4, 0.46, 0.56, 0.6))
+
+## Toque en vacío: círculo rojo suave justo donde pusiste el dedo (0.06 s).
+func _mark(lane: int, input_id: int) -> void:
+	var lane_w := viewport_size.x / LANES
+	var p := Vector2((lane + 0.5) * lane_w, hit_y)
+	if input_id >= 0 and input_x.has(input_id) and input_y.has(input_id):
+		p = Vector2(float(input_x[input_id]), float(input_y[input_id]))
+	elif input_id == -1 and input_x.has(-1) and input_y.has(-1):
+		p = Vector2(float(input_x[-1]), float(input_y[-1]))
+	marks.append({"pos": p, "t": 0.0})
 
 func _effect(lane: int, effect_y: float, color: Color) -> void:
 	effects.append({"lane":lane, "y":effect_y, "color":color, "time":0.20, "duration":0.20})
@@ -2745,6 +2763,11 @@ func _draw_game() -> void:
 		draw_rect(Rect2(dr.position + Vector2(0, ho.y), Vector2(ho.x, hs.y)), tc)
 		draw_rect(Rect2(dr.position + Vector2(ho.x + hs.x, ho.y), Vector2(ho.x, hs.y)), tc)
 		draw_rect(Rect2(dr.position + ho, hs), Color(1, 1, 1, 0.45 * (1.0 - p)), false, 4.0)
+	for m in marks:
+		var fa: float = 1.0 - clampf(float(m.t) / MARK_TIME, 0.0, 1.0)
+		var mc := pcol("miss")
+		draw_circle(m.pos, 70.0, acol(mc, 0.16 * fa))
+		draw_circle(m.pos, 44.0, acol(mc, 0.30 * fa))
 	for effect in effects:
 		var progress: float = 1.0 - float(effect.time) / float(effect.duration)
 		var color: Color = effect.color; color.a *= 1.0 - progress
