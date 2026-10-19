@@ -60,7 +60,7 @@ var active_inputs: Dictionary = {}
 var input_y: Dictionary = {}   # altura (y) del dedo de cada toque, para dibujar la larga donde lo pones
 var effects: Array = []
 var dying: Array = []   # teclas recién tocadas que se deshacen desde el centro
-const DIE_TIME := 0.22
+const DIE_TIME := 0.13
 var song_time := 0.0
 var started := false
 var paused := false
@@ -438,8 +438,7 @@ func _drag_any(pos: Vector2, relative: Vector2, input_id: int) -> void:
 			_pal_drag_to(pos.x)
 		return
 	if screen == Screen.GAME and input_id in active_inputs:
-		input_y[input_id] = pos.y
-		return
+		return   # la altura del dedo se fija al tocar: moverlo no cambia dónde se dibuja la larga
 	_library_drag(pos, relative, input_id)
 
 func _ready() -> void:
