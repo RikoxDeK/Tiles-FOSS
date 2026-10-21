@@ -117,6 +117,7 @@ const MOD_RATE := 2.0        # velocidad del modificador x2
 const HARDCORE_WIN := 0.6    # las ventanas de acierto se multiplican por esto en Hardcore
 const DIFF_MULT := [0.85, 1.0, 1.1, 1.2, 1.3]   # multiplicador de puntos por dificultad de notas
 var health := 1.0            # barra de vida (modo Estándar)
+var health_armed := false    # la barra solo se vacía sola desde que se juega la primera nota
 var hp_rate := 5.0           # HPDrainRate del mapa de osu! (0-10)
 var base_rate := 1.0         # velocidad base de la canción (2.0 con x2)
 var win_mult := 1.0          # multiplicador de ventanas de acierto (Hardcore)
@@ -588,7 +589,7 @@ func _process(delta: float) -> void:
 		_long_press()
 	if screen == Screen.GAME and started and not paused and not finished:
 		song_time += delta * play_rate
-		if game_mode == 0 and not spectating and not _mod_on("nofail") and song_time > 0.0 and not life_menu:
+		if game_mode == 0 and not spectating and not _mod_on("nofail") and health_armed and song_time > 0.0 and not life_menu:
 			health -= (0.006 + 0.0025 * hp_rate) * delta
 			if health <= 0.0:
 				health = 0.0
@@ -1033,6 +1034,7 @@ func _start_game() -> void:
 	win_mult = HARDCORE_WIN if _mod_on("hardcore") else 1.0
 	hp_rate = clampf(float(current_parsed.get("hp", 5.0)), 0.0, 10.0)
 	health = 1.0
+	health_armed = false
 	lap = 1; lap_factor = 1.0; award_idx = 0; stars = 0; crowns = 0
 	banner_time = 0.0; lap_banner_time = 0.0; bg_blend = 0.0
 	play_rate = base_rate; player.pitch_scale = base_rate; run_record = false
@@ -1125,6 +1127,7 @@ func _judgement_color(text: String) -> Color:
 	return Color.WHITE
 
 func _miss(lane: int, effect_y: float) -> void:
+	health_armed = true
 	misses += 1; combo = 0; _set_judgement("MISS", 0.6)
 	_lose_life(0.10)
 
@@ -1263,6 +1266,7 @@ func _mods_text() -> String:
 	return " · ".join(parts)
 
 func _health_gain(text: String) -> void:
+	health_armed = true
 	if game_mode != 0:
 		return
 	match text:
@@ -3434,11 +3438,12 @@ func _draw_game() -> void:
 		_text_outlined("COMBO", viewport_size.x / 2, 255 + top_inset, 30, Color.WHITE, Color(0.04, 0.16, 0.32, 0.95), 8)
 	_button(Rect2(viewport_size.x-145,35+top_inset,110,100), "II", Color(0.06,0.12,0.2,0.72))
 	if game_mode == 0 and not spectating:
-		var hb := Rect2(55, 62 + top_inset, viewport_size.x - 55 - 190, 24)
-		draw_rect(hb.grow(4.0), Color(0.04, 0.16, 0.32, 0.9))
-		var hcol := Color(1.0, 0.3, 0.3).lerp(Color(0.35, 0.95, 0.6), clampf(health * 1.4, 0.0, 1.0))
+		# Barra fina y discreta: pista translúcida y relleno suave que solo se enrojece al quedar poca vida.
+		var hb := Rect2(55, 74 + top_inset, viewport_size.x - 55 - 190, 10)
+		draw_rect(hb, Color(0.04, 0.16, 0.32, 0.35))
+		var hcol := Color(1.0, 1.0, 1.0, 0.85).lerp(Color(1.0, 0.38, 0.38, 0.9), clampf((0.35 - health) / 0.35, 0.0, 1.0))
 		if _mod_on("nofail"):
-			hcol = Color(0.55, 0.65, 0.8)
+			hcol = Color(0.55, 0.65, 0.8, 0.7)
 		draw_rect(Rect2(hb.position, Vector2(hb.size.x * clampf(health, 0.0, 1.0), hb.size.y)), hcol)
 	if spectating:
 		_text_centered("ESPECTADOR", viewport_size.x / 2.0, 90 + top_inset, 30, Color(1, 1, 1, 0.7))
