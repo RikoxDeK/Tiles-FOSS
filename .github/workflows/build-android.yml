@@ -49,13 +49,12 @@ jobs:
           unzip -q "Godot_v${GODOT_VERSION}-stable_export_templates.tpz"
           cp -r templates/* "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable/"
 
-      - name: Crear keystore de depuración
+      - name: Usar la keystore de depuración fija del proyecto
         shell: bash
         run: |
-          keytool -genkeypair -v -keystore "$HOME/debug.keystore" \
-            -storepass android -keypass android -alias androiddebugkey \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -dname "CN=Android Debug,O=Android,C=US"
+          # Siempre la misma firma: así el APK nuevo se instala encima del anterior
+          # sin desinstalar, y tus récords y ajustes se conservan.
+          cp signing/tiles-foss-debug.pkcs12 "$HOME/debug.keystore"
 
       - name: Configurar Godot (SDK, Java y keystore)
         shell: bash

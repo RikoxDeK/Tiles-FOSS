@@ -62,6 +62,11 @@ var sfx_player: AudioStreamPlayer = null
 var sfx_fail: AudioStreamWAV = null
 var sfx_life: AudioStreamWAV = null
 var fade_tween: Tween = null
+var amb_player: AudioStreamPlayer = null   # música de fondo suave al abrir la app
+var amb_tween: Tween = null
+var amb_on := false
+var amb_song := false   # el ambiente actual es la canción del mapa abierto en Preparar
+var prep_tex: Texture2D = null   # imagen del mapa en Preparar
 var input_y: Dictionary = {}   # altura (y) del dedo de cada toque, para dibujar la larga donde lo pones
 var effects: Array = []
 var marks: Array = []   # círculos rojos suaves donde tocaste en vacío
@@ -89,7 +94,21 @@ var bests: Dictionary = {}   # clave de mapa -> {"score", "rank", "acc"}
 var last_judgement := ""
 var judgement_time := 0.0
 var judgement_total := 0.5
-var lives_mode := false      # modo Vidas (ajuste guardado); false = Casual
+var game_mode := 0           # 0 = Estándar (barra de vida), 1 = Tiles (infinito, con vidas)
+var mod_x2 := false          # modificadores (se guardan)
+var mod_nofail := false      # solo Estándar
+var mod_perfect := false
+var mod_spectator := false   # solo Estándar: juega solo una partida perfecta
+var mod_hardcore := false
+const MOD_RATE := 2.0        # velocidad del modificador x2
+const HARDCORE_WIN := 0.6    # las ventanas de acierto se multiplican por esto en Hardcore
+const DIFF_MULT := [0.85, 1.0, 1.1, 1.2, 1.3]   # multiplicador de puntos por dificultad de notas
+var health := 1.0            # barra de vida (modo Estándar)
+var hp_rate := 5.0           # HPDrainRate del mapa de osu! (0-10)
+var base_rate := 1.0         # velocidad base de la canción (2.0 con x2)
+var win_mult := 1.0          # multiplicador de ventanas de acierto (Hardcore)
+var spectating := false      # esta partida la juega el espectador automático
+var mode_menu := false       # menú del botón central de modo
 var lives_setting := 3       # vidas elegidas para la próxima partida (3..10)
 var lives_left := 0
 var run_lives := 0           # vidas con las que empezó esta partida (0 = casual)
@@ -112,7 +131,6 @@ var lang := "es"             # idioma de la interfaz: "es" o "en"
 var pal: Dictionary = TilesPalette.defaults()   # paleta actual: id de rol -> Color
 var perm_asked := false   # ya pedimos el permiso de archivos en esta sesión
 var folder_dialog: FileDialog
-var infinite_mode := false   # ajuste: modo Infinito (usa las vidas)
 var infinite_run := false    # esta partida es infinita
 var lap := 1
 var lap_factor := 1.0
@@ -146,7 +164,6 @@ var home_records: Array = []
 var home_dirty := true
 var home_tex: Texture2D = null   # imagen de la última canción jugada (cabecera de Inicio)
 var home_tex_path := ""
-var progress_merged := false   # ya se leyó progreso.cfg en esta sesión (evita pisarlo con datos vacíos)
 var favorites: Dictionary = {}   # id de canción -> true
 var thumb_cache: Dictionary = {} # ruta de imagen -> Texture2D (o null si no se pudo leer)
 var thumb_budget := 1            # miniaturas que se pueden decodificar por fotograma
@@ -460,6 +477,7 @@ func _ready() -> void:
 	add_child(player)
 	sfx_player = AudioStreamPlayer.new()
 	add_child(sfx_player)
+	_setup_ambient()
 	sfx_fail = _gen_fail()
 	sfx_life = _gen_life()
 	file_dialog = FileDialog.new()
@@ -482,10 +500,10 @@ func _ready() -> void:
 	_load_settings()
 	_apply_edit_theme()
 	_apply_language()
-	if _merge_progress_file():
-		_save_settings()
+	_migrate_legacy_progress()
 	_refresh_library()
 	_resize()
+	_start_ambient()
 
 func _notification(what: int) -> void:
 	if what == NOTIFICATION_WM_GO_BACK_REQUEST:
@@ -540,10 +558,19 @@ func _resize() -> void:
 	queue_redraw()
 
 func _process(delta: float) -> void:
+	if amb_on and amb_song and screen != Screen.PREPARE:
+		_stop_ambient()
 	if screen == Screen.LIBRARY and press_id != -999 and not dragged and tab == TAB_MUSIC and overlay == "" and open_group.is_empty() and Time.get_ticks_msec() - press_ms > 480:
 		_long_press()
 	if screen == Screen.GAME and started and not paused and not finished:
 		song_time += delta * play_rate
+		if game_mode == 0 and not spectating and not _mod_on("nofail") and song_time > 0.0 and not life_menu:
+			health -= (0.006 + 0.0025 * hp_rate) * delta
+			if health <= 0.0:
+				health = 0.0
+				_game_over("SIN VIDA")
+		if spectating and started:
+			_auto_play()
 		_sync_audio()
 		_update_notes()
 	if previewing and (screen != Screen.PREPARE or not player.playing):
@@ -588,7 +615,13 @@ func _process(delta: float) -> void:
 	for d in dying:
 		d.t += delta
 	for i in range(dying.size() - 1, -1, -1):
-		if dying[i].t >= DIE_TIME:
+		var dd: Dictionary = dying[i]
+		if dd.get("kind", "") == "hold":
+			# La larga completada se queda opaca y sigue bajando hasta salir de la pantalla.
+			var hbn: float = hit_y - (float(dd.time) - song_time) * speed
+			if hbn - float(dd.height) > viewport_size.y:
+				dying.remove_at(i)
+		elif dd.t >= DIE_TIME:
 			dying.remove_at(i)
 	queue_redraw()
 
@@ -610,6 +643,21 @@ func _sync_audio() -> void:
 		song_time = audio_time
 	else:
 		song_time += error * 0.1
+
+## Espectador: toca cada nota justo a su hora (partida perfecta).
+func _auto_play() -> void:
+	for i in range(first_idx, notes.size()):
+		var n: Dictionary = notes[i]
+		if n.type != "start" and n.time - song_time > 0.05:
+			break
+		if n.done or n.holding or n.type == "start":
+			continue
+		if song_time >= n.time:
+			var aid := -300 - int(n.lane)
+			active_inputs[aid] = n.lane
+			input_x[aid] = (float(n.lane) + 0.5) * viewport_size.x / LANES
+			input_y[aid] = hit_y
+			_try_hit(int(n.lane), aid)
 
 ## Altura del dedo que sostiene una larga (con teclado: la línea de golpeo).
 func _hold_y(note: Dictionary) -> float:
@@ -635,7 +683,7 @@ func _update_notes() -> void:
 				note.holding = false
 				dying.append({"lane": note.lane, "time": float(note.time), "height": maxf(viewport_size.x / LANES * 0.83 + 90.0, float(note.duration) * speed), "t": 0.0, "kind": "hold"})
 				_hit(note.lane, "PERFECT", 180, hit_y)
-		elif note.type != "start" and song_time > note.time + HIT_LATE * play_rate:
+		elif note.type != "start" and song_time > note.time + HIT_LATE * win_mult * play_rate:
 			var miss_position: float = hit_y + (song_time - note.time) * speed
 			note.done = true
 			if note.type == "hold":   # la larga entera se queda atrás, apagada
@@ -703,10 +751,10 @@ func _next_lap() -> void:
 	lap_factor = 1.0 + 0.5 * float(lap - 1)
 	lap_banner_text = T("VUELTA %d · x%.1f") % [lap, lap_factor]
 	lap_banner_time = 2.4
-	play_rate = 1.0 + LAP_SONG_STEP * float(lap - 1)   # la canción suena un poco más rápido
+	play_rate = base_rate * (1.0 + LAP_SONG_STEP * float(lap - 1))   # la canción suena un poco más rápido
 	player.pitch_scale = play_rate
 	# Velocidad real de caída = BASE * mult * lap_factor (como antes); aquí va por segundo de canción.
-	speed = BASE_SPEED * _effective_mult() * lap_factor / play_rate
+	speed = BASE_SPEED * _effective_mult() * lap_factor * base_rate / play_rate
 	_store_infinite_best()
 	ahead = hit_y / speed + 0.15
 	lead_in = maxf(0.0, hit_y / speed + 0.05 - first_note_time) if use_lead_in else 0.0
@@ -716,6 +764,7 @@ func _next_lap() -> void:
 		n.done = false; n.holding = false; n.released = false; n.input_id = -999
 	_assign_tap_heights()
 	first_idx = 0
+	dying.clear()
 	active_inputs.clear()
 	player.stop(); audio_started = false
 	song_time = -(lead_in + 0.6)
@@ -729,12 +778,13 @@ func _store_infinite_best() -> void:
 		return
 	var key := _song_key(current_song) + "|inf"
 	var old: Dictionary = bests.get(key, {})
-	var pen := roundi(score * _lives_mult(run_lives)) if run_lives > 0 else score
+	var pen := roundi(score * run_mult)
 	var nb := {
 		"stars": maxi(stars, int(old.get("stars", 0))),
 		"crowns": maxi(crowns, int(old.get("crowns", 0))),
 		"laps": maxi(lap, int(old.get("laps", 0))),
 		"score": maxi(pen, int(old.get("score", 0))),
+		"mods": _mods_text() if pen > int(old.get("score", 0)) else String(old.get("mods", "")),
 	}
 	if nb.stars > int(old.get("stars", 0)) or nb.crowns > int(old.get("crowns", 0)) or nb.laps > int(old.get("laps", 0)) or nb.score > int(old.get("score", 0)):
 		run_record = true
@@ -743,8 +793,6 @@ func _store_infinite_best() -> void:
 
 func _finish_infinite() -> void:
 	_store_infinite_best()
-	# Penalización por vidas extra (igual que en Vidas): 3 vidas sin penalización.
-	run_mult = _lives_mult(run_lives) if run_lives > 0 else 1.0
 	score = roundi(score * run_mult)
 
 func _star_poly(c: Vector2, r: float) -> PackedVector2Array:
@@ -844,20 +892,17 @@ func _pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
 	if screen == Screen.PREPARE or screen == Screen.RESULTS or screen == Screen.SETTINGS:
 		pos.y -= ui_off
 	if screen == Screen.PREPARE:
-		if Rect2(100, 1640, viewport_size.x - 200, 145).has_point(pos): _start_game()
+		var pw := viewport_size.x
+		if Rect2(100, 1060, pw - 200, 130).has_point(pos): _start_game()
 		elif Rect2(35, 45, 180, 95).has_point(pos): _stop_audio(); screen = Screen.LIBRARY
-		elif Rect2(viewport_size.x - 365, 45, 330, 95).has_point(pos): _toggle_preview()
-		elif Rect2(235, 45, viewport_size.x - 620, 95).has_point(pos): overlay = "addto"
-		elif Rect2(100, 800, 190, 110).has_point(pos): _adjust_diff(-1)
-		elif Rect2(viewport_size.x - 290, 800, 190, 110).has_point(pos): _adjust_diff(1)
-		elif Rect2(100, 950, 190, 120).has_point(pos): _adjust_speed(-SPEED_STEP)
-		elif Rect2(viewport_size.x - 290, 950, 190, 120).has_point(pos): _adjust_speed(SPEED_STEP)
-		elif Rect2(310, 950, viewport_size.x - 620, 120).has_point(pos): speed_auto = not speed_auto; _save_settings()
-		elif _mode_rect(0).has_point(pos): lives_mode = false; infinite_mode = false; _save_settings()
-		elif _mode_rect(1).has_point(pos): lives_mode = true; infinite_mode = false; _save_settings()
-		elif _mode_rect(2).has_point(pos): lives_mode = true; infinite_mode = true; _save_settings()
-		elif lives_mode and Rect2(130, 1340, 170, 100).has_point(pos): _adjust_lives(-1)
-		elif lives_mode and Rect2(viewport_size.x - 300, 1340, 170, 100).has_point(pos): _adjust_lives(1)
+		elif Rect2(235, 45, pw - 270, 95).has_point(pos): overlay = "addto"
+		elif Rect2(60, 175, 110, 110).has_point(pos): _toggle_preview()
+		elif Rect2(110, 1295, 150, 90).has_point(pos): _adjust_diff(-1)
+		elif Rect2(pw - 260, 1295, 150, 90).has_point(pos): _adjust_diff(1)
+		elif Rect2(110, 1400, 150, 90).has_point(pos): _adjust_speed(-SPEED_STEP)
+		elif Rect2(pw - 260, 1400, 150, 90).has_point(pos): _adjust_speed(SPEED_STEP)
+		elif Rect2(280, 1400, pw - 560, 90).has_point(pos): speed_auto = not speed_auto; _save_settings()
+		elif _prepare_mod_tap(pos): pass
 	elif screen == Screen.GAME:
 		if finished:
 			return
@@ -916,15 +961,23 @@ func _assign_tap_heights() -> void:
 		next_time[n.lane] = n.time
 
 func _start_game() -> void:
+	_stop_ambient()
 	_stop_audio()
 	screen = Screen.GAME
 	if not current_song.is_empty():
-		last_played = {"id": String(current_song.get("set_id", "demo")), "version": String(current_song.get("version", ""))}
+		var sfx_k := "_inf" if game_mode == 1 else ""
+		last_played["id" + sfx_k] = String(current_song.get("set_id", "demo"))
+		last_played["version" + sfx_k] = String(current_song.get("version", ""))
 		_save_settings()
-	infinite_run = infinite_mode and lives_mode
+	infinite_run = game_mode == 1
+	spectating = _mod_on("spectator")
+	base_rate = MOD_RATE if _mod_on("x2") else 1.0
+	win_mult = HARDCORE_WIN if _mod_on("hardcore") else 1.0
+	hp_rate = clampf(float(current_parsed.get("hp", 5.0)), 0.0, 10.0)
+	health = 1.0
 	lap = 1; lap_factor = 1.0; award_idx = 0; stars = 0; crowns = 0
 	banner_time = 0.0; lap_banner_time = 0.0; bg_blend = 0.0
-	play_rate = 1.0; player.pitch_scale = 1.0; run_record = false
+	play_rate = base_rate; player.pitch_scale = base_rate; run_record = false
 	speed = BASE_SPEED * _effective_mult()
 	ahead = hit_y / speed + 0.15
 	# Que la primera nota entre desde arriba justo al empezar.
@@ -944,16 +997,18 @@ func _start_game() -> void:
 	song_time = -lead_in; started = false; paused = false; finished = false
 	score = 0; combo = 0; max_combo = 0; hits = 0; misses = 0
 	perfects = 0; greats = 0; goods = 0; empties = 0
-	run_lives = lives_setting if lives_mode else 0
+	run_lives = lives_setting if game_mode == 1 else 0
 	lives_left = run_lives
 	life_menu = false; life_menu_lock = 0.0; resume_pending = false; resume_idxs = []; grace_time = 0.0
-	failed = false; fail_text = ""; run_mult = 1.0
+	failed = false; fail_text = ""; run_mult = _mods_mult()
 
 func _try_hit(lane: int, input_id: int) -> void:
 	if resume_pending:
 		_resume_with(lane, input_id)
 		return
 	if paused or finished:
+		return
+	if spectating and started and input_id > -300:
 		return
 	if not started:
 		for note in notes:
@@ -972,26 +1027,27 @@ func _try_hit(lane: int, input_id: int) -> void:
 		var note: Dictionary = notes[i]
 		if note.type != "start" and note.time - song_time > 0.6: break
 		if note.done or note.type == "start" or note.lane != lane: continue
-		var early: float = clampf(float(note.height) / speed, 0.2, 0.6)
+		var early: float = clampf(float(note.height) / speed, 0.2, 0.6) * win_mult
 		var signed_diff: float = song_time - note.time
-		if signed_diff < -early * play_rate or signed_diff > HIT_LATE * play_rate: continue
+		if signed_diff < -early * play_rate or signed_diff > HIT_LATE * win_mult * play_rate: continue
 		best_diff = abs(signed_diff); best = note
 		break  # la más antigua pendiente del carril
 	if best.is_empty():
 		combo = 0; empties += 1; _set_judgement("VACÍO", 0.4)
 		_mark(lane, input_id)
-		_lose_life()
+		_lose_life(0.05)
 		return
 	if best.type == "hold":
 		best.holding = true; best.input_id = input_id
 	else:
 		best.done = true
 		dying.append({"lane": lane, "time": float(best.time), "height": float(best.height), "t": 0.0})
-		var judgement := "PERFECT" if best_diff <= PERFECT_WINDOW * play_rate else ("GREAT" if best_diff <= GREAT_WINDOW * play_rate else "GOOD")
+		var judgement := "PERFECT" if best_diff <= PERFECT_WINDOW * win_mult * play_rate else ("GREAT" if best_diff <= GREAT_WINDOW * win_mult * play_rate else "GOOD")
 		var points := 100 if judgement == "PERFECT" else (75 if judgement == "GREAT" else 50)
 		_hit(lane, judgement, points, hit_y)
 
 func _hit(lane: int, text: String, points: int, effect_y: float) -> void:
+	_health_gain(text)
 	hits += 1; combo += 1; max_combo = max(max_combo, combo); score += points + min(combo, 50)
 	_set_judgement(text, 0.55); combo_pop = 0.18
 	match text:
@@ -1012,14 +1068,27 @@ func _judgement_color(text: String) -> Color:
 
 func _miss(lane: int, effect_y: float) -> void:
 	misses += 1; combo = 0; _set_judgement("MISS", 0.6)
-	_lose_life()
+	_lose_life(0.10)
 
 # --- Modo Vidas ----------------------------------------------------------
 
 ## Cada fallo (nota que se va, hold soltado, toque en vacío) cuesta una vida.
 ## Con vidas restantes: pausa y menú (rendirse / continuar). Sin vidas: fin de la partida.
-func _lose_life() -> void:
-	if run_lives <= 0 or finished or life_menu or grace_time > 0.0:
+func _lose_life(amount := 0.08) -> void:
+	if finished or life_menu or grace_time > 0.0 or spectating:
+		return
+	if _mod_on("perfect"):
+		_game_over("FALLASTE")
+		return
+	if game_mode == 0:
+		# Estándar: cada fallo resta vida (más con un HP alto); a 0 se pierde, salvo Sin fallo.
+		health -= amount * (0.7 + 0.06 * hp_rate)
+		if health <= 0.0:
+			health = 0.0
+			if not _mod_on("nofail"):
+				_game_over("SIN VIDA")
+		return
+	if run_lives <= 0:
 		return
 	# Con N vidas se pueden fallar N veces y seguir; el fallo N+1 (con 0 vidas) termina.
 	if lives_left <= 0:
@@ -1103,6 +1172,47 @@ func _resume_with(lane: int, input_id: int) -> void:
 	if audio_stream != null and audio_started:
 		player.seek(maxf(0.0, song_time))
 
+func _mod_on(id: String) -> bool:
+	match id:
+		"x2": return mod_x2
+		"nofail": return game_mode == 0 and mod_nofail
+		"perfect": return mod_perfect
+		"spectator": return game_mode == 0 and mod_spectator
+		"hardcore": return mod_hardcore
+	return false
+
+## Multiplicador de puntos de todos los modificadores activos.
+func _mods_mult() -> float:
+	var m := 1.0
+	if _mod_on("x2"): m *= 1.3
+	if _mod_on("hardcore"): m *= 1.15
+	if _mod_on("nofail"): m *= 0.5
+	if _mod_on("perfect"): m *= 1.1
+	m *= float(DIFF_MULT[diff_level])
+	if game_mode == 1:
+		m *= _lives_mult(lives_setting)
+	return m
+
+func _mods_text() -> String:
+	var parts: Array = []
+	if _mod_on("x2"): parts.append("x2")
+	if _mod_on("nofail"): parts.append(T("Sin fallo"))
+	if _mod_on("perfect"): parts.append("Perfect")
+	if _mod_on("spectator"): parts.append(T("Espectador"))
+	if _mod_on("hardcore"): parts.append("Hardcore")
+	if diff_level != 1: parts.append(T(String(DIFFICULTY_LEVELS[diff_level].name)))
+	if game_mode == 1: parts.append(T("%d vidas") % lives_setting)
+	return " · ".join(parts)
+
+func _health_gain(text: String) -> void:
+	if game_mode != 0:
+		return
+	match text:
+		"PERFECT": health += 0.030
+		"GREAT": health += 0.022
+		"GOOD": health += 0.012
+	health = minf(1.0, health)
+
 ## Puntos x1.00 con 3 vidas; cada vida extra resta ~7,1 % hasta x0.50 con 10.
 func _lives_mult(n: int) -> float:
 	return 1.0 - float(n - LIVES_MIN) * 0.5 / float(LIVES_MAX - LIVES_MIN)
@@ -1111,9 +1221,51 @@ func _adjust_lives(delta: int) -> void:
 	lives_setting = clampi(lives_setting + delta, LIVES_MIN, LIVES_MAX)
 	_save_settings()
 
-func _mode_rect(i: int) -> Rect2:
-	var bw := (viewport_size.x - 240.0 - 32.0) / 3.0
-	return Rect2(110.0 + i * (bw + 16.0), 1190, bw, 120)
+func _mod_ids() -> Array:
+	if game_mode == 0:
+		return ["x2", "nofail", "perfect", "spectator", "hardcore"]
+	return ["x2", "perfect", "hardcore"]
+
+func _mod_label(id: String) -> String:
+	match id:
+		"x2": return "Velocidad x2"
+		"nofail": return "Sin fallo"
+		"perfect": return "Perfect"
+		"spectator": return "Espectador"
+		"hardcore": return "Hardcore"
+	return id
+
+func _mod_rect(i: int) -> Rect2:
+	var cw2 := (viewport_size.x - 240.0 - 16.0) / 2.0
+	return Rect2(110.0 + (i % 2) * (cw2 + 16.0), 1520.0 + floorf(i / 2.0) * 100.0, cw2, 90.0)
+
+func _toggle_mod(id: String) -> void:
+	match id:
+		"x2": mod_x2 = not mod_x2
+		"nofail":
+			mod_nofail = not mod_nofail
+			if mod_nofail: mod_perfect = false
+		"perfect":
+			mod_perfect = not mod_perfect
+			if mod_perfect: mod_nofail = false
+		"spectator": mod_spectator = not mod_spectator
+		"hardcore": mod_hardcore = not mod_hardcore
+	_save_settings()
+
+func _prepare_mod_tap(pos: Vector2) -> bool:
+	var ids := _mod_ids()
+	for i in ids.size():
+		if _mod_rect(i).has_point(pos):
+			_toggle_mod(String(ids[i]))
+			return true
+	if game_mode == 1:
+		if Rect2(130, 1720, 170, 90).has_point(pos):
+			_adjust_lives(-1)
+			return true
+		if Rect2(viewport_size.x - 300, 1720, 170, 90).has_point(pos):
+			_adjust_lives(1)
+			return true
+	return false
 
 ## Vidas como barras horizontales gruesas (las restantes encendidas, de izquierda a derecha).
 func _draw_lives_bars(x: float, y: float, bar_w: float, bar_h: float, gap: float) -> void:
@@ -1340,9 +1492,7 @@ func _set_library_dir(path: String) -> void:
 		_show_status(T("Android no deja usar esa carpeta. Se usa la de por defecto: %s") % library_dir, true, 8.0)
 		return
 	library_dir = path
-	progress_merged = false
-	_merge_progress_file()
-	progress_merged = true
+	_migrate_legacy_progress()
 	_save_settings()
 	_apply_filter()
 	_show_status(T("Carpeta de canciones: %s") % path, false)
@@ -1377,23 +1527,15 @@ func _backup_copy(src: String, backup_dir: String, id: String, name: String) -> 
 func _progress_path() -> String:
 	return library_dir.path_join(PROGRESS_FILE) if library_dir != "" else ""
 
-## Copia de los récords, listas y favoritas en la carpeta de canciones (junto a
-## "Por importar" e "Importadas"), para recuperarlos al reinstalar la app.
-func _save_progress_file() -> void:
+## Los récords, listas y favoritas ya solo se guardan dentro de la app (settings.cfg).
+## Si queda un progreso.cfg de versiones anteriores, se importa UNA vez y se renombra.
+func _migrate_legacy_progress() -> void:
 	var path := _progress_path()
-	if path == "" or not DirAccess.dir_exists_absolute(library_dir):
+	if path == "" or not FileAccess.file_exists(path):
 		return
-	if not progress_merged:
-		progress_merged = true
-		_merge_progress_file()   # antes de escribir, une lo que ya había en el archivo
-	var cfg := ConfigFile.new()
-	for key in bests:
-		cfg.set_value("best", key, bests[key])
-	cfg.set_value("library", "playlists", playlists)
-	cfg.set_value("library", "favorites", favorites.keys())
-	cfg.set_value("library", "last_id", String(last_played.get("id", "")))
-	cfg.set_value("library", "last_version", String(last_played.get("version", "")))
-	cfg.save(path)
+	if _merge_progress_file():
+		_save_settings()
+	DirAccess.rename_absolute(path, path.get_base_dir().path_join("progreso_antiguo.cfg"))
 
 ## Une lo que haya en progreso.cfg con lo actual (nunca baja un récord). true si cambió algo.
 func _merge_progress_file() -> bool:
@@ -1448,7 +1590,12 @@ func _merge_progress_file() -> bool:
 				favorites[String(fid)] = true
 				changed = true
 	if String(last_played.get("id", "")) == "" and String(cfg.get_value("library", "last_id", "")) != "":
-		last_played = {"id": String(cfg.get_value("library", "last_id", "")), "version": String(cfg.get_value("library", "last_version", ""))}
+		last_played["id"] = String(cfg.get_value("library", "last_id", ""))
+		last_played["version"] = String(cfg.get_value("library", "last_version", ""))
+		changed = true
+	if String(last_played.get("id_inf", "")) == "" and String(cfg.get_value("library", "last_id_inf", "")) != "":
+		last_played["id_inf"] = String(cfg.get_value("library", "last_id_inf", ""))
+		last_played["version_inf"] = String(cfg.get_value("library", "last_version_inf", ""))
 		changed = true
 	return changed
 
@@ -1550,9 +1697,8 @@ func _sync_folder() -> void:
 		return
 	var inbox := library_dir.path_join(INBOX_NAME)
 	var backup := library_dir.path_join(BACKUP_NAME)
-	progress_merged = true
-	if _merge_progress_file():   # tras reinstalar: recupera récords, listas y favoritas
-		_apply_filter()
+	_migrate_legacy_progress()
+	_apply_filter()
 	_save_settings()
 	var backup_files := _osz_files(backup)
 	var inbox_files := _osz_files(inbox)
@@ -1621,7 +1767,86 @@ func _nav_rect(i: int) -> Rect2:
 func _nav_active() -> int:
 	return 3 if screen == Screen.SETTINGS or screen == Screen.PALETTE else tab
 
+func _mode_btn_center() -> Vector2:
+	return Vector2(viewport_size.x / 2.0, _nav_curve_y(viewport_size.x / 2.0) + 58.0)
+
+func _mode_btn_rect() -> Rect2:
+	var c := _mode_btn_center()
+	return Rect2(c.x - 62, c.y - 62, 124, 124)
+
+func _mode_opt_rect(i: int) -> Rect2:
+	var c := _mode_btn_center()
+	return Rect2(viewport_size.x / 2.0 - 230.0, c.y - 200.0 - i * 135.0, 460, 112)
+
+func _set_game_mode(i: int) -> void:
+	if game_mode == i:
+		return
+	game_mode = i
+	home_dirty = true
+	_save_settings()
+
+func _draw_mode_icon(m: int, c: Vector2, s: float, col: Color) -> void:
+	if m == 0:
+		draw_rect(Rect2(c.x - s, c.y - s * 0.25, s * 0.55, s * 1.15), col)
+		draw_rect(Rect2(c.x - s * 0.275, c.y - s * 0.95, s * 0.55, s * 1.85), col)
+		draw_rect(Rect2(c.x + s * 0.45, c.y - s * 0.55, s * 0.55, s * 1.45), col)
+	else:
+		var pts := PackedVector2Array()
+		for k in 41:
+			var t := TAU * k / 40.0
+			var d := 1.0 + sin(t) * sin(t)
+			pts.append(c + Vector2(s * 1.35 * cos(t) / d, s * 1.35 * sin(t) * cos(t) / d))
+		draw_polyline(pts, col, s * 0.34, true)
+
+func _draw_mode_button() -> void:
+	var c := _mode_btn_center()
+	var col := pcol("accent") if game_mode == 0 else pcol("violet")
+	draw_circle(c + Vector2(0, 5), 52.0, Color(0, 0, 0, 0.25))
+	draw_circle(c, 52.0, col)
+	draw_arc(c, 47.0, PI * 1.12, PI * 1.88, 16, Color(1, 1, 1, 0.35), 5.0)
+	draw_arc(c, 55.0, 0.0, TAU, 40, Color.WHITE, 5.0)
+	_draw_mode_icon(game_mode, c, 20.0, Color.WHITE)
+	_text_centered("Estándar" if game_mode == 0 else "Tiles", c.x, c.y + 38.0 + 30.0 + 22.0, 28, Color.WHITE)
+
+func _draw_mode_menu() -> void:
+	draw_rect(Rect2(0, 0, viewport_size.x, _nav_curve_y(viewport_size.x / 2.0)), Color(0, 0, 0, 0.55))
+	for i in 2:
+		var r := _mode_opt_rect(i)
+		var col := pcol("accent") if i == 0 else pcol("violet")
+		if i != game_mode:
+			col = col.darkened(0.35)
+		_panel(r, col, 56)
+		if i == game_mode:
+			draw_style_box(_outline_box(56), r)
+		_draw_mode_icon(i, Vector2(r.position.x + 70, r.get_center().y), 22.0, Color.WHITE)
+		_text("Estándar" if i == 0 else "Tiles", Vector2(r.position.x + 130, r.get_center().y + 13), 40, Color.WHITE)
+
+func _outline_box(radius: float) -> StyleBoxFlat:
+	var b := StyleBoxFlat.new()
+	b.bg_color = Color(0, 0, 0, 0)
+	b.draw_center = false
+	b.border_width_left = 5
+	b.border_width_right = 5
+	b.border_width_top = 5
+	b.border_width_bottom = 5
+	b.border_color = Color.WHITE
+	b.corner_radius_top_left = int(radius)
+	b.corner_radius_top_right = int(radius)
+	b.corner_radius_bottom_left = int(radius)
+	b.corner_radius_bottom_right = int(radius)
+	return b
+
 func _nav_tap(pos: Vector2) -> bool:
+	if mode_menu:
+		mode_menu = false
+		for i in 2:
+			if _mode_opt_rect(i).has_point(pos):
+				_set_game_mode(i)
+				return true
+		return true
+	if _mode_btn_rect().has_point(pos):
+		mode_menu = true
+		return true
 	for i in 4:
 		if _nav_rect(i).has_point(pos):
 			_go_tab(i)
@@ -1629,6 +1854,7 @@ func _nav_tap(pos: Vector2) -> bool:
 	return false
 
 func _go_tab(i: int) -> void:
+	mode_menu = false
 	open_group = {}
 	sel_mode = false
 	sel_ids = {}
@@ -1696,6 +1922,9 @@ func _draw_nav() -> void:
 			draw_arc(cc, rad + 3.0, 0.0, TAU, 40, Color.WHITE, 5.0)
 		_draw_nav_icon(i, cc, 18.0 if on else 16.0, base.lerp(Color.WHITE, 0.85))
 		_text_centered(labels[i], cx, ytop + 58.0 + 38.0 + 30.0, 28, Color.WHITE if on else pcol("muted").lerp(Color.WHITE, 0.25))
+	_draw_mode_button()
+	if mode_menu:
+		_draw_mode_menu()
 
 # --- Listas de reproducción -------------------------------------------------
 
@@ -1766,9 +1995,6 @@ func _remove_dir_recursive(path: String) -> void:
 ## Borra canciones con todas sus dificultades: la carpeta extraída, su copia en Importadas
 ## (si no, "Recargar" la restauraría), sus récords, favoritas y apariciones en listas.
 func _delete_songs(ids: Array) -> void:
-	if library_dir != "" and not progress_merged:
-		progress_merged = true
-		_merge_progress_file()   # antes de borrar, para que el archivo de progreso no reviva récords
 	var count := 0
 	for raw in ids:
 		var sid := String(raw)
@@ -1798,7 +2024,11 @@ func _delete_songs(ids: Array) -> void:
 					kept.append(r)
 			pl.refs = kept
 		if String(last_played.get("id", "")) == sid:
-			last_played = {}
+			last_played["id"] = ""
+			last_played["version"] = ""
+		if String(last_played.get("id_inf", "")) == sid:
+			last_played["id_inf"] = ""
+			last_played["version_inf"] = ""
 	_exit_select()
 	overlay = ""
 	_refresh_library()
@@ -2209,7 +2439,7 @@ func _rebuild_home() -> void:
 		var sid := k.get_slice("|", 0)
 		var ver := k.substr(sid.length() + 1)
 		var e := _find_entry(sid, ver)
-		if e.is_empty():
+		if e.is_empty() or inf != (game_mode == 1):
 			continue
 		var b: Dictionary = bests[key]
 		home_records.append({"entry": e, "level": clampi(lvl, 0, DIFFICULTY_LEVELS.size() - 1), "inf": inf, "b": b})
@@ -2223,11 +2453,15 @@ func _home_row_count() -> int:
 	var avail := viewport_size.y - NAV_H - top_inset - HOME_ROWS_Y - 10.0
 	return clampi(int(avail / HOME_ROW_STEP), 1, 8)
 
+func _last_entry() -> Dictionary:
+	var k := "_inf" if game_mode == 1 else ""
+	return _find_entry(String(last_played.get("id" + k, "")), String(last_played.get("version" + k, "")))
+
 func _home_tap(pos: Vector2) -> void:
 	pos.y -= top_inset
 	var x := 55.0
 	var cw := viewport_size.x - 110.0
-	var le := _find_entry(String(last_played.get("id", "")), String(last_played.get("version", "")))
+	var le := _last_entry()
 	if not le.is_empty() and (Rect2(0, -top_inset, viewport_size.x, 620.0 + top_inset).has_point(pos) or Rect2(viewport_size.x / 2.0 - 220.0, 770, 440, 100).has_point(pos)):
 		_select_song(le)
 		return
@@ -2235,10 +2469,6 @@ func _home_tap(pos: Vector2) -> void:
 	for i in n:
 		if Rect2(x, HOME_ROWS_Y + i * HOME_ROW_STEP, cw, HOME_ROW_H).has_point(pos):
 			var rec: Dictionary = home_records[i]
-			diff_level = int(rec.level)
-			if rec.inf:
-				lives_mode = true
-				infinite_mode = true
 			_select_song(rec.entry)
 			return
 
@@ -2251,7 +2481,7 @@ func _draw_home() -> void:
 	var muted := pcol("muted")
 	var ink := pcol("ink")
 	var navy := pcol("bg")
-	var le := _find_entry(String(last_played.get("id", "")), String(last_played.get("version", "")))
+	var le := _last_entry()
 	var hero_h := 620.0 + top_inset
 	# Imagen de la última canción (horizontal) ocupando la parte de arriba.
 	if le.is_empty():
@@ -2294,7 +2524,7 @@ func _draw_home() -> void:
 		_text_centered("Jugar", w / 2, 840, 54, Color.WHITE)
 	_text("Tus mejores récords", Vector2(55, 945), 32, muted)
 	if home_records.is_empty():
-		_text(_fit("Juega en modo Vidas o Infinito para guardar récords.", cw, 28), Vector2(55, HOME_ROWS_Y + 55), 28, muted)
+		_text(_fit("Juega una canción para guardar tu récord en este modo.", cw, 28), Vector2(55, HOME_ROWS_Y + 55), 28, muted)
 	var n := mini(_home_row_count(), home_records.size())
 	for i in n:
 		var rec: Dictionary = home_records[i]
@@ -2558,6 +2788,7 @@ func _adjust_diff(delta: int) -> void:
 	_save_settings()
 
 func _select_song(entry: Dictionary) -> void:
+	_stop_ambient()
 	_stop_audio()
 	var new_chart: Array = []
 	var stream: AudioStream = null
@@ -2602,6 +2833,10 @@ func _select_song(entry: Dictionary) -> void:
 	_reload_bg()
 	song_stats = {"notes": note_count, "holds": hold_count, "duration": duration, "dropped": dropped, "total": total}
 	screen = Screen.PREPARE
+	var pbg := String(entry.get("bg_path", ""))
+	prep_tex = OsuImporter.load_image(pbg, 1280) if pbg != "" else null
+	_stop_ambient()
+	_ambient_play(audio_stream, true)
 
 # --- Velocidad y ajustes -------------------------------------------------
 
@@ -2619,8 +2854,12 @@ func _load_settings() -> void:
 		return
 	speed_auto = cfg.get_value("speed", "auto", false)
 	speed_mult = clampf(float(cfg.get_value("speed", "mult", 3.0)), SPEED_MIN, SPEED_MAX)
-	lives_mode = bool(cfg.get_value("mods", "lives_mode", false))
-	infinite_mode = bool(cfg.get_value("mods", "infinite", false))
+	game_mode = clampi(int(cfg.get_value("mods", "game_mode", 1 if bool(cfg.get_value("mods", "infinite", false)) else 0)), 0, 1)
+	mod_x2 = bool(cfg.get_value("mods", "x2", false))
+	mod_nofail = bool(cfg.get_value("mods", "nofail", false))
+	mod_perfect = bool(cfg.get_value("mods", "perfect", false))
+	mod_spectator = bool(cfg.get_value("mods", "spectator", false))
+	mod_hardcore = bool(cfg.get_value("mods", "hardcore", false))
 	diff_level = clampi(int(cfg.get_value("mods", "diff", 1)), 0, DIFFICULTY_LEVELS.size() - 1)
 	library_dir = String(cfg.get_value("library", "dir", ""))
 	lives_setting = clampi(int(cfg.get_value("mods", "lives", 3)), LIVES_MIN, LIVES_MAX)
@@ -2631,7 +2870,10 @@ func _load_settings() -> void:
 		for fid in fav_list:
 			favorites[String(fid)] = true
 	sort_mode = clampi(int(cfg.get_value("library", "sort", 0)), 0, SORT_MODES.size() - 1)
-	last_played = {"id": String(cfg.get_value("library", "last_id", "")), "version": String(cfg.get_value("library", "last_version", ""))}
+	last_played = {
+		"id": String(cfg.get_value("library", "last_id", "")), "version": String(cfg.get_value("library", "last_version", "")),
+		"id_inf": String(cfg.get_value("library", "last_id_inf", "")), "version_inf": String(cfg.get_value("library", "last_version_inf", "")),
+	}
 	var pl = cfg.get_value("library", "playlists", [])
 	if pl is Array:
 		for p in pl:
@@ -2657,8 +2899,12 @@ func _save_settings() -> void:
 	var cfg := ConfigFile.new()
 	cfg.set_value("speed", "auto", speed_auto)
 	cfg.set_value("speed", "mult", speed_mult)
-	cfg.set_value("mods", "lives_mode", lives_mode)
-	cfg.set_value("mods", "infinite", infinite_mode)
+	cfg.set_value("mods", "game_mode", game_mode)
+	cfg.set_value("mods", "x2", mod_x2)
+	cfg.set_value("mods", "nofail", mod_nofail)
+	cfg.set_value("mods", "perfect", mod_perfect)
+	cfg.set_value("mods", "spectator", mod_spectator)
+	cfg.set_value("mods", "hardcore", mod_hardcore)
 	cfg.set_value("mods", "diff", diff_level)
 	cfg.set_value("library", "dir", library_dir)
 	cfg.set_value("mods", "lives", lives_setting)
@@ -2668,6 +2914,8 @@ func _save_settings() -> void:
 	cfg.set_value("library", "sort", sort_mode)
 	cfg.set_value("library", "last_id", String(last_played.get("id", "")))
 	cfg.set_value("library", "last_version", String(last_played.get("version", "")))
+	cfg.set_value("library", "last_id_inf", String(last_played.get("id_inf", "")))
+	cfg.set_value("library", "last_version_inf", String(last_played.get("version_inf", "")))
 	cfg.set_value("library", "playlists", playlists)
 	cfg.set_value("display", "show_bg", show_bg)
 	cfg.set_value("display", "lang", lang)
@@ -2677,7 +2925,6 @@ func _save_settings() -> void:
 	for key in bests:
 		cfg.set_value("best", key, bests[key])
 	cfg.save(SETTINGS_PATH)
-	_save_progress_file()
 
 # --- Puntaje y rangos ----------------------------------------------------
 
@@ -2692,8 +2939,6 @@ func _adjust_bg(delta: float) -> void:
 
 func _song_key(entry: Dictionary) -> String:
 	var key := "%s|%s" % [entry.get("set_id", "demo"), entry.get("version", "")]
-	if not entry.get("demo", false) and diff_level != 1:
-		key += "|d%d" % diff_level   # cada nivel de dificultad de notas tiene sus propios récords
 	return key
 
 ## Precisión 0..100: Perfect 100 %, Great 80 %, Good 50 %, cada VACÍO resta 25 % de una nota.
@@ -2716,17 +2961,15 @@ func _finish_run() -> void:
 		return
 	run_accuracy = _accuracy()
 	run_rank = _rank_for(run_accuracy, misses + empties)
-	run_mult = _lives_mult(run_lives) if run_lives > 0 else 1.0
-	if run_lives > 0:
-		score = roundi(score * run_mult)
-	if failed or run_lives <= 0:   # solo el modo Vidas guarda récords
+	score = roundi(score * run_mult)
+	if failed or spectating:   # las partidas perdidas y las del espectador no guardan récord
 		run_record = false
 		return
 	var key := _song_key(current_song)
 	var old: Dictionary = bests.get(key, {})
 	run_record = score > int(old.get("score", 0))
 	if run_record or old.is_empty():
-		bests[key] = {"score": score, "rank": maxi(run_rank, int(old.get("rank", 0))), "acc": run_accuracy}
+		bests[key] = {"score": score, "rank": maxi(run_rank, int(old.get("rank", 0))), "acc": run_accuracy, "pf": perfects, "gr": greats, "gd": goods, "ms": misses + empties, "mods": _mods_text()}
 	elif run_rank > int(old.get("rank", 0)):
 		old["rank"] = run_rank
 		bests[key] = old
@@ -2751,6 +2994,77 @@ func _set_paused(value: bool) -> void:
 		player.volume_db = -18.0
 		fade_tween = create_tween()
 		fade_tween.tween_property(player, "volume_db", 0.0, 0.15)
+
+# --- Música de fondo ------------------------------------------------------
+# Al abrir la app suena, baja y apagada (filtro de graves), tu última canción jugada.
+# Se detiene al elegir una canción o empezar una partida.
+
+func _setup_ambient() -> void:
+	if AudioServer.get_bus_index("Ambient") < 0:
+		AudioServer.add_bus()
+		var bi := AudioServer.bus_count - 1
+		AudioServer.set_bus_name(bi, "Ambient")
+		AudioServer.set_bus_send(bi, "Master")
+		var lp := AudioEffectLowPassFilter.new()
+		lp.cutoff_hz = 1800.0
+		AudioServer.add_bus_effect(bi, lp)
+	amb_player = AudioStreamPlayer.new()
+	amb_player.bus = "Ambient"
+	amb_player.volume_db = -60.0
+	amb_player.finished.connect(_ambient_loop)
+	add_child(amb_player)
+
+func _ambient_entry() -> Dictionary:
+	var e := _last_entry()
+	if e.is_empty() or not e.has("audio_path"):
+		e = {}
+		for k in ["", "_inf"]:
+			var cand := _find_entry(String(last_played.get("id" + k, "")), String(last_played.get("version" + k, "")))
+			if not cand.is_empty() and cand.has("audio_path"):
+				e = cand
+				break
+	return e
+
+func _start_ambient() -> void:
+	var e := _ambient_entry()
+	if e.is_empty():
+		return
+	var stream: AudioStream = OsuImporter.load_audio(String(e.audio_path))
+	if stream == null:
+		return
+	_ambient_play(stream, false)
+
+## Suena suave y tapada: fundido de entrada y filtro de graves (canal "Ambient").
+func _ambient_play(stream: AudioStream, from_song: bool) -> void:
+	if stream == null or amb_player == null:
+		return
+	amb_player.stream = stream
+	amb_on = true
+	amb_song = from_song
+	amb_player.volume_db = -60.0
+	var start := 0.0
+	if stream.get_length() > 20.0:
+		start = stream.get_length() * 0.25
+	amb_player.play(start)
+	if amb_tween != null and amb_tween.is_valid():
+		amb_tween.kill()
+	amb_tween = create_tween()
+	amb_tween.tween_property(amb_player, "volume_db", -17.0, 2.5)
+
+func _ambient_loop() -> void:
+	if amb_on:
+		amb_player.play(0.0)
+
+func _stop_ambient() -> void:
+	if not amb_on:
+		return
+	amb_on = false
+	amb_song = false
+	if amb_tween != null and amb_tween.is_valid():
+		amb_tween.kill()
+	amb_tween = create_tween()
+	amb_tween.tween_property(amb_player, "volume_db", -60.0, 0.4)
+	amb_tween.tween_callback(amb_player.stop)
 
 func _kill_fade() -> void:
 	if fade_tween != null and fade_tween.is_valid():
@@ -2852,14 +3166,20 @@ func _gen_life() -> AudioStreamWAV:
 func _toggle_preview() -> void:
 	if previewing:
 		_stop_audio()
+		_ambient_play(audio_stream, true)   # vuelve el sonido suave y tapado de fondo
 		return
 	if audio_stream == null:
 		return
+	_stop_ambient()
 	player.stream = audio_stream
 	player.pitch_scale = 1.0
 	player.stream_paused = false
-	player.play()
+	player.volume_db = -40.0
+	player.play()   # desde el principio, sin filtro, con entrada suave
 	previewing = true
+	_kill_fade()
+	fade_tween = create_tween()
+	fade_tween.tween_property(player, "volume_db", 0.0, 0.8)
 
 func _go_library() -> void:
 	if infinite_run and screen == Screen.GAME and not finished:
@@ -2933,7 +3253,7 @@ func _draw_game() -> void:
 			var hb: float = hit_y - (float(d.time) - song_time) * speed
 			var hr := Rect2(int(d.lane) * lane_w + 2, hb - float(d.height), lane_w - 4, float(d.height))
 			var hf := pcol("hold").lerp(pcol("nav_home"), 0.35).lerp(Color.WHITE, 0.35)
-			draw_rect(hr, acol(hf, 1.0 - p))
+			draw_rect(hr, acol(hf.darkened(0.3), 0.38))
 			continue
 		var dbottom: float = hit_y - (float(d.time) - song_time) * speed
 		var dr := Rect2(int(d.lane) * lane_w + 2, dbottom - float(d.height), lane_w - 4, float(d.height))
@@ -2972,6 +3292,15 @@ func _draw_game() -> void:
 		_text_outlined(str(combo), viewport_size.x / 2, 200 + top_inset, csize, ccol, Color(0.04, 0.16, 0.32, 0.95), 16)
 		_text_outlined("COMBO", viewport_size.x / 2, 255 + top_inset, 30, Color.WHITE, Color(0.04, 0.16, 0.32, 0.95), 8)
 	_button(Rect2(viewport_size.x-145,35+top_inset,110,100), "II", Color(0.06,0.12,0.2,0.72))
+	if game_mode == 0 and not spectating:
+		var hb := Rect2(55, 62 + top_inset, viewport_size.x - 55 - 190, 24)
+		draw_rect(hb.grow(4.0), Color(0.04, 0.16, 0.32, 0.9))
+		var hcol := Color(1.0, 0.3, 0.3).lerp(Color(0.35, 0.95, 0.6), clampf(health * 1.4, 0.0, 1.0))
+		if _mod_on("nofail"):
+			hcol = Color(0.55, 0.65, 0.8)
+		draw_rect(Rect2(hb.position, Vector2(hb.size.x * clampf(health, 0.0, 1.0), hb.size.y)), hcol)
+	if spectating:
+		_text_centered("ESPECTADOR", viewport_size.x / 2.0, 90 + top_inset, 30, Color(1, 1, 1, 0.7))
 	if run_lives == LIVES_MIN:
 		_draw_lives_bars(55, 60 + top_inset, 64, 16, 12)
 	elif run_lives > LIVES_MIN:
@@ -3129,91 +3458,105 @@ func _draw_difficulty_picker() -> void:
 		_text(_fit(e.version, r.size.x - 180.0, 34), Vector2(r.position.x + 155, r.get_center().y + 12), 34, pcol("ink"))
 
 func _draw_prepare() -> void:
-	_background(); draw_set_transform(Vector2(0, ui_off)); _button(Rect2(35,45,180,95),"< Volver",pcol("button"))
+	_background(); draw_set_transform(Vector2(0, ui_off))
 	var w := viewport_size.x
-	var muted := pcol("muted")
-	var prev_col := pcol("danger") if previewing else pcol("accent")
-	if audio_stream == null:
-		prev_col = acol(pcol("button"), 0.4)
-	_button(Rect2(w - 365, 45, 330, 95), "Detener" if previewing else "Escuchar", prev_col)
-	_button(Rect2(235, 45, w - 620, 95), "+ A lista", pcol("violet"))
-	var text_w := w - 160
-	_text(_fit(current_song.title, text_w, 58), Vector2(80,370), 58, Color.WHITE)
-	_text(_fit("%s · %s" % [T(current_song.artist), current_song.version], text_w, 32), Vector2(82,445), 32, pcol("muted"))
-	_panel(Rect2(80,560,w-160,200),acol(pcol("panel"), 0.92),34)
-	_text(T("%d notas · %d sostenidas") % [song_stats.notes, song_stats.holds], Vector2(140,645), 38, Color.WHITE)
-	_text("%s · %s" % [_format_time(song_stats.duration), T("Con audio") if audio_stream != null else T("Sin audio")], Vector2(140,715), 38, Color.WHITE if audio_stream != null else Color(1,0.6,0.6))
-	# Dificultad de notas
-	var cx := w / 2
-	var lvl: Dictionary = DIFFICULTY_LEVELS[diff_level]
-	var demo_song: bool = current_parsed.is_empty()
-	_button(Rect2(100,800,190,110),"-",acol(pcol("button"), 0.4 if demo_song else 1.0))
-	_button(Rect2(w-290,800,190,110),"+",acol(pcol("button"), 0.4 if demo_song else 1.0))
-	_text_centered("Dificultad de notas", cx, 842, 28, muted)
-	_text_centered("—" if demo_song else String(lvl.name), cx, 902, 52, Color(1, 1, 1, 0.4) if demo_song else lvl.color)
-	# Velocidad
-	_button(Rect2(100,950,190,120),"-",pcol("button"))
-	_button(Rect2(w-290,950,190,120),"+",pcol("button"))
-	_text_centered("Velocidad · AUTO" if speed_auto else "Velocidad · MANUAL (toca: auto)", cx, 992, 28, muted)
-	_text_centered("x%.1f" % _effective_mult(), cx, 1052, 56, pcol("accent").lightened(0.3) if speed_auto else Color.WHITE)
-	# Modificadores
-	_panel(Rect2(80,1110,w-160,470),acol(pcol("panel"), 0.92),34)
-	_text("MODO", Vector2(130,1165), 28, muted)
-	_button(_mode_rect(0), "CASUAL", pcol("accent") if not lives_mode else pcol("button"))
-	_button(_mode_rect(1), "VIDAS", pcol("danger") if lives_mode and not infinite_mode else pcol("button"))
-	_button(_mode_rect(2), "INFINITO", pcol("violet") if infinite_mode else pcol("button"))
-	if lives_mode:
-		_button(Rect2(130,1340,170,100), "-", pcol("button"))
-		_button(Rect2(w-300,1340,170,100), "+", pcol("button"))
-		_text_centered(T("%d vidas") % lives_setting, cx, 1405, 48, Color.WHITE)
-		var m := _lives_mult(lives_setting)
-		var pen_text := "Sin penalización de puntos" if lives_setting == LIVES_MIN else T("Puntos x%.2f (-%d %%)") % [m, roundi((1.0 - m) * 100.0)]
-		var pen_col := _ok() if lives_setting == LIVES_MIN else Color(1.0, 0.75, 0.4)
-		if infinite_mode:
-			_text_centered("3 estrellas en la vuelta 1 y 3 coronas en las vueltas 2 y 3", cx, 1470, 24, pcol("gold"))
-			_text_centered("Cada vuelta acelera notas y canción: x1.0, x1.5, x2.0...", cx, 1500, 24, pcol("gold"))
-			_text_centered(pen_text, cx, 1532, 26, pen_col)
-			_text_centered(T("Puedes fallar %d veces y seguir; el siguiente fallo termina.") % lives_setting, cx, 1560, 22, muted)
-		else:
-			_text_centered(pen_text, cx, 1490, 28, pen_col)
-			_text_centered(T("Puedes fallar %d veces y seguir; el siguiente fallo termina.") % lives_setting, cx, 1545, 24, muted)
-	else:
-		_text_centered("Sin límite de fallos", cx, 1405, 40, Color.WHITE)
-		_text_centered("Juega tranquilo: fallar solo rompe el combo. No se guarda.", cx, 1465, 28, muted)
-	_draw_prepare_record(cx)
-	_button(Rect2(100,1640,w-200,145),"JUGAR",pcol("accent"))
-
-## Mejor récord de esta canción para el modo elegido (Casual no guarda).
-func _draw_prepare_record(cx: float) -> void:
-	if not lives_mode:
-		return
-	var key := _song_key(current_song)
+	var cx := w / 2.0
 	var muted := pcol("muted")
 	var gold := pcol("gold")
-	if infinite_mode:
-		var b: Dictionary = bests.get(key + "|inf", {})
-		if b.is_empty():
-			_text_centered("Récord: sin récord todavía", cx, 1620, 28, muted)
-			return
-		var n_st := mini(int(b.get("stars", 0)), 3)
-		var n_cr := mini(int(b.get("crowns", 0)), 3)
-		var label := T("Vuelta %d · %d pts") % [int(b.get("laps", 1)), int(b.get("score", 0))]
-		var ir := 15.0
-		var step := ir * 2.7
-		var icons_w := (n_st + n_cr) * step
-		var text_w := _font().get_string_size(label, HORIZONTAL_ALIGNMENT_LEFT, -1, 28).x
-		var x := cx - (icons_w + (24.0 if icons_w > 0.0 else 0.0) + text_w) / 2.0
-		for i in n_st:
-			_draw_award("star", Vector2(x + step / 2.0 + i * step, 1609), ir, true)
-		for i in n_cr:
-			_draw_award("crown", Vector2(x + step / 2.0 + (n_st + i) * step, 1609), ir, true)
-		_text(label, Vector2(x + icons_w + (24.0 if icons_w > 0.0 else 0.0), 1620), 28, gold)
+	_button(Rect2(35, 45, 180, 95), "< Volver", pcol("button"))
+	_button(Rect2(235, 45, w - 270, 95), "+ A lista", pcol("violet"))
+	# Botón cuadrado de reproducir / detener, a la izquierda del título.
+	var pb := Rect2(60, 175, 110, 110)
+	var pcolr := pcol("danger") if previewing else pcol("accent")
+	if audio_stream == null:
+		pcolr = acol(pcol("button"), 0.4)
+	_panel(pb, pcolr, 26)
+	var pc := pb.get_center()
+	if previewing:
+		draw_rect(Rect2(pc.x - 17, pc.y - 17, 34, 34), Color.WHITE)
 	else:
-		var b2: Dictionary = bests.get(key, {})
-		if b2.is_empty():
-			_text_centered("Récord: sin récord todavía", cx, 1620, 28, muted)
+		draw_colored_polygon(PackedVector2Array([pc + Vector2(-14, -24), pc + Vector2(-14, 24), pc + Vector2(24, 0)]), Color.WHITE)
+	var text_w := w - 195.0 - 60.0
+	_text(_fit(current_song.title, text_w, 52), Vector2(195, 236), 52, Color.WHITE)
+	_text(_fit("%s · %s" % [T(current_song.artist), current_song.version], text_w, 30), Vector2(197, 282), 30, muted)
+	# Imagen del mapa, igual que en Inicio (se funde con el fondo).
+	var hero := Rect2(0, 320, w, 400)
+	if prep_tex != null:
+		_draw_cover(prep_tex, hero)
+	else:
+		draw_rect(hero, _badge_color(current_song).darkened(0.3))
+	var navy := pcol("bg")
+	var bands := 16
+	for k in bands:
+		var f := float(k + 1) / bands
+		draw_rect(Rect2(0, hero.end.y - 140.0 + k * 140.0 / bands, w, 140.0 / bands + 1.0), Color(navy.r, navy.g, navy.b, 0.98 * pow(f, 1.7)))
+		draw_rect(Rect2(0, hero.position.y + k * 50.0 / bands, w, 50.0 / bands + 1.0), Color(navy.r, navy.g, navy.b, 0.9 * (1.0 - f)))
+	# Mejor récord de este modo, con los modificadores con que se logró.
+	_panel(Rect2(80, 745, w - 160, 250), acol(pcol("panel"), 0.92), 34)
+	var key := _song_key(current_song)
+	if game_mode == 0:
+		var b: Dictionary = bests.get(key, {})
+		if b.is_empty():
+			_text_centered("Mejor récord: sin récord todavía", cx, 880, 34, muted)
 		else:
-			_text_centered(T("Récord: %s · %d pts") % [RANKS[int(b2.rank)], int(b2.score)], cx, 1620, 28, gold)
+			var rk := clampi(int(b.get("rank", 0)), 0, RANKS.size() - 1)
+			_text_centered(RANKS[rk], 230, 905, 150, RANK_COLORS[rk])
+			_text("Mejor récord", Vector2(380, 790), 24, muted)
+			_text(str(int(b.get("score", 0))), Vector2(380, 862), 72, Color.WHITE)
+			var l1 := T("Precisión %.1f %%") % float(b.get("acc", 0.0))
+			if b.has("ms"):
+				l1 += " · " + T("Fallos: %d") % int(b.ms)
+			_text(_fit(l1, 590, 24), Vector2(380, 900), 24, muted)
+			if b.has("pf"):
+				_text(_fit("Perfect %d · Great %d · Good %d" % [int(b.pf), int(b.gr), int(b.gd)], 590, 24), Vector2(380, 934), 24, muted)
+			var bm := String(b.get("mods", ""))
+			_text(_fit(bm if bm != "" else T("Sin modificadores"), 590, 24), Vector2(380, 968), 24, gold)
+	else:
+		var ib: Dictionary = bests.get(key + "|inf", {})
+		if ib.is_empty():
+			_text_centered("Mejor récord: sin récord todavía", cx, 880, 34, muted)
+		else:
+			var n_st := mini(int(ib.get("stars", 0)), 3)
+			var n_cr := mini(int(ib.get("crowns", 0)), 3)
+			for i in 3:
+				_draw_award("star", Vector2(150 + i * 80, 840), 28.0, i < n_st)
+				_draw_award("crown", Vector2(150 + i * 80, 925), 26.0, i < n_cr)
+			_text("Mejor récord", Vector2(430, 790), 24, muted)
+			_text(str(int(ib.get("score", 0))), Vector2(430, 862), 72, Color.WHITE)
+			_text(T("Vuelta %d") % int(ib.get("laps", 1)), Vector2(430, 912), 26, muted)
+			var im := String(ib.get("mods", ""))
+			_text(_fit(im if im != "" else T("Sin modificadores"), 540, 24), Vector2(430, 960), 24, gold)
+	# Datos del mapa.
+	var info := T("%d notas · %d sostenidas") % [song_stats.notes, song_stats.holds] + " · " + _format_time(song_stats.duration) + " · " + (T("Con audio") if audio_stream != null else T("Sin audio"))
+	_text_centered(_fit(info, w - 100, 28), cx, 1040, 28, Color.WHITE if audio_stream != null else Color(1, 0.6, 0.6))
+	_button(Rect2(100, 1060, w - 200, 130), "JUGAR", pcol("accent"))
+	# Modificadores (abajo del todo).
+	_panel(Rect2(80, 1220, w - 160, 660), acol(pcol("panel"), 0.92), 34)
+	var mode_name := T("ESTÁNDAR") if game_mode == 0 else "TILES"
+	_text(T("MODIFICADORES") + " · " + mode_name, Vector2(130, 1270), 28, muted)
+	var lvl: Dictionary = DIFFICULTY_LEVELS[diff_level]
+	var demo_song: bool = current_parsed.is_empty()
+	_button(Rect2(110, 1295, 150, 90), "-", acol(pcol("button"), 0.4 if demo_song else 1.0))
+	_button(Rect2(w - 260, 1295, 150, 90), "+", acol(pcol("button"), 0.4 if demo_song else 1.0))
+	_text_centered("Dificultad de notas", cx, 1325, 24, muted)
+	_text_centered("—" if demo_song else String(lvl.name), cx, 1375, 44, Color(1, 1, 1, 0.4) if demo_song else lvl.color)
+	_button(Rect2(110, 1400, 150, 90), "-", pcol("button"))
+	_button(Rect2(w - 260, 1400, 150, 90), "+", pcol("button"))
+	_text_centered("Velocidad · AUTO" if speed_auto else "Velocidad · MANUAL (toca: auto)", cx, 1430, 24, muted)
+	_text_centered("x%.1f" % _effective_mult(), cx, 1478, 44, pcol("accent").lightened(0.3) if speed_auto else Color.WHITE)
+	var ids := _mod_ids()
+	for i in ids.size():
+		var on := _mod_on(String(ids[i]))
+		_button(_mod_rect(i), _mod_label(String(ids[i])), pcol("accent") if on else pcol("button"))
+	if game_mode == 1:
+		_button(Rect2(130, 1720, 170, 90), "-", pcol("button"))
+		_button(Rect2(w - 300, 1720, 170, 90), "+", pcol("button"))
+		_text_centered(T("%d vidas") % lives_setting, cx, 1782, 44, Color.WHITE)
+	var pm := _mods_mult()
+	var pm_text := T("Puntos x%.2f") % pm
+	if _mod_on("spectator"):
+		pm_text = T("Espectador: no se guarda récord")
+	_text_centered(pm_text, cx, 1852, 28, _ok() if pm >= 1.0 else Color(1.0, 0.75, 0.4))
 
 func _lang_rect(i: int) -> Rect2:
 	return Rect2(viewport_size.x - 80.0 - 30.0 - 2.0 * 170.0 - 16.0 + i * 186.0, 1125, 170, 90)
@@ -3326,7 +3669,7 @@ func _draw_results_screen() -> void:
 	else:
 		var best: Dictionary = bests.get(_song_key(current_song), {})
 		if not best.is_empty():
-			best_txt = T("Mejor: %s · %d") % [RANKS[int(best.rank)], int(best.score)] if run_lives > 0 else T("Mejor %d") % int(best.score)
+			best_txt = T("Mejor: %s · %d") % [RANKS[int(best.rank)], int(best.score)]
 	if best_txt != "":
 		_text_centered(best_txt, w / 2, 910, 42, muted)
 	# Detalle pequeño.
@@ -3336,14 +3679,12 @@ func _draw_results_screen() -> void:
 	else:
 		info = T("Precisión %.1f %%") % run_accuracy + " · Perfect %d · Great %d · Good %d · " % [perfects, greats, goods] + T("Fallos: %d") % misses
 	_text_centered(_fit(info, w - 100.0, 28), w / 2, 975 + top_inset * 0.0, 28, muted)
-	var note_txt := ""
-	if run_lives > 0:
-		if infinite_run:
-			note_txt = T("%d vidas · sin penalización") % run_lives if run_lives == LIVES_MIN else T("%d vidas · puntos x%.2f") % [run_lives, run_mult]
-		else:
-			note_txt = T("Modo Vidas · %d vidas · puntos x%.2f") % [run_lives, run_mult]
-	elif not infinite_run:
-		note_txt = T("Casual · esta partida no se guarda")
+	var mt := _mods_text()
+	var note_txt := T("Puntos x%.2f") % run_mult
+	if mt != "":
+		note_txt = mt + " · " + note_txt
+	if spectating:
+		note_txt = T("Espectador: no se guarda récord")
 	if note_txt != "":
 		_text_centered(_fit(note_txt, w - 100.0, 26), w / 2, 1020, 26, muted)
 	# Botones: canciones (círculo) a la izquierda y repetir (píldora) al lado.

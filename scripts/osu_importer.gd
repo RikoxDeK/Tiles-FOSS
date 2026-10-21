@@ -54,7 +54,7 @@ static func parse_osu(text: String, header_only := false) -> Dictionary:
 	var r := {
 		"ok": false, "error": "", "mode": 0, "keys": 4,
 		"title": "", "artist": "", "creator": "", "version": "",
-		"audio": "", "background": "", "slider_multiplier": 1.4,
+		"audio": "", "background": "", "slider_multiplier": 1.4, "hp": 5.0,
 		"timing": [], "objects": []
 	}
 	var section := ""
@@ -85,6 +85,7 @@ static func parse_osu(text: String, header_only := false) -> Dictionary:
 			elif key == "Version": r.version = val
 			elif key == "CircleSize": r.keys = int(round(float(val)))
 			elif key == "SliderMultiplier": r.slider_multiplier = float(val)
+			elif key == "HPDrainRate": r.hp = float(val)
 		elif section == "Events":
 			# Línea de imagen de fondo:  0,0,"archivo.jpg",0,0
 			var ev := line.split(",")
