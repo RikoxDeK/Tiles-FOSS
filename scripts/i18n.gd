@@ -191,6 +191,7 @@ const EN := {
 	"Suena en el inicio y los menús": "Plays on the home screen and menus",
 	"Volumen de la música": "Music volume",
 	"Volumen de los efectos": "Effects volume",
+	"Largo de las notas": "Note length",
 	"Estándar": "Standard",
 	"ESTÁNDAR": "STANDARD",
 	"MODIFICADORES": "MODIFIERS",

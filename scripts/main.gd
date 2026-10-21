@@ -64,6 +64,10 @@ var sfx_life: AudioStreamWAV = null
 var fade_tween: Tween = null
 var amb_player: AudioStreamPlayer = null   # música de fondo suave al abrir la app
 var amb_tween: Tween = null
+var amb_player2: AudioStreamPlayer = null   # segundo canal: permite el fundido cruzado entre canciones
+var amb_cur: AudioStreamPlayer = null
+var amb_tweens := {}
+var note_len := 1.0      # ajuste: largo de las notas normales (1.0 = el de siempre)
 var amb_on := false
 var amb_song := false   # el ambiente actual es la canción del mapa abierto en Preparar
 var amb_retry := 0.0    # espera antes de volver a intentar arrancar la música de fondo
@@ -74,7 +78,7 @@ var set_scroll := 0.0    # desplazamiento de Ajustes
 var set_press_id := -999
 var set_press_pos := Vector2.ZERO
 var set_dragged := false
-const SETTINGS_END := 2500.0   # fin del contenido de Ajustes (unidades de 1080 px)
+const SETTINGS_END := 2820.0   # fin del contenido de Ajustes (unidades de 1080 px)
 var prep_tex: Texture2D = null   # imagen del mapa en Preparar
 var input_y: Dictionary = {}   # altura (y) del dedo de cada toque, para dibujar la larga donde lo pones
 var effects: Array = []
@@ -926,6 +930,8 @@ func _settings_tap(pos: Vector2) -> void:
 			_stop_ambient()
 	elif Rect2(130, 2040, 170, 110).has_point(pos): _adjust_music_vol(-0.1)
 	elif Rect2(w - 300, 2040, 170, 110).has_point(pos): _adjust_music_vol(0.1)
+	elif Rect2(130, 2620, 170, 110).has_point(pos): _adjust_note_len(-0.1)
+	elif Rect2(w - 300, 2620, 170, 110).has_point(pos): _adjust_note_len(0.1)
 	elif Rect2(130, 2330, 170, 110).has_point(pos): _adjust_sfx_vol(-0.1)
 	elif Rect2(w - 300, 2330, 170, 110).has_point(pos): _adjust_sfx_vol(0.1)
 
@@ -1007,9 +1013,9 @@ func _assign_tap_heights() -> void:
 		var n: Dictionary = notes[i]
 		if n.type == "start":
 			continue
-		n.height = NORMAL_HEIGHT
+		n.height = NORMAL_HEIGHT * note_len
 		if n.type == "tap" and next_time.has(n.lane):
-			n.height = clampf((next_time[n.lane] - n.time) * speed - 6.0, 50.0, NORMAL_HEIGHT)
+			n.height = clampf((next_time[n.lane] - n.time) * speed - 6.0, 50.0, NORMAL_HEIGHT * note_len)
 		next_time[n.lane] = n.time
 
 func _start_game() -> void:
@@ -1040,7 +1046,7 @@ func _start_game() -> void:
 		note.done = false
 		note.holding = false
 		note.input_id = -999
-		note.height = NORMAL_HEIGHT
+		note.height = NORMAL_HEIGHT * note_len
 		notes.append(note)
 	_assign_tap_heights()
 	first_idx = 0
@@ -2921,6 +2927,7 @@ func _load_settings() -> void:
 	show_thumbs = bool(cfg.get_value("display", "show_thumbs", true))
 	sfx_on = bool(cfg.get_value("display", "sfx", true))
 	amb_enabled = bool(cfg.get_value("display", "amb", true))
+	note_len = clampf(float(cfg.get_value("display", "note_len", 1.0)), 0.5, 1.5)
 	music_vol = clampf(float(cfg.get_value("display", "music_vol", 1.0)), 0.0, 1.0)
 	sfx_vol = clampf(float(cfg.get_value("display", "sfx_vol", 1.0)), 0.0, 1.0)
 	_apply_volumes()
@@ -2970,6 +2977,7 @@ func _save_settings() -> void:
 	cfg.set_value("display", "show_thumbs", show_thumbs)
 	cfg.set_value("display", "sfx", sfx_on)
 	cfg.set_value("display", "amb", amb_enabled)
+	cfg.set_value("display", "note_len", note_len)
 	cfg.set_value("display", "music_vol", music_vol)
 	cfg.set_value("display", "sfx_vol", sfx_vol)
 	cfg.set_value("library", "favorites", favorites.keys())
@@ -3081,6 +3089,10 @@ func _apply_volumes() -> void:
 	if si >= 0:
 		AudioServer.set_bus_volume_db(si, _vol_db(sfx_vol))
 
+func _adjust_note_len(delta: float) -> void:
+	note_len = snappedf(clampf(note_len + delta, 0.5, 1.5), 0.1)
+	_save_settings()
+
 func _adjust_music_vol(delta: float) -> void:
 	music_vol = snappedf(clampf(music_vol + delta, 0.0, 1.0), 0.1)
 	_apply_volumes()
@@ -3118,8 +3130,13 @@ func _setup_ambient() -> void:
 	amb_player = AudioStreamPlayer.new()
 	amb_player.bus = "Ambient"
 	amb_player.volume_db = -60.0
-	amb_player.finished.connect(_ambient_loop)
+	amb_player.finished.connect(_ambient_loop.bind(amb_player))
 	add_child(amb_player)
+	amb_player2 = AudioStreamPlayer.new()
+	amb_player2.bus = "Ambient"
+	amb_player2.volume_db = -60.0
+	amb_player2.finished.connect(_ambient_loop.bind(amb_player2))
+	add_child(amb_player2)
 
 func _ambient_entry() -> Dictionary:
 	var e := _last_entry()
@@ -3143,37 +3160,48 @@ func _start_ambient() -> void:
 		return
 	_ambient_play(stream, false)
 
-## Suena suave y tapada: fundido de entrada y filtro de graves (canal "Ambient").
+## Suena suave y tapada (canal "Ambient"). Si ya sonaba otra, hace un fundido cruzado:
+## la anterior baja mientras la nueva sube, sin cortes.
 func _ambient_play(stream: AudioStream, from_song: bool) -> void:
 	if stream == null or amb_player == null or not amb_enabled:
 		return
-	amb_player.stream = stream
+	var old := amb_cur
+	var nw := amb_player2 if amb_cur == amb_player else amb_player
+	nw.stream = stream
+	nw.volume_db = -60.0
 	amb_on = true
 	amb_song = from_song
-	amb_player.volume_db = -60.0
 	var start := 0.0
 	if stream.get_length() > 20.0:
 		start = stream.get_length() * 0.25
-	amb_player.play(start)
-	if amb_tween != null and amb_tween.is_valid():
-		amb_tween.kill()
-	amb_tween = create_tween()
-	amb_tween.tween_property(amb_player, "volume_db", -17.0, 2.5)
+	nw.play(start)
+	amb_cur = nw
+	_amb_fade(nw, -17.0, 2.2, false)
+	if old != null and old.playing:
+		_amb_fade(old, -60.0, 2.2, true)
 
-func _ambient_loop() -> void:
-	if amb_on:
-		amb_player.play(0.0)
+func _amb_fade(p: AudioStreamPlayer, to_db: float, dur: float, stop_after: bool) -> void:
+	var prev = amb_tweens.get(p, null)
+	if prev != null and prev.is_valid():
+		prev.kill()
+	var tw := create_tween()
+	amb_tweens[p] = tw
+	tw.tween_property(p, "volume_db", to_db, dur)
+	if stop_after:
+		tw.tween_callback(p.stop)
+
+func _ambient_loop(p: AudioStreamPlayer) -> void:
+	if amb_on and p == amb_cur:
+		p.play(0.0)
 
 func _stop_ambient() -> void:
 	if not amb_on:
 		return
 	amb_on = false
 	amb_song = false
-	if amb_tween != null and amb_tween.is_valid():
-		amb_tween.kill()
-	amb_tween = create_tween()
-	amb_tween.tween_property(amb_player, "volume_db", -60.0, 0.4)
-	amb_tween.tween_callback(amb_player.stop)
+	amb_retry = 0.0
+	if amb_cur != null:
+		_amb_fade(amb_cur, -60.0, 0.6, true)
 
 func _kill_fade() -> void:
 	if fade_tween != null and fade_tween.is_valid():
@@ -3274,8 +3302,13 @@ func _gen_life() -> AudioStreamWAV:
 ## Escuchar solo el audio de la canción abierta (sin jugar).
 func _toggle_preview() -> void:
 	if previewing:
-		_stop_audio()
-		_ambient_play(audio_stream, true)   # vuelve el sonido suave y tapado de fondo
+		# La canción sin filtro baja suave mientras vuelve el sonido tapado de fondo.
+		previewing = false
+		_kill_fade()
+		fade_tween = create_tween()
+		fade_tween.tween_property(player, "volume_db", -40.0, 0.6)
+		fade_tween.tween_callback(_stop_audio)
+		_ambient_play(audio_stream, true)
 		return
 	if audio_stream == null:
 		return
@@ -3339,7 +3372,7 @@ func _draw_game() -> void:
 		if note.done and note.get("released", false):
 			var gb: float = hit_y + (song_time - float(note.release_time)) * speed
 			var gh: float = maxf(0.0, (float(note.time) + float(note.duration) - float(note.release_time)) * speed)
-			draw_rect(Rect2(note.lane * lane_w + 2, gb - gh, lane_w - 4, gh), Color(0.42, 0.47, 0.55, 0.32))
+			draw_rect(Rect2(note.lane * lane_w + 2, gb - gh, lane_w - 4, gh), Color(0.42, 0.47, 0.55, 0.6))
 			continue
 		if note.done or (note.type == "start" and started): continue
 		var bottom: float = viewport_size.y if note.type == "start" and not started else hit_y - (note.time - song_time) * speed
@@ -3361,8 +3394,7 @@ func _draw_game() -> void:
 		if d.get("kind", "") == "hold":
 			var hb: float = hit_y - (float(d.time) - song_time) * speed
 			var hr := Rect2(int(d.lane) * lane_w + 2, hb - float(d.height), lane_w - 4, float(d.height))
-			var hf := pcol("hold").lerp(pcol("nav_home"), 0.35).lerp(Color.WHITE, 0.35)
-			draw_rect(hr, acol(hf.darkened(0.3), 0.38))
+			draw_rect(hr, acol(pcol("hold").lerp(pcol("tile"), 0.45), 0.85))
 			continue
 		var dbottom: float = hit_y - (float(d.time) - song_time) * speed
 		var dr := Rect2(int(d.lane) * lane_w + 2, dbottom - float(d.height), lane_w - 4, float(d.height))
@@ -3721,6 +3753,11 @@ func _draw_settings() -> void:
 	_button(Rect2(130, 2330, 170, 110), "-", off_col)
 	_button(Rect2(w - 300, 2330, 170, 110), "+", off_col)
 	_text_centered("%d %%" % roundi(sfx_vol * 100.0), w / 2, 2405, 56, Color.WHITE)
+	_panel(Rect2(80, 2500, w - 160, 300), panel_col, 34)
+	_text("Largo de las notas", Vector2(130, 2585), 40, Color.WHITE)
+	_button(Rect2(130, 2620, 170, 110), "-", off_col)
+	_button(Rect2(w - 300, 2620, 170, 110), "+", off_col)
+	_text_centered("%d %%" % roundi(note_len * 100.0), w / 2, 2695, 56, Color.WHITE)
 	if status_time > 0.0:
 		_text(_fit(status_text, w - 160, 26), Vector2(80, 270), 26, _err() if status_error else _ok())
 	_draw_nav()
