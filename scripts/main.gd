@@ -66,6 +66,15 @@ var amb_player: AudioStreamPlayer = null   # música de fondo suave al abrir la 
 var amb_tween: Tween = null
 var amb_on := false
 var amb_song := false   # el ambiente actual es la canción del mapa abierto en Preparar
+var amb_retry := 0.0    # espera antes de volver a intentar arrancar la música de fondo
+var amb_enabled := true  # ajuste: música de fondo en menús
+var music_vol := 1.0     # ajuste: volumen de la música (0 - 1)
+var sfx_vol := 1.0       # ajuste: volumen de los efectos (0 - 1)
+var set_scroll := 0.0    # desplazamiento de Ajustes
+var set_press_id := -999
+var set_press_pos := Vector2.ZERO
+var set_dragged := false
+const SETTINGS_END := 2500.0   # fin del contenido de Ajustes (unidades de 1080 px)
 var prep_tex: Texture2D = null   # imagen del mapa en Preparar
 var input_y: Dictionary = {}   # altura (y) del dedo de cada toque, para dibujar la larga donde lo pones
 var effects: Array = []
@@ -467,15 +476,25 @@ func _drag_any(pos: Vector2, relative: Vector2, input_id: int) -> void:
 		if input_id == pal_drag_id:
 			_pal_drag_to(pos.x)
 		return
+	if screen == Screen.SETTINGS:
+		if input_id == set_press_id:
+			if not set_dragged and pos.distance_to(set_press_pos) > 24.0:
+				set_dragged = true
+			if set_dragged:
+				set_scroll = clampf(set_scroll - relative.y, 0.0, _settings_max_scroll())
+		return
 	if screen == Screen.GAME and input_id in active_inputs:
 		return   # la altura del dedo se fija al tocar: moverlo no cambia dónde se dibuja la larga
 	_library_drag(pos, relative, input_id)
 
 func _ready() -> void:
 	get_viewport().size_changed.connect(_resize)
+	_setup_buses()
 	player = AudioStreamPlayer.new()
+	player.bus = "Music"
 	add_child(player)
 	sfx_player = AudioStreamPlayer.new()
+	sfx_player.bus = "SFX"
 	add_child(sfx_player)
 	_setup_ambient()
 	sfx_fail = _gen_fail()
@@ -560,6 +579,7 @@ func _resize() -> void:
 func _process(delta: float) -> void:
 	if amb_on and amb_song and screen != Screen.PREPARE:
 		_stop_ambient()
+	_ambient_tick(delta)
 	if screen == Screen.LIBRARY and press_id != -999 and not dragged and tab == TAB_MUSIC and overlay == "" and open_group.is_empty() and Time.get_ticks_msec() - press_ms > 480:
 		_long_press()
 	if screen == Screen.GAME and started and not paused and not finished:
@@ -849,6 +869,8 @@ func _unhandled_input(event: InputEvent) -> void:
 		if screen == Screen.LIBRARY:
 			scroll_y += -120.0 if event.button_index == MOUSE_BUTTON_WHEEL_UP else 120.0
 			_clamp_scroll()
+		elif screen == Screen.SETTINGS:
+			set_scroll = clampf(set_scroll + (-120.0 if event.button_index == MOUSE_BUTTON_WHEEL_UP else 120.0), 0.0, _settings_max_scroll())
 	elif event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT:
 		_pointer(event.position, event.pressed, -1)
 	elif event is InputEventKey and screen == Screen.GAME:
@@ -866,6 +888,47 @@ func _unhandled_input(event: InputEvent) -> void:
 			elif not event.pressed:
 				active_inputs.erase(input_id)
 
+func _settings_max_scroll() -> float:
+	return maxf(0.0, SETTINGS_END - (viewport_size.y - NAV_H - ui_off))
+
+func _settings_pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
+	if pressed:
+		if _nav_tap(pos):
+			return
+		set_press_id = input_id
+		set_press_pos = pos
+		set_dragged = false
+	elif input_id == set_press_id:
+		set_press_id = -999
+		if not set_dragged:
+			pos.y += set_scroll - ui_off
+			_settings_tap(pos)
+
+func _settings_tap(pos: Vector2) -> void:
+	var w := viewport_size.x
+	if Rect2(80, 330, w - 160, 180).has_point(pos):
+		show_bg = not show_bg; _reload_bg(); _save_settings()
+	elif Rect2(80, 870, w - 160, 180).has_point(pos):
+		show_thumbs = not show_thumbs; _save_settings()
+	elif show_bg and Rect2(130, 690, 170, 110).has_point(pos): _adjust_bg(-0.05)
+	elif show_bg and Rect2(w - 300, 690, 170, 110).has_point(pos): _adjust_bg(0.05)
+	elif _lang_rect(0).has_point(pos): _set_lang("es")
+	elif _lang_rect(1).has_point(pos): _set_lang("en")
+	elif Rect2(80, 1290, w - 160, 180).has_point(pos): _open_palette()
+	elif Rect2(80, 1500, w - 160, 180).has_point(pos):
+		sfx_on = not sfx_on; _save_settings()
+	elif Rect2(80, 1710, w - 160, 180).has_point(pos):
+		amb_enabled = not amb_enabled
+		_save_settings()
+		if amb_enabled:
+			amb_retry = 0.0
+		else:
+			_stop_ambient()
+	elif Rect2(130, 2040, 170, 110).has_point(pos): _adjust_music_vol(-0.1)
+	elif Rect2(w - 300, 2040, 170, 110).has_point(pos): _adjust_music_vol(0.1)
+	elif Rect2(130, 2330, 170, 110).has_point(pos): _adjust_sfx_vol(-0.1)
+	elif Rect2(w - 300, 2330, 170, 110).has_point(pos): _adjust_sfx_vol(0.1)
+
 func _key_lane(event: InputEventKey) -> int:
 	var key: Key = event.physical_keycode
 	if key == KEY_D: return 0
@@ -875,6 +938,9 @@ func _key_lane(event: InputEventKey) -> int:
 	return -1
 
 func _pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
+	if screen == Screen.SETTINGS:
+		_settings_pointer(pos, pressed, input_id)
+		return
 	if screen == Screen.PALETTE:
 		_palette_pointer(pos, pressed, input_id)
 		return
@@ -887,9 +953,7 @@ func _pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
 	if screen == Screen.PREPARE and overlay != "":
 		_overlay_tap(pos)
 		return
-	if screen == Screen.SETTINGS and _nav_tap(pos):
-		return
-	if screen == Screen.PREPARE or screen == Screen.RESULTS or screen == Screen.SETTINGS:
+	if screen == Screen.PREPARE or screen == Screen.RESULTS:
 		pos.y -= ui_off
 	if screen == Screen.PREPARE:
 		var pw := viewport_size.x
@@ -932,18 +996,6 @@ func _pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
 		input_y[input_id] = pos.y
 		input_x[input_id] = pos.x
 		_try_hit(lane, input_id)
-	elif screen == Screen.SETTINGS:
-		if Rect2(80, 330, viewport_size.x - 160, 180).has_point(pos):
-			show_bg = not show_bg; _reload_bg(); _save_settings()
-		elif Rect2(80, 870, viewport_size.x - 160, 180).has_point(pos):
-			show_thumbs = not show_thumbs; _save_settings()
-		elif show_bg and Rect2(130, 690, 170, 110).has_point(pos): _adjust_bg(-0.05)
-		elif show_bg and Rect2(viewport_size.x - 300, 690, 170, 110).has_point(pos): _adjust_bg(0.05)
-		elif _lang_rect(0).has_point(pos): _set_lang("es")
-		elif _lang_rect(1).has_point(pos): _set_lang("en")
-		elif Rect2(80, 1290, viewport_size.x - 160, 180).has_point(pos): _open_palette()
-		elif Rect2(80, 1500, viewport_size.x - 160, 180).has_point(pos):
-			sfx_on = not sfx_on; _save_settings()
 	elif screen == Screen.RESULTS:
 		if _results_retry_rect().has_point(pos): _start_game()
 		elif _results_songs_rect().grow(20).has_point(pos): open_group = {}; screen = Screen.LIBRARY
@@ -1784,6 +1836,9 @@ func _set_game_mode(i: int) -> void:
 	game_mode = i
 	home_dirty = true
 	_save_settings()
+	# La música de inicio cambia a la última canción del modo nuevo.
+	if amb_on and not amb_song:
+		_start_ambient()
 
 func _draw_mode_icon(m: int, c: Vector2, s: float, col: Color) -> void:
 	if m == 0:
@@ -2865,6 +2920,10 @@ func _load_settings() -> void:
 	lives_setting = clampi(int(cfg.get_value("mods", "lives", 3)), LIVES_MIN, LIVES_MAX)
 	show_thumbs = bool(cfg.get_value("display", "show_thumbs", true))
 	sfx_on = bool(cfg.get_value("display", "sfx", true))
+	amb_enabled = bool(cfg.get_value("display", "amb", true))
+	music_vol = clampf(float(cfg.get_value("display", "music_vol", 1.0)), 0.0, 1.0)
+	sfx_vol = clampf(float(cfg.get_value("display", "sfx_vol", 1.0)), 0.0, 1.0)
+	_apply_volumes()
 	var fav_list = cfg.get_value("library", "favorites", [])
 	if fav_list is Array:
 		for fid in fav_list:
@@ -2910,6 +2969,9 @@ func _save_settings() -> void:
 	cfg.set_value("mods", "lives", lives_setting)
 	cfg.set_value("display", "show_thumbs", show_thumbs)
 	cfg.set_value("display", "sfx", sfx_on)
+	cfg.set_value("display", "amb", amb_enabled)
+	cfg.set_value("display", "music_vol", music_vol)
+	cfg.set_value("display", "sfx_vol", sfx_vol)
 	cfg.set_value("library", "favorites", favorites.keys())
 	cfg.set_value("library", "sort", sort_mode)
 	cfg.set_value("library", "last_id", String(last_played.get("id", "")))
@@ -2999,12 +3061,57 @@ func _set_paused(value: bool) -> void:
 # Al abrir la app suena, baja y apagada (filtro de graves), tu última canción jugada.
 # Se detiene al elegir una canción o empezar una partida.
 
+func _setup_buses() -> void:
+	for bus_name in ["Music", "SFX"]:
+		if AudioServer.get_bus_index(bus_name) < 0:
+			AudioServer.add_bus()
+			var bi := AudioServer.bus_count - 1
+			AudioServer.set_bus_name(bi, bus_name)
+			AudioServer.set_bus_send(bi, "Master")
+	_apply_volumes()
+
+func _vol_db(v: float) -> float:
+	return -80.0 if v <= 0.001 else linear_to_db(v)
+
+func _apply_volumes() -> void:
+	var mi := AudioServer.get_bus_index("Music")
+	var si := AudioServer.get_bus_index("SFX")
+	if mi >= 0:
+		AudioServer.set_bus_volume_db(mi, _vol_db(music_vol))
+	if si >= 0:
+		AudioServer.set_bus_volume_db(si, _vol_db(sfx_vol))
+
+func _adjust_music_vol(delta: float) -> void:
+	music_vol = snappedf(clampf(music_vol + delta, 0.0, 1.0), 0.1)
+	_apply_volumes()
+	_save_settings()
+
+func _adjust_sfx_vol(delta: float) -> void:
+	sfx_vol = snappedf(clampf(sfx_vol + delta, 0.0, 1.0), 0.1)
+	_apply_volumes()
+	_save_settings()
+	_play_sfx(sfx_life)   # muestra el nuevo volumen
+
+## Música de menú: vuelve sola al salir de Preparar, de la partida o de los resultados.
+func _ambient_tick(delta: float) -> void:
+	var menu := screen == Screen.LIBRARY or screen == Screen.SETTINGS or screen == Screen.PALETTE
+	if not menu or not amb_enabled or previewing:
+		if amb_on and not amb_song and not amb_enabled:
+			_stop_ambient()
+		return
+	if amb_on:
+		return
+	amb_retry -= delta
+	if amb_retry <= 0.0:
+		amb_retry = 1.0
+		_start_ambient()
+
 func _setup_ambient() -> void:
 	if AudioServer.get_bus_index("Ambient") < 0:
 		AudioServer.add_bus()
 		var bi := AudioServer.bus_count - 1
 		AudioServer.set_bus_name(bi, "Ambient")
-		AudioServer.set_bus_send(bi, "Master")
+		AudioServer.set_bus_send(bi, "Music")
 		var lp := AudioEffectLowPassFilter.new()
 		lp.cutoff_hz = 1800.0
 		AudioServer.add_bus_effect(bi, lp)
@@ -3026,6 +3133,8 @@ func _ambient_entry() -> Dictionary:
 	return e
 
 func _start_ambient() -> void:
+	if not amb_enabled:
+		return
 	var e := _ambient_entry()
 	if e.is_empty():
 		return
@@ -3036,7 +3145,7 @@ func _start_ambient() -> void:
 
 ## Suena suave y tapada: fundido de entrada y filtro de graves (canal "Ambient").
 func _ambient_play(stream: AudioStream, from_song: bool) -> void:
-	if stream == null or amb_player == null:
+	if stream == null or amb_player == null or not amb_enabled:
 		return
 	amb_player.stream = stream
 	amb_on = true
@@ -3562,7 +3671,9 @@ func _lang_rect(i: int) -> Rect2:
 	return Rect2(viewport_size.x - 80.0 - 30.0 - 2.0 * 170.0 - 16.0 + i * 186.0, 1125, 170, 90)
 
 func _draw_settings() -> void:
-	_background(); draw_set_transform(Vector2(0, ui_off))
+	_background()
+	set_scroll = clampf(set_scroll, 0.0, _settings_max_scroll())
+	draw_set_transform(Vector2(0, ui_off - set_scroll))
 	var w := viewport_size.x
 	var muted := pcol("muted")
 	var panel_col := acol(pcol("panel"), 0.92)
@@ -3596,8 +3707,22 @@ func _draw_settings() -> void:
 	_text("Efectos de sonido", Vector2(130, 1585), 40, Color.WHITE)
 	_text("Sonidos al perder y al perder una vida", Vector2(130, 1635), 26, muted)
 	_button(Rect2(w - 330, 1545, 200, 90), "SÍ" if sfx_on else "NO", on_col if sfx_on else off_col)
+	_panel(Rect2(80, 1710, w - 160, 180), panel_col, 34)
+	_text("Música de fondo", Vector2(130, 1795), 40, Color.WHITE)
+	_text("Suena en el inicio y los menús", Vector2(130, 1845), 26, muted)
+	_button(Rect2(w - 330, 1755, 200, 90), "SÍ" if amb_enabled else "NO", on_col if amb_enabled else off_col)
+	_panel(Rect2(80, 1920, w - 160, 300), panel_col, 34)
+	_text("Volumen de la música", Vector2(130, 2005), 40, Color.WHITE)
+	_button(Rect2(130, 2040, 170, 110), "-", off_col)
+	_button(Rect2(w - 300, 2040, 170, 110), "+", off_col)
+	_text_centered("%d %%" % roundi(music_vol * 100.0), w / 2, 2115, 56, Color.WHITE)
+	_panel(Rect2(80, 2210, w - 160, 300), panel_col, 34)
+	_text("Volumen de los efectos", Vector2(130, 2295), 40, Color.WHITE)
+	_button(Rect2(130, 2330, 170, 110), "-", off_col)
+	_button(Rect2(w - 300, 2330, 170, 110), "+", off_col)
+	_text_centered("%d %%" % roundi(sfx_vol * 100.0), w / 2, 2405, 56, Color.WHITE)
 	if status_time > 0.0:
-		_text(_fit(status_text, w - 160, 26), Vector2(80, 1722), 26, _err() if status_error else _ok())
+		_text(_fit(status_text, w - 160, 26), Vector2(80, 270), 26, _err() if status_error else _ok())
 	_draw_nav()
 
 ## Pantalla de resultados (también al perder): fondo de la canción arriba con borde curvo,
