@@ -1,4 +1,4 @@
-# Tiles FOSS v0.2
+# Tiles FOSS
 
 Prototipo visual y jugable inspirado en la estructura de los juegos de piano verticales, con identidad propia y preparado para Android.
 
