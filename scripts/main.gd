@@ -511,7 +511,7 @@ const STAR_TIERS := [
 	{"max": 9.0, "name": "Extreme", "color": Color(0.48, 0.12, 0.50), "dark": false},
 	{"max": 999.0, "name": "Master", "color": Color(0.26, 0.10, 0.42), "dark": false},
 ]
-const STAR_CACHE_VERSION := 2   # súbelo si cambias la escala de estimación
+const STAR_CACHE_VERSION := 3   # súbelo si cambias la escala de estimación
 var star_cache: Dictionary = {}   # "set_id|versión|tamaño" -> estrellas estimadas (se guarda en settings.cfg)
 
 func _tier_of(st: float) -> int:
