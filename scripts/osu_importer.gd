@@ -427,6 +427,8 @@ static func suggest_speed(chart: Array, event_gap := MIN_EVENT_GAP) -> float:
 ## Para ajustar la escala basta con cambiar estas dos cifras.
 const STAR_PEAK_K := 0.62
 const STAR_MEAN_K := 0.30
+const STAR_SOFT_CAP := 4.0
+const STAR_SOFT_K := 0.55
 
 static func estimate_stars(parsed: Dictionary) -> float:
 	var objs: Array = (parsed.get("objects", []) as Array).duplicate()
@@ -473,4 +475,9 @@ static func estimate_stars(parsed: Dictionary) -> float:
 	for i in n_top:
 		peak += float(rates[i])
 	peak /= maxf(n_top, 1)
-	return snappedf(clampf(STAR_PEAK_K * peak + STAR_MEAN_K * mean, 0.0, 12.0), 0.01)
+	var raw := STAR_PEAK_K * peak + STAR_MEAN_K * mean
+	# Hasta 4 se deja igual; por encima se comprime para que los mapas muy densos (mania con acordes)
+	# no caigan todos en Master.
+	if raw > STAR_SOFT_CAP:
+		raw = STAR_SOFT_CAP + (raw - STAR_SOFT_CAP) * STAR_SOFT_K
+	return snappedf(clampf(raw, 0.0, 12.0), 0.01)

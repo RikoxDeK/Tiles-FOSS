@@ -511,6 +511,7 @@ const STAR_TIERS := [
 	{"max": 9.0, "name": "Extreme", "color": Color(0.48, 0.12, 0.50), "dark": false},
 	{"max": 999.0, "name": "Master", "color": Color(0.26, 0.10, 0.42), "dark": false},
 ]
+const STAR_CACHE_VERSION := 2   # súbelo si cambias la escala de estimación
 var star_cache: Dictionary = {}   # "set_id|versión|tamaño" -> estrellas estimadas (se guarda en settings.cfg)
 
 func _tier_of(st: float) -> int:
@@ -558,13 +559,20 @@ func _text_fixed_c(value: String, cx: float, y: float, size: int, color: Color) 
 	var w := _font().get_string_size(value, HORIZONTAL_ALIGNMENT_LEFT, -1, size).x
 	_text_fixed(value, Vector2(cx - w / 2.0, y), size, color)
 
-## Cuadro de color de la categoría con su nombre (sin mostrar el número de estrellas).
-func _draw_star_chip(r: Rect2, st: float) -> void:
+## Categoría integrada en la fila: píldora translúcida del color de la categoría, con un punto y el nombre
+## (sin bloque sólido). dark_bg = true cuando el fondo es oscuro o de color fuerte (preparar, fila actual).
+func _draw_star_chip(r: Rect2, st: float, dark_bg := false) -> void:
 	var t: Dictionary = STAR_TIERS[_tier_of(st)]
-	_panel(r, t.color, 20)
-	var fg := Color(0.22, 0.12, 0.04) if t.dark else Color.WHITE
-	var size := 28 if r.size.y >= 60.0 else 24
-	_text_fixed_c(String(t.name), r.get_center().x, r.get_center().y + size * 0.35, size, fg)
+	var c: Color = t.color
+	var txt: Color = c.lightened(0.45) if dark_bg else c.darkened(0.42)
+	var fill := Color(c.r, c.g, c.b, 0.26 if dark_bg else 0.20)
+	var rr := Rect2(r.position.x + 14.0, r.position.y + r.size.y * 0.16, r.size.x - 14.0, r.size.y * 0.68)
+	_panel(rr, fill, rr.size.y / 2.0)
+	var size := 26 if r.size.y >= 60.0 else 22
+	var dot_x := rr.position.x + rr.size.y * 0.5
+	draw_circle(Vector2(dot_x, rr.get_center().y), rr.size.y * 0.16, c)
+	var tx := (rr.position.x + rr.size.y + rr.end.x) / 2.0 - rr.size.y * 0.25
+	_text_fixed_c(String(t.name), tx, rr.get_center().y + size * 0.35, size, txt)
 
 func _diff_pill_rect() -> Rect2:
 	return Rect2(80, 602, viewport_size.x - 160, 108)
@@ -581,7 +589,7 @@ func _draw_diff_pill() -> void:
 	var r := _diff_pill_rect()
 	var multi := _diff_pill_multi()
 	_panel(r, Color(0.02, 0.04, 0.09, 0.78), 28)
-	_draw_star_chip(Rect2(r.position.x + 10, r.position.y + 10, 200, r.size.y - 20), st)
+	_draw_star_chip(Rect2(r.position.x + 10, r.position.y + 10, 200, r.size.y - 20), st, true)
 	var tw := r.size.x - 236.0 - (90.0 if multi else 24.0)
 	_text(_fit(String(current_song.version), tw, 34), Vector2(r.position.x + 232, r.position.y + (52.0 if multi else 64.0)), 34, Color.WHITE)
 	if multi:
@@ -2384,7 +2392,7 @@ func _draw_overlay() -> void:
 			var stv := _stars_of(ee)
 			var vw2 := rr.size.x - 60.0
 			if stv >= 0.0:
-				_draw_star_chip(Rect2(rr.end.x - 214.0, rr.position.y + 8.0, 204.0, rr.size.y - 16.0), stv)
+				_draw_star_chip(Rect2(rr.end.x - 214.0, rr.position.y + 8.0, 204.0, rr.size.y - 16.0), stv, cur)
 				vw2 -= 214.0
 			_text(_fit(String(ee.version), vw2, 34), Vector2(rr.position.x + 30, rr.get_center().y + 12), 34, Color.WHITE if cur else ink)
 		_text("Categoría estimada por el juego", Vector2(panel.position.x + 40, panel.end.y - 36), 22, _ink_soft())
@@ -3099,6 +3107,8 @@ func _load_settings() -> void:
 				pal[pk] = Color.from_string(String(cfg.get_value("palette", pk)), pal[pk])
 	bg_vis = clampf(float(cfg.get_value("display", "bg_vis", 0.30)), 0.1, 0.7)
 	var sc = cfg.get_value("library", "stars", {})
+	if int(cfg.get_value("library", "stars_v", 0)) != STAR_CACHE_VERSION:
+		sc = {}   # escala distinta: se recalculan las categorías
 	if sc is Dictionary:
 		star_cache = (sc as Dictionary).duplicate()
 	if cfg.has_section("best"):
@@ -3137,6 +3147,7 @@ func _save_settings() -> void:
 	cfg.set_value("display", "show_bg", show_bg)
 	cfg.set_value("display", "lang", lang)
 	cfg.set_value("library", "stars", star_cache)
+	cfg.set_value("library", "stars_v", STAR_CACHE_VERSION)
 	for pk in pal:
 		cfg.set_value("palette", pk, (pal[pk] as Color).to_html(false))
 	cfg.set_value("display", "bg_vis", bg_vis)
