@@ -235,13 +235,13 @@ const SLIDERS := [
 	{"y": 1920.0, "min": 0.0, "max": 1.0, "step": 0.05},
 	{"y": 2210.0, "min": 0.0, "max": 1.0, "step": 0.05},
 	{"y": 2500.0, "min": 0.5, "max": 1.5, "step": 0.05},
-	{"y": 2790.0, "min": -100.0, "max": 500.0, "step": 5.0},
+	{"y": 2790.0, "min": -600.0, "max": 600.0, "step": 5.0},
 ]
 var set_slider := -1
 var set_slider_id := -999
 
 # Calibración del audio tocando al ritmo
-const CAL_PERIOD := 0.8     # segundos entre clics
+const CAL_PERIOD := 1.2     # segundos entre clics
 const CAL_NEEDED := 8       # toques mínimos para dar un resultado
 var cal_player: AudioStreamPlayer = null
 var cal_taps: Array = []    # desvío de cada toque respecto al clic más cercano (segundos; + = tarde)
@@ -3213,7 +3213,7 @@ func _load_settings() -> void:
 	note_len = clampf(float(cfg.get_value("display", "note_len", 1.0)), 0.5, 1.5)
 	music_vol = clampf(float(cfg.get_value("display", "music_vol", 1.0)), 0.0, 1.0)
 	sfx_vol = clampf(float(cfg.get_value("display", "sfx_vol", 1.0)), 0.0, 1.0)
-	audio_delay_ms = clampf(float(cfg.get_value("display", "audio_delay_ms", 0.0)), -100.0, 500.0)
+	audio_delay_ms = clampf(float(cfg.get_value("display", "audio_delay_ms", 0.0)), -600.0, 600.0)
 	_apply_volumes()
 	var fav_list = cfg.get_value("library", "favorites", [])
 	if fav_list is Array:
@@ -4074,7 +4074,7 @@ func _draw_settings() -> void:
 	_draw_slider(1, "Volumen de la música", "%d %%" % roundi(music_vol * 100.0))
 	_draw_slider(2, "Volumen de los efectos", "%d %%" % roundi(sfx_vol * 100.0))
 	_draw_slider(3, "Largo de las notas", "%d %%" % roundi(note_len * 100.0))
-	_draw_slider(4, "Retraso del audio", "%d ms" % roundi(audio_delay_ms), 1.0, "Súbelo si con Bluetooth el sonido llega tarde")
+	_draw_slider(4, "Retraso del audio", "%d ms" % roundi(audio_delay_ms), 1.0, "Súbelo si el sonido llega tarde; bájalo si llega antes")
 	_panel(Rect2(80, 3120, w - 160, 180), panel_col, 34)
 	_text("Calibrar tocando al ritmo", Vector2(130, 3205), 40, Color.WHITE)
 	_text("Toca al compás de los clics y se ajusta solo", Vector2(130, 3255), 26, muted)
@@ -4458,7 +4458,7 @@ func _open_calibration() -> void:
 
 func _close_calibration(apply: bool) -> void:
 	if apply and cal_taps.size() >= CAL_NEEDED:
-		audio_delay_ms = clampf(snappedf(_median(cal_taps) * 1000.0, 5.0), -100.0, 500.0)
+		audio_delay_ms = clampf(snappedf(_median(cal_taps) * 1000.0, 5.0), -600.0, 600.0)
 		_save_settings()
 	if cal_player != null:
 		cal_player.stop()

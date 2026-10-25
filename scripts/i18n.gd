@@ -240,7 +240,7 @@ const EN := {
 	"Reiniciar": "Reset",
 	"Aplicar": "Apply",
 	"Retraso del audio": "Audio delay",
-	"Súbelo si con Bluetooth el sonido llega tarde": "Raise it if the sound arrives late over Bluetooth",
+	"Súbelo si el sonido llega tarde; bájalo si llega antes": "Raise it if the sound is late; lower it if it is early",
 	"Calibrar tocando al ritmo": "Calibrate by tapping the rhythm",
 	"Toca al compás de los clics y se ajusta solo": "Tap along with the clicks and it adjusts itself",
 	"Calibrar": "Calibrate",
