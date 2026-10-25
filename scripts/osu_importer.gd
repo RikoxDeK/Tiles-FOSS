@@ -419,3 +419,58 @@ static func suggest_speed(chart: Array, event_gap := MIN_EVENT_GAP) -> float:
 	var p10: float = gaps[int(gaps.size() * 0.1)]
 	var mult: float = TARGET_ROW_PX / (maxf(p10, event_gap) * BASE_SPEED)
 	return snappedf(clampf(mult, AUTO_SPEED_MIN, AUTO_SPEED_MAX), 0.1)
+
+
+## --- Estrellas estimadas -----------------------------------------------------
+## No es el cálculo oficial de osu!: se estima con los objetos ORIGINALES del mapa (antes de adaptarlo
+## a dos dedos) mirando cuántas notas por segundo hay en lo más intenso (pico) y en promedio.
+## Para ajustar la escala basta con cambiar estas dos cifras.
+const STAR_PEAK_K := 0.62
+const STAR_MEAN_K := 0.30
+
+static func estimate_stars(parsed: Dictionary) -> float:
+	var objs: Array = (parsed.get("objects", []) as Array).duplicate()
+	if objs.size() < 2:
+		return 0.0
+	objs.sort_custom(func(a, b): return float(a.time) < float(b.time))
+	# Eventos: objetos casi simultáneos (acordes) cuentan un poco más; las largas, también.
+	var ev_t: Array = []
+	var ev_w: Array = []
+	for o in objs:
+		var extra := 0.25 if float(o.end) - float(o.time) > 0.25 else 0.0
+		if not ev_t.is_empty() and float(o.time) - float(ev_t[ev_t.size() - 1]) <= 0.03:
+			ev_w[ev_w.size() - 1] = float(ev_w[ev_w.size() - 1]) + 0.35 + extra
+		else:
+			ev_t.append(float(o.time))
+			ev_w.append(1.0 + extra)
+	var total := 0.0
+	for w in ev_w:
+		total += float(w)
+	var active := 0.0   # tiempo con notas; los descansos largos no cuentan
+	for i in range(1, ev_t.size()):
+		active += minf(float(ev_t[i]) - float(ev_t[i - 1]), 3.0)
+	var mean := total / maxf(active, 1.0)
+	# Pico: ventanas de 2 s cada 0.5 s; se promedia el 5 % más intenso.
+	var rates: Array = []
+	var lo := 0
+	var hi := 0
+	var acc := 0.0
+	var t := float(ev_t[0])
+	var t_end := float(ev_t[ev_t.size() - 1])
+	while t <= t_end:
+		while hi < ev_t.size() and float(ev_t[hi]) < t + 2.0:
+			acc += float(ev_w[hi])
+			hi += 1
+		while lo < hi and float(ev_t[lo]) < t:
+			acc -= float(ev_w[lo])
+			lo += 1
+		rates.append(acc / 2.0)
+		t += 0.5
+	rates.sort()
+	rates.reverse()
+	var n_top := mini(rates.size(), maxi(3, int(rates.size() * 0.05)))
+	var peak := 0.0
+	for i in n_top:
+		peak += float(rates[i])
+	peak /= maxf(n_top, 1)
+	return snappedf(clampf(STAR_PEAK_K * peak + STAR_MEAN_K * mean, 0.0, 12.0), 0.01)

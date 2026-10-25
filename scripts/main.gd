@@ -116,6 +116,9 @@ var mod_hardcore := false
 const MOD_RATE := 2.0        # velocidad del modificador x2
 const HARDCORE_WIN := 0.6    # las ventanas de acierto se multiplican por esto en Hardcore
 const DIFF_MULT := [0.85, 1.0, 1.1, 1.2, 1.3]   # multiplicador de puntos por dificultad de notas
+## Vida que se pierde en modo Estándar (la barra completa vale 1.0; se multiplica por el HP del mapa, ~x1.0 con HP 5).
+const DRAIN_EMPTY := 0.12    # tocar donde no hay nota (originalmente 0.05)
+const DRAIN_MISS := 0.10     # dejar pasar una nota (como siempre)
 var health := 1.0            # barra de vida (modo Estándar)
 var health_armed := false    # la barra solo se vacía sola desde que se juega la primera nota
 var hp_rate := 5.0           # HPDrainRate del mapa de osu! (0-10)
@@ -491,6 +494,107 @@ func _drag_any(pos: Vector2, relative: Vector2, input_id: int) -> void:
 	if screen == Screen.GAME and input_id in active_inputs:
 		return   # la altura del dedo se fija al tocar: moverlo no cambia dónde se dibuja la larga
 	_library_drag(pos, relative, input_id)
+
+# --- Menús de pausa / vida perdida y estrellas de dificultad -----------------
+
+## Botones de los menús de pausa y de vida perdida: 0 arriba (salir/rendirse), 1 reiniciar, 2 continuar (abajo, lo más usado).
+func _menu_btn_rect(i: int) -> Rect2:
+	return Rect2(170, 830.0 + i * 145.0, viewport_size.x - 340, 120)
+
+## Categorías por estrellas (hasta el máximo indicado, sin incluirlo: 1.99 es Beginner y 2.0 ya es Normal). De fácil (cálido claro) a difícil (fuerte y oscuro).
+const STAR_TIERS := [
+	{"max": 2.0, "name": "Beginner", "color": Color(1.0, 0.88, 0.45), "dark": true},
+	{"max": 4.0, "name": "Normal", "color": Color(1.0, 0.72, 0.30), "dark": true},
+	{"max": 5.0, "name": "Medium", "color": Color(0.98, 0.52, 0.25), "dark": false},
+	{"max": 6.0, "name": "Hard", "color": Color(0.90, 0.28, 0.26), "dark": false},
+	{"max": 8.0, "name": "Very Hard", "color": Color(0.72, 0.13, 0.36), "dark": false},
+	{"max": 9.0, "name": "Extreme", "color": Color(0.48, 0.12, 0.50), "dark": false},
+	{"max": 999.0, "name": "Master", "color": Color(0.26, 0.10, 0.42), "dark": false},
+]
+var star_cache: Dictionary = {}   # "set_id|versión|tamaño" -> estrellas estimadas (se guarda en settings.cfg)
+
+func _tier_of(st: float) -> int:
+	for i in STAR_TIERS.size():
+		if st < float(STAR_TIERS[i].max):
+			return i
+	return STAR_TIERS.size() - 1
+
+func _stars_key(e: Dictionary) -> String:
+	return "%s|%s|%d" % [e.get("set_id", ""), e.get("version", ""), int(e.get("size", 0))]
+
+func _cache_stars(e: Dictionary, parsed: Dictionary) -> void:
+	star_cache[_stars_key(e)] = OsuImporter.estimate_stars(parsed)
+
+## Estrellas estimadas de una dificultad (-1 si no hay: demo o mapa ilegible). Se calcula una vez y se guarda.
+func _stars_of(e: Dictionary) -> float:
+	if e.get("demo", false) or not e.has("osu_path"):
+		return -1.0
+	var k := _stars_key(e)
+	if star_cache.has(k):
+		return float(star_cache[k])
+	var parsed: Dictionary = OsuImporter.parse_osu(FileAccess.get_file_as_string(String(e.osu_path)))
+	if not parsed.ok:
+		star_cache[k] = -1.0
+		return -1.0
+	_cache_stars(e, parsed)
+	return float(star_cache[k])
+
+## Calcula las estrellas de todas las dificultades de una canción y las ordena de fácil a difícil.
+func _ensure_group_stars(g: Dictionary) -> void:
+	if g.is_empty() or g.get("stars_sorted", false):
+		return
+	var before := star_cache.size()
+	for e in g.entries:
+		_stars_of(e)
+	g.entries.sort_custom(func(a, b):
+		if a.badge != b.badge:
+			return String(a.badge).naturalnocasecmp_to(String(b.badge)) < 0
+		return _stars_of(a) < _stars_of(b))
+	g["stars_sorted"] = true
+	if star_cache.size() != before:
+		_save_settings()
+
+func _text_fixed_c(value: String, cx: float, y: float, size: int, color: Color) -> void:
+	var w := _font().get_string_size(value, HORIZONTAL_ALIGNMENT_LEFT, -1, size).x
+	_text_fixed(value, Vector2(cx - w / 2.0, y), size, color)
+
+## Cuadro de color de la categoría con su nombre (sin mostrar el número de estrellas).
+func _draw_star_chip(r: Rect2, st: float) -> void:
+	var t: Dictionary = STAR_TIERS[_tier_of(st)]
+	_panel(r, t.color, 20)
+	var fg := Color(0.22, 0.12, 0.04) if t.dark else Color.WHITE
+	var size := 28 if r.size.y >= 60.0 else 24
+	_text_fixed_c(String(t.name), r.get_center().x, r.get_center().y + size * 0.35, size, fg)
+
+func _diff_pill_rect() -> Rect2:
+	return Rect2(80, 602, viewport_size.x - 160, 108)
+
+func _diff_pill_multi() -> bool:
+	var g := _group_of(String(current_song.get("set_id", "")))
+	return not g.is_empty() and g.entries.size() > 1
+
+## Dificultad de la canción dentro de "preparar": toca para elegir otra de la misma canción.
+func _draw_diff_pill() -> void:
+	var st := _stars_of(current_song)
+	if st < 0.0:
+		return
+	var r := _diff_pill_rect()
+	var multi := _diff_pill_multi()
+	_panel(r, Color(0.02, 0.04, 0.09, 0.78), 28)
+	_draw_star_chip(Rect2(r.position.x + 10, r.position.y + 10, 200, r.size.y - 20), st)
+	var tw := r.size.x - 236.0 - (90.0 if multi else 24.0)
+	_text(_fit(String(current_song.version), tw, 34), Vector2(r.position.x + 232, r.position.y + (52.0 if multi else 64.0)), 34, Color.WHITE)
+	if multi:
+		_text(_fit(T("Cambiar dificultad"), tw, 22), Vector2(r.position.x + 232, r.position.y + 88), 22, pcol("muted"))
+		var c := Vector2(r.end.x - 48, r.get_center().y)
+		draw_colored_polygon(PackedVector2Array([c + Vector2(-15, -8), c + Vector2(15, -8), c + Vector2(0, 11)]), pcol("text"))
+
+func _open_diffs() -> void:
+	var g := _group_of(String(current_song.get("set_id", "")))
+	if g.is_empty() or g.entries.size() < 2:
+		return
+	_ensure_group_stars(g)
+	overlay = "diffs"
 
 func _ready() -> void:
 	get_viewport().size_changed.connect(_resize)
@@ -968,6 +1072,7 @@ func _pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
 		elif Rect2(35, 45, 180, 95).has_point(pos): _stop_audio(); screen = Screen.LIBRARY
 		elif Rect2(235, 45, pw - 270, 95).has_point(pos): overlay = "addto"
 		elif Rect2(60, 175, 110, 110).has_point(pos): _toggle_preview()
+		elif _diff_pill_rect().has_point(pos) and _diff_pill_multi(): _open_diffs()
 		elif Rect2(110, 1295, 150, 90).has_point(pos): _adjust_diff(-1)
 		elif Rect2(pw - 260, 1295, 150, 90).has_point(pos): _adjust_diff(1)
 		elif Rect2(110, 1400, 150, 90).has_point(pos): _adjust_speed(-SPEED_STEP)
@@ -980,8 +1085,9 @@ func _pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
 		if life_menu:
 			pos.y -= ui_off
 			if life_menu_lock <= 0.0:
-				if Rect2(170, 760, viewport_size.x - 340, 135).has_point(pos): _give_up()
-				elif Rect2(170, 930, viewport_size.x - 340, 135).has_point(pos): _continue_after_life()
+				if _menu_btn_rect(0).has_point(pos): _give_up()
+				elif _menu_btn_rect(1).has_point(pos): _restart_run()
+				elif _menu_btn_rect(2).has_point(pos): _continue_after_life()
 			return
 		if resume_pending:
 			var rl: int = clampi(int(pos.x / (viewport_size.x / LANES)), 0, LANES - 1)
@@ -995,8 +1101,9 @@ func _pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
 			return
 		if paused:
 			pos.y -= ui_off
-			if Rect2(170, 760, viewport_size.x - 340, 135).has_point(pos): _set_paused(false)
-			elif Rect2(170, 930, viewport_size.x - 340, 135).has_point(pos): _go_library()
+			if _menu_btn_rect(0).has_point(pos): _go_prepare()
+			elif _menu_btn_rect(1).has_point(pos): _restart_run()
+			elif _menu_btn_rect(2).has_point(pos): _set_paused(false)
 			return
 		var lane: int = clampi(int(pos.x / (viewport_size.x / LANES)), 0, LANES - 1)
 		active_inputs[input_id] = lane
@@ -1095,7 +1202,7 @@ func _try_hit(lane: int, input_id: int) -> void:
 	if best.is_empty():
 		combo = 0; empties += 1; _set_judgement("VACÍO", 0.4)
 		_mark(lane, input_id)
-		_lose_life(0.05)
+		_lose_life(DRAIN_EMPTY)
 		return
 	if best.type == "hold":
 		best.holding = true; best.input_id = input_id
@@ -1129,7 +1236,7 @@ func _judgement_color(text: String) -> Color:
 func _miss(lane: int, effect_y: float) -> void:
 	health_armed = true
 	misses += 1; combo = 0; _set_judgement("MISS", 0.6)
-	_lose_life(0.10)
+	_lose_life(DRAIN_MISS)
 
 # --- Modo Vidas ----------------------------------------------------------
 
@@ -2205,6 +2312,14 @@ func _overlay_layout() -> Dictionary:
 		py = (viewport_size.y - h) / 2.0
 		for i in n_sort:
 			rows.append(Rect2(px + 30, py + 140 + i * 114.0, pw - 60, 100))
+	elif overlay == "diffs":
+		var gd := _group_of(String(current_song.get("set_id", "")))
+		var nd: int = gd.entries.size() if not gd.is_empty() else 0
+		var rh := clampf((viewport_size.y - 200.0 - 160.0 - 90.0) / maxf(nd, 1.0) - 14.0, 64.0, 100.0)
+		h = 160.0 + nd * (rh + 14.0) + 90.0
+		py = (viewport_size.y - h) / 2.0
+		for i in nd:
+			rows.append(Rect2(px + 30, py + 140 + i * (rh + 14.0), pw - 60, rh))
 	elif overlay == "songmenu":
 		h = 160.0 + 2 * 114.0 + 10.0
 		py = (viewport_size.y - h) / 2.0
@@ -2251,12 +2366,28 @@ func _draw_overlay() -> void:
 		title = _fit(String(menu_group.get("title", "")), panel.size.x - 80, 44)
 	elif overlay == "delconfirm":
 		title = "Eliminar canciones"
+	elif overlay == "diffs":
+		title = "Elegir dificultad"
 	_text(title, Vector2(panel.position.x + 40, panel.position.y + 86), 44, ink)
 	if overlay == "sort":
 		for i in lay.rows.size():
 			var r: Rect2 = lay.rows[i]
 			_panel(r, accent if i == sort_mode else soft, 22)
 			_text(SORT_MODES[i], Vector2(r.position.x + 36, r.get_center().y + 13), 36, Color.WHITE if i == sort_mode else ink)
+	elif overlay == "diffs":
+		var gd2 := _group_of(String(current_song.get("set_id", "")))
+		for i in lay.rows.size():
+			var rr: Rect2 = lay.rows[i]
+			var ee: Dictionary = gd2.entries[i]
+			var cur: bool = _ref(ee) == _ref(current_song)
+			_panel(rr, accent if cur else soft, 22)
+			var stv := _stars_of(ee)
+			var vw2 := rr.size.x - 60.0
+			if stv >= 0.0:
+				_draw_star_chip(Rect2(rr.end.x - 214.0, rr.position.y + 8.0, 204.0, rr.size.y - 16.0), stv)
+				vw2 -= 214.0
+			_text(_fit(String(ee.version), vw2, 34), Vector2(rr.position.x + 30, rr.get_center().y + 12), 34, Color.WHITE if cur else ink)
+		_text("Categoría estimada por el juego", Vector2(panel.position.x + 40, panel.end.y - 36), 22, _ink_soft())
 	elif overlay == "songmenu":
 		var r0: Rect2 = lay.rows[0]
 		_panel(r0, soft, 22)
@@ -2312,6 +2443,17 @@ func _overlay_tap(pos: Vector2) -> void:
 				_save_settings()
 				_apply_filter()
 				overlay = ""
+				return
+		if not panel.has_point(pos):
+			overlay = ""
+	elif overlay == "diffs":
+		var gd3 := _group_of(String(current_song.get("set_id", "")))
+		for i in lay.rows.size():
+			if lay.rows[i].has_point(pos):
+				var chosen: Dictionary = gd3.entries[i]
+				overlay = ""
+				if _ref(chosen) != _ref(current_song):
+					_select_song(chosen)
 				return
 		if not panel.has_point(pos):
 			overlay = ""
@@ -2480,9 +2622,10 @@ func _music_tap(pos: Vector2) -> void:
 			else:
 				_toggle_favorite(String(g.id))
 			return
-		if g.entries.size() == 1:
+		if g.entries.size() == 1 and g.get("in_playlist", false):
 			_select_song(g.entries[0])
 		else:
+			_ensure_group_stars(g)
 			open_group = g
 
 # --- Inicio --------------------------------------------------------------------
@@ -2698,16 +2841,12 @@ func _draw_card(g: Dictionary, x: float, y: float, w: float, kind: String) -> vo
 	var thumb: Texture2D = _group_thumb(g) if show_thumbs else null
 	if thumb != null:
 		_draw_cover(thumb, Rect2(x, y, 190, CARD_H))
-		if count > 1:
-			draw_rect(Rect2(x, y + CARD_H - 46, 190, 46), Color(0, 0, 0, 0.55))
-			_text_centered(T("%d dif.") % count, x + 95, y + CARD_H - 13, 28, Color.WHITE)
+		draw_rect(Rect2(x, y + CARD_H - 46, 190, 46), Color(0, 0, 0, 0.55))
+		_text_centered(T("%d dif.") % count, x + 95, y + CARD_H - 13, 28, Color.WHITE)
 	else:
 		draw_rect(Rect2(x, y, 190, CARD_H), _badge_color(first))
-		if count > 1:
-			_text_centered(first.badge, x + 95, y + CARD_H / 2 - 2, 44, Color.WHITE)
-			_text_centered(T("%d dif.") % count, x + 95, y + CARD_H / 2 + 44, 28, Color(1, 1, 1, 0.9))
-		else:
-			_text_centered(first.badge, x + 95, y + CARD_H / 2 + 15, 44, Color.WHITE)
+		_text_centered(first.badge, x + 95, y + CARD_H / 2 - 2, 44, Color.WHITE)
+		_text_centered(T("%d dif.") % count, x + 95, y + CARD_H / 2 + 44, 28, Color(1, 1, 1, 0.9))
 	_text(_fit(g.title, text_w, 38), Vector2(x + 215, y + 82), 38, ink)
 	var sub: String = (T("%s · %d dificultades") % [T(g.artist), count]) if count > 1 else ("%s · %s" % [T(g.artist), first.version])
 	_text(_fit(sub, text_w, 27), Vector2(x + 215, y + 132), 27, soft)
@@ -2871,6 +3010,7 @@ func _select_song(entry: Dictionary) -> void:
 		if not parsed.ok:
 			_show_status(parsed.error, true)
 			return
+		_cache_stars(entry, parsed)
 		var built := _build_from_parsed(parsed)
 		if built.is_empty():
 			_show_status("No quedaron notas jugables en este mapa", true)
@@ -2958,6 +3098,9 @@ func _load_settings() -> void:
 			if pal.has(pk):
 				pal[pk] = Color.from_string(String(cfg.get_value("palette", pk)), pal[pk])
 	bg_vis = clampf(float(cfg.get_value("display", "bg_vis", 0.30)), 0.1, 0.7)
+	var sc = cfg.get_value("library", "stars", {})
+	if sc is Dictionary:
+		star_cache = (sc as Dictionary).duplicate()
 	if cfg.has_section("best"):
 		for key in cfg.get_section_keys("best"):
 			var v = cfg.get_value("best", key)
@@ -2993,6 +3136,7 @@ func _save_settings() -> void:
 	cfg.set_value("library", "playlists", playlists)
 	cfg.set_value("display", "show_bg", show_bg)
 	cfg.set_value("display", "lang", lang)
+	cfg.set_value("library", "stars", star_cache)
 	for pk in pal:
 		cfg.set_value("palette", pk, (pal[pk] as Color).to_html(false))
 	cfg.set_value("display", "bg_vis", bg_vis)
@@ -3327,6 +3471,26 @@ func _toggle_preview() -> void:
 	fade_tween = create_tween()
 	fade_tween.tween_property(player, "volume_db", 0.0, 0.8)
 
+## Reinicia la canción desde el principio con los mismos ajustes.
+func _restart_run() -> void:
+	if infinite_run and screen == Screen.GAME and not finished:
+		_store_infinite_best()
+	life_menu = false
+	_start_game()
+
+## Sale de la partida y vuelve a "preparar" de la misma canción (no a la lista).
+func _go_prepare() -> void:
+	if infinite_run and screen == Screen.GAME and not finished:
+		_store_infinite_best()
+	_stop_audio()
+	paused = false
+	life_menu = false
+	resume_pending = false
+	overlay = ""
+	screen = Screen.PREPARE
+	_stop_ambient()
+	_ambient_play(audio_stream, true)
+
 func _go_library() -> void:
 	if infinite_run and screen == Screen.GAME and not finished:
 		_store_infinite_best()
@@ -3486,15 +3650,17 @@ func _draw_game() -> void:
 		else:
 			_text_outlined(str(lives_left), viewport_size.x / 2, 680, 150, _hot(), Color(0.02, 0.05, 0.12, 0.95), 14)
 			_text_centered("vidas restantes" if lives_left > 0 else "¡Última oportunidad!", viewport_size.x / 2, 735, 30, Color(0.82, 0.91, 1))
-		_button(Rect2(170, 760, viewport_size.x - 340, 135), "RENDIRSE", acol(pcol("danger").darkened(0.25), lk))
-		_button(Rect2(170, 930, viewport_size.x - 340, 135), "CONTINUAR", acol(pcol("accent"), lk))
+		_button(_menu_btn_rect(0), "RENDIRSE", acol(pcol("danger").darkened(0.25), lk))
+		_button(_menu_btn_rect(1), "REINICIAR", acol(pcol("button"), lk))
+		_button(_menu_btn_rect(2), "CONTINUAR", acol(pcol("accent"), lk))
 		draw_set_transform(Vector2.ZERO)
 	elif paused and not resume_pending:
 		draw_rect(Rect2(Vector2.ZERO,viewport_size), Color(0,0,0,0.74))
 		draw_set_transform(Vector2(0, ui_off))
-		_text_centered("PAUSA", viewport_size.x / 2, 600, 62, Color.WHITE)
-		_button(Rect2(170,760,viewport_size.x-340,135), "CONTINUAR", pcol("accent"))
-		_button(Rect2(170,930,viewport_size.x-340,135), "SALIR", pcol("button"))
+		_text_centered("PAUSA", viewport_size.x / 2, 690, 62, Color.WHITE)
+		_button(_menu_btn_rect(0), "SALIR", pcol("button"))
+		_button(_menu_btn_rect(1), "REINICIAR", pcol("button"))
+		_button(_menu_btn_rect(2), "CONTINUAR", pcol("accent"))
 		draw_set_transform(Vector2.ZERO)
 
 ## Tecla larga: degradado (claro arriba, oscuro abajo) con línea y círculo con brillo.
@@ -3601,7 +3767,12 @@ func _draw_difficulty_picker() -> void:
 			var ir := clampf(r.size.y * 0.13, 9.0, 16.0)
 			for k in cnt:
 				_draw_award(kind, Vector2(r.position.x + 65 + (k - (cnt - 1) / 2.0) * (ir * 2.6), r.position.y + r.size.y * 0.80), ir, true)
-		_text(_fit(e.version, r.size.x - 180.0, 34), Vector2(r.position.x + 155, r.get_center().y + 12), 34, pcol("ink"))
+		var vw := r.size.x - 180.0
+		var st := _stars_of(e)
+		if st >= 0.0:
+			_draw_star_chip(Rect2(r.end.x - 214.0, r.position.y + 10.0, 204.0, r.size.y - 20.0), st)
+			vw -= 214.0
+		_text(_fit(e.version, vw, 34), Vector2(r.position.x + 155, r.get_center().y + 12), 34, pcol("ink"))
 
 func _draw_prepare() -> void:
 	_background(); draw_set_transform(Vector2(0, ui_off))
@@ -3637,6 +3808,7 @@ func _draw_prepare() -> void:
 		var f := float(k + 1) / bands
 		draw_rect(Rect2(0, hero.end.y - 140.0 + k * 140.0 / bands, w, 140.0 / bands + 1.0), Color(navy.r, navy.g, navy.b, 0.98 * pow(f, 1.7)))
 		draw_rect(Rect2(0, hero.position.y + k * 50.0 / bands, w, 50.0 / bands + 1.0), Color(navy.r, navy.g, navy.b, 0.9 * (1.0 - f)))
+	_draw_diff_pill()
 	# Mejor récord de este modo, con los modificadores con que se logró.
 	_panel(Rect2(80, 745, w - 160, 250), acol(pcol("panel"), 0.92), 34)
 	var key := _song_key(current_song)

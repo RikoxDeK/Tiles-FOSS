@@ -222,4 +222,8 @@ const EN := {
 	"No se pudo abrir el archivo .osz": "Could not open the .osz file",
 	"No hay mapas compatibles (osu!mania u osu!standard)": "No compatible maps (osu!mania or osu!standard)",
 	"No se pudo escribir en el almacenamiento": "Could not write to storage",
+	"REINICIAR": "RESTART",
+	"Cambiar dificultad": "Change difficulty",
+	"Elegir dificultad": "Choose difficulty",
+	"Categoría estimada por el juego": "Category estimated by the game",
 }
