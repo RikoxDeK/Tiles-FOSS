@@ -28,10 +28,10 @@ const GREAT_WINDOW := 0.20
 ## Siempre se mantiene el límite de dos dedos y las reglas de comodidad.
 const DIFFICULTY_LEVELS := [
 	{"name": "Relajado", "event": 0.20, "lane": 0.14, "color": Color(0.5, 0.95, 0.75)},
-	{"name": "Normal", "event": 0.16, "lane": 0.12, "color": Color(1, 1, 1)},
-	{"name": "Intenso", "event": 0.125, "lane": 0.10, "color": Color(1.0, 0.75, 0.4)},
-	{"name": "Extremo", "event": 0.10, "lane": 0.085, "color": Color(1.0, 0.45, 0.45)},
-	{"name": "Máximo", "event": 0.08, "lane": 0.07, "color": Color(1.0, 0.5, 0.85)},
+	{"name": "Suave", "event": 0.16, "lane": 0.12, "color": Color(0.72, 0.9, 1.0)},
+	{"name": "Normal", "event": 0.125, "lane": 0.10, "color": Color(1, 1, 1)},
+	{"name": "Intenso", "event": 0.10, "lane": 0.085, "color": Color(1.0, 0.75, 0.4)},
+	{"name": "Extremo", "event": 0.08, "lane": 0.07, "color": Color(1.0, 0.45, 0.45)},
 ]
 const INBOX_NAME := "Por importar"
 const BACKUP_NAME := "Importadas"
@@ -115,7 +115,9 @@ var mod_spectator := false   # solo Estándar: juega solo una partida perfecta
 var mod_hardcore := false
 const MOD_RATE := 2.0        # velocidad del modificador x2
 const HARDCORE_WIN := 0.6    # las ventanas de acierto se multiplican por esto en Hardcore
-const DIFF_MULT := [0.85, 1.0, 1.1, 1.2, 1.3]   # multiplicador de puntos por dificultad de notas
+const DIFF_BASE := 2   # nivel de referencia: "Normal" (x1.00) y el que viene por defecto
+const DIFF_MULT := [0.8, 0.9, 1.0, 1.1, 1.2]   # multiplicador de puntos por dificultad de notas
+var level_mults: Array = DIFF_MULT.duplicate()   # el de arriba, ajustado al mapa abierto (ver _compute_level_mults)
 ## Vida que se pierde en modo Estándar (la barra completa vale 1.0; se multiplica por el HP del mapa, ~x1.0 con HP 5).
 const DRAIN_EMPTY := 0.12    # tocar donde no hay nota (originalmente 0.05)
 const DRAIN_MISS := 0.10     # dejar pasar una nota (como siempre)
@@ -137,7 +139,7 @@ var grace_time := 0.0        # tras continuar, un segundo sin perder vidas
 var failed := false
 var fail_text := ""
 var run_mult := 1.0
-var diff_level := 1          # índice en DIFFICULTY_LEVELS (1 = Normal)
+var diff_level := DIFF_BASE   # índice en DIFFICULTY_LEVELS (DIFF_BASE = Normal)
 var current_parsed: Dictionary = {}   # mapa .osu parseado de la canción abierta
 var library_dir := ""        # carpeta de canciones elegida ("" = sin configurar)
 var syncing := false
@@ -1364,7 +1366,7 @@ func _mods_mult() -> float:
 	if _mod_on("hardcore"): m *= 1.15
 	if _mod_on("nofail"): m *= 0.5
 	if _mod_on("perfect"): m *= 1.1
-	m *= float(DIFF_MULT[diff_level])
+	m *= float(level_mults[diff_level])
 	if game_mode == 1:
 		m *= _lives_mult(lives_setting)
 	return m
@@ -1376,11 +1378,13 @@ func _mods_text() -> String:
 	if _mod_on("perfect"): parts.append("Perfect")
 	if _mod_on("spectator"): parts.append(T("Espectador"))
 	if _mod_on("hardcore"): parts.append("Hardcore")
-	if diff_level != 1: parts.append(T(String(DIFFICULTY_LEVELS[diff_level].name)))
+	if diff_level != DIFF_BASE: parts.append(T(String(DIFFICULTY_LEVELS[diff_level].name)))
 	if game_mode == 1: parts.append(T("%d vidas") % lives_setting)
 	return " · ".join(parts)
 
 func _health_gain(text: String) -> void:
+	if text == "COMENZAR":
+		return   # la tecla de inicio no cuenta: la barra solo empieza a vaciarse con la primera nota jugada
 	health_armed = true
 	if game_mode != 0:
 		return
@@ -1681,25 +1685,62 @@ func _osz_files(dir: String) -> Array:
 			out.append(f)
 	return out
 
+var md5_cache: Dictionary = {}   # "nombre|tamaño" -> md5 (para no releer archivos grandes)
+
+func _file_size(path: String) -> int:
+	var f := FileAccess.open(path, FileAccess.READ)
+	if f == null:
+		return 0
+	var n := int(f.get_length())
+	f.close()
+	return n
+
+## Id de canción de un .osz de la carpeta de respaldo: el [id] del nombre o, si no lo tiene, su md5.
+func _backup_file_id(dir: String, f: String) -> String:
+	var fid := _id_from_name(f)
+	if fid != "":
+		return fid
+	var key := "%s|%d" % [dir.path_join(f), _file_size(dir.path_join(f))]
+	if not md5_cache.has(key):
+		md5_cache[key] = FileAccess.get_md5(dir.path_join(f)).substr(0, 10)
+	return String(md5_cache[key])
+
+## Canciones que ya tienen copia en la carpeta de respaldo: id -> cuántos archivos hay de ella.
+func _backup_ids(dir: String) -> Dictionary:
+	var ids := {}
+	for f in _osz_files(dir):
+		var id := _backup_file_id(dir, f)
+		ids[id] = int(ids.get(id, 0)) + 1
+	return ids
+
 ## Copia un .osz a la carpeta de respaldo (sin duplicar). true si queda guardado.
+## Si la canción ya tiene copia solo se reemplaza cuando el archivo nuevo es más grande: el .osz original
+## trae storyboard, vídeo y hitsounds, y el que genera "Exportar" no.
 func _backup_copy(src: String, backup_dir: String, id: String, name: String) -> bool:
 	var target := backup_dir.path_join(name)
-	if FileAccess.file_exists(target):
-		if FileAccess.get_md5(target).substr(0, 10) == id:
-			return true
-		target = backup_dir.path_join("%s_%s" % [id, name])
-		if FileAccess.file_exists(target):
-			return true
+	var existing := ""
+	for ex in _osz_files(backup_dir):
+		if _backup_file_id(backup_dir, ex) == id:
+			existing = backup_dir.path_join(ex)
+			break
+	if existing != "" and _file_size(src) <= _file_size(existing):
+		return true
 	if DirAccess.copy_absolute(src, target) != OK:
 		var bytes := FileAccess.get_file_as_bytes(src)
 		if bytes.is_empty():
 			return false
 		var out := FileAccess.open(target, FileAccess.WRITE)
 		if out == null:
+			if OS.has_feature("android"):
+				OS.request_permissions()
+			_show_status("Sin acceso a la carpeta. Concede \"acceso a todos los archivos\" a la app y pulsa el botón otra vez.", true, 10.0)
 			return false
 		out.store_buffer(bytes)
 		out.close()
-	return FileAccess.file_exists(target)
+	var saved := FileAccess.file_exists(target)
+	if saved and existing != "" and existing != target:
+		DirAccess.remove_absolute(existing)   # la copia anterior (más pequeña) queda reemplazada
+	return saved
 
 func _progress_path() -> String:
 	return library_dir.path_join(PROGRESS_FILE) if library_dir != "" else ""
@@ -1838,14 +1879,14 @@ func _export_library() -> void:
 		return
 	_save_settings()   # guarda la carpeta (une antes progreso.cfg si ya existía)
 	var backup := library_dir.path_join(BACKUP_NAME)
-	var have := "\n".join(_osz_files(backup))
+	var have: Dictionary = _backup_ids(backup)
 	var todo: Array = []
 	var total := 0
 	for g in groups:
 		if g.id == "demo":
 			continue
 		total += 1
-		if not have.contains("[%s]" % g.id):
+		if not have.has(String(g.id)):
 			todo.append(g)
 	var done := 0
 	var failed := 0
@@ -1908,13 +1949,17 @@ func _sync_folder() -> void:
 			await get_tree().process_frame
 			good = OsuImporter.import_osz(ipath).ok
 		if good:
-			if _backup_copy(ipath, backup, id, f):
+			var bname: String = f if _id_from_name(f) == id else "%s [%s].osz" % [OsuImporter.safe_name(f.get_basename()), id]
+			if _backup_copy(ipath, backup, id, bname):
 				DirAccess.remove_absolute(ipath)
 			imported += 1
 		else:
 			failed += 1
 	_refresh_library()
-	var msg := T("Listo: %d importadas, %d restauradas (vi %d en Por importar y %d en Importadas)") % [imported, restored, inbox_files.size(), backup_files.size()]
+	var uniq: int = _backup_ids(backup).size()
+	var msg := T("Listo: %d importadas, %d restauradas (vi %d en Por importar y %d en Importadas)") % [imported, restored, inbox_files.size(), uniq]
+	if backup_files.size() > uniq:
+		msg += T(" · %d archivos repetidos en Importadas") % (backup_files.size() - uniq)
 	if failed > 0:
 		msg += T(", %d con error") % failed
 	if total == 0:
@@ -2644,7 +2689,7 @@ func _rebuild_home() -> void:
 	for key in bests:
 		var k := String(key)
 		var inf := false
-		var lvl := 1
+		var lvl := DIFF_BASE
 		if k.ends_with("|inf"):
 			inf = true
 			k = k.trim_suffix("|inf")
@@ -2965,6 +3010,30 @@ func _build_from_parsed(parsed: Dictionary) -> Dictionary:
 		"dropped": parsed.objects.size() - playable.size(),
 	}
 
+## Si varios niveles de intensidad dejan exactamente las mismas notas (mapas fáciles), no tiene sentido
+## premiar ni castigar la diferencia: todos los niveles iguales comparten el multiplicador del que
+## esté más cerca de Normal (x1.00).
+func _compute_level_mults(parsed: Dictionary) -> void:
+	level_mults = DIFF_MULT.duplicate()
+	if parsed.is_empty():
+		return
+	var sigs: Array = []
+	for i in DIFFICULTY_LEVELS.size():
+		var lvl: Dictionary = DIFFICULTY_LEVELS[i]
+		var ch: Array = OsuImporter.build_chart(parsed, OsuImporter.DEFAULT_MAX_FINGERS, float(lvl.event), float(lvl.lane))
+		var parts := PackedStringArray()
+		for n in ch:
+			parts.append("%d|%d|%s|%d" % [roundi(float(n.time) * 1000.0), int(n.lane), String(n.type), roundi(float(n.get("duration", 0.0)) * 1000.0)])
+		sigs.append("\n".join(parts).hash())
+	for i in sigs.size():
+		var lo := i
+		var hi := i
+		for j in sigs.size():
+			if sigs[j] == sigs[i]:
+				lo = mini(lo, j)
+				hi = maxi(hi, j)
+		level_mults[i] = DIFF_MULT[clampi(DIFF_BASE, lo, hi)]
+
 ## Reconstruye el chart de la canción abierta (al cambiar la dificultad en "preparar").
 func _rebuild_chart() -> bool:
 	if current_parsed.is_empty():
@@ -3043,6 +3112,7 @@ func _select_song(entry: Dictionary) -> void:
 		duration = stream.get_length()
 	chart = new_chart; chart_end = new_end; use_lead_in = new_lead; first_note_time = new_first; auto_mult = new_auto
 	audio_stream = stream; current_song = entry; current_parsed = new_parsed
+	_compute_level_mults(new_parsed)
 	_reload_bg()
 	song_stats = {"notes": note_count, "holds": hold_count, "duration": duration, "dropped": dropped, "total": total}
 	screen = Screen.PREPARE
@@ -3073,7 +3143,9 @@ func _load_settings() -> void:
 	mod_perfect = bool(cfg.get_value("mods", "perfect", false))
 	mod_spectator = bool(cfg.get_value("mods", "spectator", false))
 	mod_hardcore = bool(cfg.get_value("mods", "hardcore", false))
-	diff_level = clampi(int(cfg.get_value("mods", "diff", 1)), 0, DIFFICULTY_LEVELS.size() - 1)
+	diff_level = clampi(int(cfg.get_value("mods", "diff", DIFF_BASE)), 0, DIFFICULTY_LEVELS.size() - 1)
+	if int(cfg.get_value("mods", "diff_v", 1)) < 2:
+		diff_level = DIFF_BASE   # los niveles se renombraron: el Normal de ahora era el Intenso
 	library_dir = String(cfg.get_value("library", "dir", ""))
 	lives_setting = clampi(int(cfg.get_value("mods", "lives", 3)), LIVES_MIN, LIVES_MAX)
 	show_thumbs = bool(cfg.get_value("display", "show_thumbs", true))
@@ -3129,6 +3201,7 @@ func _save_settings() -> void:
 	cfg.set_value("mods", "spectator", mod_spectator)
 	cfg.set_value("mods", "hardcore", mod_hardcore)
 	cfg.set_value("mods", "diff", diff_level)
+	cfg.set_value("mods", "diff_v", 2)
 	cfg.set_value("library", "dir", library_dir)
 	cfg.set_value("mods", "lives", lives_setting)
 	cfg.set_value("display", "show_thumbs", show_thumbs)
