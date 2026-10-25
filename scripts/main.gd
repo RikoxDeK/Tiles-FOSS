@@ -1,6 +1,6 @@
 extends Node2D
 
-enum Screen { LIBRARY, PREPARE, GAME, RESULTS, SETTINGS, PALETTE }
+enum Screen { LIBRARY, PREPARE, GAME, RESULTS, SETTINGS, PALETTE, CALIBRATE }
 const LANES := 4
 const NORMAL_HEIGHT := 455.0
 const BASE_SPEED := 760.0
@@ -78,7 +78,7 @@ var set_scroll := 0.0    # desplazamiento de Ajustes
 var set_press_id := -999
 var set_press_pos := Vector2.ZERO
 var set_dragged := false
-const SETTINGS_END := 2820.0   # fin del contenido de Ajustes (unidades de 1080 px)
+const SETTINGS_END := 3330.0   # fin del contenido de Ajustes (unidades de 1080 px)
 var prep_tex: Texture2D = null   # imagen del mapa en Preparar
 var input_y: Dictionary = {}   # altura (y) del dedo de cada toque, para dibujar la larga donde lo pones
 var effects: Array = []
@@ -209,7 +209,44 @@ var first_idx := 0          # primera nota que aún no se resolvió (notas orden
 var player: AudioStreamPlayer
 var audio_stream: AudioStream = null
 var audio_started := false
-var audio_offset := 0.0     # calibración manual en segundos (futuro: pantalla de calibración)
+var audio_offset := 0.0     # compensación fija en segundos (se deja en 0; usa audio_delay_ms)
+var audio_delay_ms := 0.0   # ajuste: retraso del audio (Bluetooth) en ms. Positivo = el sonido llega tarde, las notas se retrasan igual
+
+# Animaciones suaves (todo se dibuja a mano, así que cada transición es un progreso 0..1)
+var trans_t := 0.0          # progreso del fundido al cambiar de pantalla o pestaña
+var trans_len := 0.4
+var last_screen := Screen.LIBRARY
+var last_tab := TAB_HOME
+var last_sub := -1
+var last_nav := 0
+var nav_anim: Array = [1.0, 0.0, 0.0, 0.0]   # cuánto está "activo" cada icono de la barra (0..1)
+var nav_pop: Array = [0.0, 0.0, 0.0, 0.0]    # rebote al elegir una pestaña
+var ov_p := 0.0             # progreso de apertura de las ventanas (overlay)
+var ov_last := ""
+var ov_group_p := 0.0       # progreso de apertura del selector de dificultades
+var ov_group_last: Dictionary = {}
+var mode_menu_p := 0.0
+var res_t := 0.0            # segundos desde que se muestran los resultados
+
+# Deslizadores de Ajustes
+const SLIDER_X := 130.0
+const SLIDERS := [
+	{"y": 540.0, "min": 0.1, "max": 0.7, "step": 0.05},
+	{"y": 1920.0, "min": 0.0, "max": 1.0, "step": 0.05},
+	{"y": 2210.0, "min": 0.0, "max": 1.0, "step": 0.05},
+	{"y": 2500.0, "min": 0.5, "max": 1.5, "step": 0.05},
+	{"y": 2790.0, "min": -100.0, "max": 500.0, "step": 5.0},
+]
+var set_slider := -1
+var set_slider_id := -999
+
+# Calibración del audio tocando al ritmo
+const CAL_PERIOD := 0.8     # segundos entre clics
+const CAL_NEEDED := 8       # toques mínimos para dar un resultado
+var cal_player: AudioStreamPlayer = null
+var cal_taps: Array = []    # desvío de cada toque respecto al clic más cercano (segundos; + = tarde)
+var cal_last := 0.0
+var cal_pulse := 0.0
 
 # Biblioteca
 var groups: Array = []          # una entrada por canción, con todas sus dificultades
@@ -486,7 +523,12 @@ func _drag_any(pos: Vector2, relative: Vector2, input_id: int) -> void:
 		if input_id == pal_drag_id:
 			_pal_drag_to(pos.x)
 		return
+	if screen == Screen.CALIBRATE:
+		return
 	if screen == Screen.SETTINGS:
+		if input_id == set_slider_id:
+			_slider_apply(set_slider, pos.x)
+			return
 		if input_id == set_press_id:
 			if not set_dragged and pos.distance_to(set_press_pos) > 24.0:
 				set_dragged = true
@@ -664,6 +706,8 @@ func _go_back() -> void:
 			screen = Screen.LIBRARY
 		Screen.PALETTE:
 			screen = Screen.SETTINGS
+		Screen.CALIBRATE:
+			_close_calibration(false)
 		Screen.RESULTS:
 			open_group = {}
 			screen = Screen.LIBRARY
@@ -762,6 +806,7 @@ func _process(delta: float) -> void:
 				dying.remove_at(i)
 		elif dd.t >= DIE_TIME:
 			dying.remove_at(i)
+	_anim_tick(delta)
 	queue_redraw()
 
 func _sync_audio() -> void:
@@ -776,7 +821,7 @@ func _sync_audio() -> void:
 		return
 	# El reloj avanza con delta y se corrige suavemente contra la posición real del audio.
 	# La posición del audio va en segundos de la canción; latencia y mezcla van en segundos reales.
-	var audio_time := player.get_playback_position() + (AudioServer.get_time_since_last_mix() - AudioServer.get_output_latency()) * play_rate + audio_offset
+	var audio_time := player.get_playback_position() + (AudioServer.get_time_since_last_mix() - AudioServer.get_output_latency() - audio_delay_ms / 1000.0) * play_rate + audio_offset
 	var error := audio_time - song_time
 	if abs(error) > 0.08:
 		song_time = audio_time
@@ -1014,9 +1059,17 @@ func _settings_pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
 	if pressed:
 		if _nav_tap(pos):
 			return
+		var sl := _slider_hit(Vector2(pos.x, pos.y + set_scroll - ui_off))
+		if sl >= 0:
+			set_slider = sl
+			set_slider_id = input_id
+			_slider_apply(sl, pos.x)
+			return
 		set_press_id = input_id
 		set_press_pos = pos
 		set_dragged = false
+	elif input_id == set_slider_id:
+		_slider_release()
 	elif input_id == set_press_id:
 		set_press_id = -999
 		if not set_dragged:
@@ -1029,8 +1082,6 @@ func _settings_tap(pos: Vector2) -> void:
 		show_bg = not show_bg; _reload_bg(); _save_settings()
 	elif Rect2(80, 870, w - 160, 180).has_point(pos):
 		show_thumbs = not show_thumbs; _save_settings()
-	elif show_bg and Rect2(130, 690, 170, 110).has_point(pos): _adjust_bg(-0.05)
-	elif show_bg and Rect2(w - 300, 690, 170, 110).has_point(pos): _adjust_bg(0.05)
 	elif _lang_rect(0).has_point(pos): _set_lang("es")
 	elif _lang_rect(1).has_point(pos): _set_lang("en")
 	elif Rect2(80, 1290, w - 160, 180).has_point(pos): _open_palette()
@@ -1043,12 +1094,7 @@ func _settings_tap(pos: Vector2) -> void:
 			amb_retry = 0.0
 		else:
 			_stop_ambient()
-	elif Rect2(130, 2040, 170, 110).has_point(pos): _adjust_music_vol(-0.1)
-	elif Rect2(w - 300, 2040, 170, 110).has_point(pos): _adjust_music_vol(0.1)
-	elif Rect2(130, 2620, 170, 110).has_point(pos): _adjust_note_len(-0.1)
-	elif Rect2(w - 300, 2620, 170, 110).has_point(pos): _adjust_note_len(0.1)
-	elif Rect2(130, 2330, 170, 110).has_point(pos): _adjust_sfx_vol(-0.1)
-	elif Rect2(w - 300, 2330, 170, 110).has_point(pos): _adjust_sfx_vol(0.1)
+	elif Rect2(80, 3120, w - 160, 180).has_point(pos): _open_calibration()
 
 func _key_lane(event: InputEventKey) -> int:
 	var key: Key = event.physical_keycode
@@ -1059,6 +1105,9 @@ func _key_lane(event: InputEventKey) -> int:
 	return -1
 
 func _pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
+	if screen == Screen.CALIBRATE:
+		_calibrate_pointer(pos, pressed, input_id)
+		return
 	if screen == Screen.SETTINGS:
 		_settings_pointer(pos, pressed, input_id)
 		return
@@ -1987,7 +2036,7 @@ func _nav_rect(i: int) -> Rect2:
 	return Rect2(i * cw, viewport_size.y - NAV_H, cw, NAV_H)
 
 func _nav_active() -> int:
-	return 3 if screen == Screen.SETTINGS or screen == Screen.PALETTE else tab
+	return 3 if screen == Screen.SETTINGS or screen == Screen.PALETTE or screen == Screen.CALIBRATE else tab
 
 func _mode_btn_center() -> Vector2:
 	return Vector2(viewport_size.x / 2.0, _nav_curve_y(viewport_size.x / 2.0) + 58.0)
@@ -2033,8 +2082,9 @@ func _draw_mode_button() -> void:
 	_draw_mode_icon(game_mode, c, 20.0, Color.WHITE)
 	_text_centered("Estándar" if game_mode == 0 else "Tiles", c.x, c.y + 38.0 + 30.0 + 22.0, 28, Color.WHITE)
 
-func _draw_mode_menu() -> void:
-	draw_rect(Rect2(0, 0, viewport_size.x, _nav_curve_y(viewport_size.x / 2.0)), Color(0, 0, 0, 0.55))
+func _draw_mode_menu(p := 1.0) -> void:
+	draw_rect(Rect2(0, 0, viewport_size.x, _nav_curve_y(viewport_size.x / 2.0)), Color(0, 0, 0, 0.55 * p))
+	draw_set_transform(Vector2(0, (1.0 - _ease_out(p)) * 70.0))
 	for i in 2:
 		var r := _mode_opt_rect(i)
 		var col := pcol("accent") if i == 0 else pcol("violet")
@@ -2045,6 +2095,7 @@ func _draw_mode_menu() -> void:
 			draw_style_box(_outline_box(56), r)
 		_draw_mode_icon(i, Vector2(r.position.x + 70, r.get_center().y), 22.0, Color.WHITE)
 		_text("Estándar" if i == 0 else "Tiles", Vector2(r.position.x + 130, r.get_center().y + 13), 40, Color.WHITE)
+	draw_set_transform(Vector2.ZERO)
 
 func _outline_box(radius: float) -> StyleBoxFlat:
 	var b := StyleBoxFlat.new()
@@ -2131,25 +2182,25 @@ func _draw_nav() -> void:
 	draw_polyline(top, _nav_edge(), 4.0)
 	var labels := ["Inicio", "Música", "Archivos", "Ajustes"]
 	var colors := [pcol("nav_home"), pcol("nav_music"), pcol("nav_files"), pcol("nav_settings")]
-	var active := _nav_active()
 	for i in 4:
 		var r := _nav_rect(i)
 		var cx := r.get_center().x
 		var ytop := _nav_curve_y(cx)
-		var on := i == active
-		var rad := 44.0 if on else 38.0
-		var cc := Vector2(cx, ytop + 58.0 - (8.0 if on else 0.0))
+		var k: float = nav_anim[i]
+		var pop := sin(float(nav_pop[i]) * PI)
+		var rad := lerpf(38.0, 44.0, k) * (1.0 + 0.10 * pop)
+		var cc := Vector2(cx, ytop + 58.0 - 8.0 * k - 10.0 * pop)
 		var base: Color = colors[i]
 		draw_circle(cc + Vector2(0, 5), rad, Color(0, 0, 0, 0.25))
 		draw_circle(cc, rad, base)
 		draw_arc(cc, rad - 5.0, PI * 1.12, PI * 1.88, 16, Color(1, 1, 1, 0.35), 5.0)
-		if on:
-			draw_arc(cc, rad + 3.0, 0.0, TAU, 40, Color.WHITE, 5.0)
-		_draw_nav_icon(i, cc, 18.0 if on else 16.0, base.lerp(Color.WHITE, 0.85))
-		_text_centered(labels[i], cx, ytop + 58.0 + 38.0 + 30.0, 28, Color.WHITE if on else pcol("muted").lerp(Color.WHITE, 0.25))
+		if k > 0.02:
+			draw_arc(cc, rad + 3.0, 0.0, TAU, 40, Color(1, 1, 1, k), 5.0)
+		_draw_nav_icon(i, cc, lerpf(16.0, 18.0, k) * (1.0 + 0.10 * pop), base.lerp(Color.WHITE, 0.85))
+		_text_centered(labels[i], cx, ytop + 58.0 + 38.0 + 30.0, 28, pcol("muted").lerp(Color.WHITE, 0.25).lerp(Color.WHITE, k))
 	_draw_mode_button()
-	if mode_menu:
-		_draw_mode_menu()
+	if mode_menu or mode_menu_p > 0.0:
+		_draw_mode_menu(mode_menu_p)
 
 # --- Listas de reproducción -------------------------------------------------
 
@@ -2401,14 +2452,17 @@ func _overlay_layout() -> Dictionary:
 		extra["ok"] = Rect2(px + 60 + bw, py + 300, bw, 100)
 	return {"panel": Rect2(px, py, pw, h), "rows": rows, "extra": extra}
 
-func _draw_overlay() -> void:
+func _draw_overlay(p := 1.0) -> void:
 	draw_set_transform(Vector2.ZERO)
-	draw_rect(Rect2(Vector2.ZERO, viewport_size), Color(0, 0, 0, 0.62))
+	draw_rect(Rect2(Vector2.ZERO, viewport_size), Color(0, 0, 0, 0.62 * p))
 	var lay := _overlay_layout()
 	var panel: Rect2 = lay.panel
 	var ink := pcol("ink")
 	var soft := _soft()
 	var accent := pcol("accent")
+	var e := 1.0 if overlay == "newlist" else _ease_out(p)   # la caja de texto no se mueve, así que ahí no hay desplazamiento
+	var sc := lerpf(0.94, 1.0, e)
+	draw_set_transform(panel.get_center() * (1.0 - sc) + Vector2(0, (1.0 - e) * 60.0), 0.0, Vector2(sc, sc))
 	_panel(panel, pcol("card"), 34)
 	var title := "Ordenar por"
 	if overlay == "addto":
@@ -2484,6 +2538,7 @@ func _draw_overlay() -> void:
 		name_edit.size = er.size
 		_button(ex2["cancel"], "Cancelar", pcol("button"))
 		_button(ex2["ok"], "Crear", accent)
+	draw_set_transform(Vector2.ZERO)
 
 func _overlay_tap(pos: Vector2) -> void:
 	var lay := _overlay_layout()
@@ -2988,7 +3043,11 @@ func _draw_library() -> void:
 		_draw_music()
 	_draw_nav()
 	if not open_group.is_empty():
-		_draw_difficulty_picker()
+		_draw_difficulty_picker(ov_group_p)
+	elif ov_group_p > 0.0 and not ov_group_last.is_empty():
+		open_group = ov_group_last   # cerrándose: se dibuja un momento más mientras se desvanece
+		_draw_difficulty_picker(ov_group_p)
+		open_group = {}
 
 
 ## Construye el chart jugable de un mapa parseado con el nivel de dificultad actual.
@@ -3154,6 +3213,7 @@ func _load_settings() -> void:
 	note_len = clampf(float(cfg.get_value("display", "note_len", 1.0)), 0.5, 1.5)
 	music_vol = clampf(float(cfg.get_value("display", "music_vol", 1.0)), 0.0, 1.0)
 	sfx_vol = clampf(float(cfg.get_value("display", "sfx_vol", 1.0)), 0.0, 1.0)
+	audio_delay_ms = clampf(float(cfg.get_value("display", "audio_delay_ms", 0.0)), -100.0, 500.0)
 	_apply_volumes()
 	var fav_list = cfg.get_value("library", "favorites", [])
 	if fav_list is Array:
@@ -3210,6 +3270,7 @@ func _save_settings() -> void:
 	cfg.set_value("display", "note_len", note_len)
 	cfg.set_value("display", "music_vol", music_vol)
 	cfg.set_value("display", "sfx_vol", sfx_vol)
+	cfg.set_value("display", "audio_delay_ms", audio_delay_ms)
 	cfg.set_value("library", "favorites", favorites.keys())
 	cfg.set_value("library", "sort", sort_mode)
 	cfg.set_value("library", "last_id", String(last_played.get("id", "")))
@@ -3601,10 +3662,17 @@ func _draw() -> void:
 	elif screen == Screen.GAME: _draw_game()
 	elif screen == Screen.SETTINGS: _draw_settings()
 	elif screen == Screen.PALETTE: _draw_palette()
+	elif screen == Screen.CALIBRATE: _draw_calibrate()
 	else: _draw_results()
 	draw_set_transform(Vector2.ZERO)
-	if overlay != "" and (screen == Screen.LIBRARY or screen == Screen.PREPARE):
-		_draw_overlay()
+	if screen == Screen.LIBRARY or screen == Screen.PREPARE:
+		if overlay != "":
+			_draw_overlay(ov_p)
+		elif ov_p > 0.0 and ov_last != "":
+			overlay = ov_last   # cerrándose: se dibuja un momento más mientras se desvanece
+			_draw_overlay(ov_p)
+			overlay = ""
+	_draw_trans_cover()
 
 func _draw_game() -> void:
 	var lane_w := viewport_size.x / LANES
@@ -3814,10 +3882,13 @@ func _draw_hold_tile(rect: Rect2, active: bool, line_y: float) -> void:
 	draw_arc(head, radius, 0, TAU, 48, acol(glow, 0.9), 6.0, true)
 	draw_arc(head, radius - 5.0, 0, TAU, 48, Color(1, 1, 1, 0.55), 2.0, true)
 
-func _draw_difficulty_picker() -> void:
-	draw_rect(Rect2(Vector2.ZERO, viewport_size), Color(0, 0, 0, 0.62))
+func _draw_difficulty_picker(p := 1.0) -> void:
+	var ease_p := _ease_out(p)
+	draw_rect(Rect2(Vector2.ZERO, viewport_size), Color(0, 0, 0, 0.62 * p))
 	var layout := _picker_layout()
 	var panel: Rect2 = layout.panel
+	var sc := lerpf(0.94, 1.0, ease_p)
+	draw_set_transform(panel.get_center() * (1.0 - sc) + Vector2(0, (1.0 - ease_p) * 60.0), 0.0, Vector2(sc, sc))
 	_panel(panel, pcol("card"), 34)
 	var inner_w := panel.size.x - 80.0
 	_text(_fit(open_group.title, inner_w, 44), Vector2(panel.position.x + 40, panel.position.y + 76), 44, pcol("ink"))
@@ -3857,6 +3928,7 @@ func _draw_difficulty_picker() -> void:
 			_draw_star_chip(Rect2(r.end.x - 214.0, r.position.y + 10.0, 204.0, r.size.y - 20.0), st)
 			vw -= 214.0
 		_text(_fit(e.version, vw, 34), Vector2(r.position.x + 155, r.get_center().y + 12), 34, pcol("ink"))
+	draw_set_transform(Vector2.ZERO)
 
 func _draw_prepare() -> void:
 	_background(); draw_set_transform(Vector2(0, ui_off))
@@ -3977,12 +4049,7 @@ func _draw_settings() -> void:
 	_text("Fondos de los mapas", Vector2(130, 415), 40, Color.WHITE)
 	_text("Imagen del mapa detrás de las teclas", Vector2(130, 465), 26, muted)
 	_button(Rect2(w - 330, 375, 200, 90), "SÍ" if show_bg else "NO", on_col if show_bg else off_col)
-	var a := 1.0 if show_bg else 0.4
-	_panel(Rect2(80, 540, w - 160, 300), acol(pcol("panel"), 0.92 * a), 34)
-	_text("Visibilidad del fondo", Vector2(130, 625), 40, Color(1, 1, 1, a))
-	_button(Rect2(130, 690, 170, 110), "-", acol(off_col, a))
-	_button(Rect2(w - 300, 690, 170, 110), "+", acol(off_col, a))
-	_text_centered("%d %%" % roundi(bg_vis * 100.0), w / 2, 765, 56, Color(1, 1, 1, a))
+	_draw_slider(0, "Visibilidad del fondo", "%d %%" % roundi(bg_vis * 100.0), 1.0 if show_bg else 0.4)
 	_panel(Rect2(80, 870, w - 160, 180), panel_col, 34)
 	_text("Miniaturas de canciones", Vector2(130, 955), 40, Color.WHITE)
 	_text("Imagen del mapa en cada canción de la lista", Vector2(130, 1005), 26, muted)
@@ -4004,21 +4071,14 @@ func _draw_settings() -> void:
 	_text("Música de fondo", Vector2(130, 1795), 40, Color.WHITE)
 	_text("Suena en el inicio y los menús", Vector2(130, 1845), 26, muted)
 	_button(Rect2(w - 330, 1755, 200, 90), "SÍ" if amb_enabled else "NO", on_col if amb_enabled else off_col)
-	_panel(Rect2(80, 1920, w - 160, 300), panel_col, 34)
-	_text("Volumen de la música", Vector2(130, 2005), 40, Color.WHITE)
-	_button(Rect2(130, 2040, 170, 110), "-", off_col)
-	_button(Rect2(w - 300, 2040, 170, 110), "+", off_col)
-	_text_centered("%d %%" % roundi(music_vol * 100.0), w / 2, 2115, 56, Color.WHITE)
-	_panel(Rect2(80, 2210, w - 160, 300), panel_col, 34)
-	_text("Volumen de los efectos", Vector2(130, 2295), 40, Color.WHITE)
-	_button(Rect2(130, 2330, 170, 110), "-", off_col)
-	_button(Rect2(w - 300, 2330, 170, 110), "+", off_col)
-	_text_centered("%d %%" % roundi(sfx_vol * 100.0), w / 2, 2405, 56, Color.WHITE)
-	_panel(Rect2(80, 2500, w - 160, 300), panel_col, 34)
-	_text("Largo de las notas", Vector2(130, 2585), 40, Color.WHITE)
-	_button(Rect2(130, 2620, 170, 110), "-", off_col)
-	_button(Rect2(w - 300, 2620, 170, 110), "+", off_col)
-	_text_centered("%d %%" % roundi(note_len * 100.0), w / 2, 2695, 56, Color.WHITE)
+	_draw_slider(1, "Volumen de la música", "%d %%" % roundi(music_vol * 100.0))
+	_draw_slider(2, "Volumen de los efectos", "%d %%" % roundi(sfx_vol * 100.0))
+	_draw_slider(3, "Largo de las notas", "%d %%" % roundi(note_len * 100.0))
+	_draw_slider(4, "Retraso del audio", "%d ms" % roundi(audio_delay_ms), 1.0, "Súbelo si con Bluetooth el sonido llega tarde")
+	_panel(Rect2(80, 3120, w - 160, 180), panel_col, 34)
+	_text("Calibrar tocando al ritmo", Vector2(130, 3205), 40, Color.WHITE)
+	_text("Toca al compás de los clics y se ajusta solo", Vector2(130, 3255), 26, muted)
+	_button(Rect2(w - 330, 3165, 200, 90), "Calibrar", on_col)
 	if status_time > 0.0:
 		_text(_fit(status_text, w - 160, 26), Vector2(80, 270), 26, _err() if status_error else _ok())
 	_draw_nav()
@@ -4072,18 +4132,35 @@ func _draw_results_screen() -> void:
 	if failed:
 		_text_centered(fail_text, w / 2, 235 + top_inset, 32, _hot())
 	elif run_record:
-		_text_centered("¡Nuevo récord!", w / 2, 235 + top_inset, 34, Color(1.0, 0.6, 0.1))
+		var rp := clampf((res_t - 0.15) / 0.55, 0.0, 1.0)
+		var rs := _back_out(rp)
+		var gold := Color(1.0, 0.6, 0.1).lerp(Color(1.0, 0.85, 0.4), 0.5 + 0.5 * sin(res_t * 3.2))
+		gold.a = clampf(rp * 2.0, 0.0, 1.0)
+		if rp < 1.0:   # destello dorado que se expande y se desvanece
+			draw_arc(Vector2(w / 2, 225 + top_inset), 40.0 + 300.0 * _ease_out(rp), 0.0, TAU, 64, Color(1.0, 0.78, 0.25, 0.55 * (1.0 - rp)), 6.0, true)
+		if rs > 0.02:
+			_text_centered("¡Nuevo récord!", w / 2, 235 + top_inset, maxi(6, int(34.0 * rs)), gold)
 	# Estrellas/coronas (Infinito) o rango (Casual y Vidas).
 	var cy := 470.0
 	if infinite_run:
 		for i in 3:
-			_draw_award("star", Vector2(w / 2 + (i - 1) * 190.0, cy - 60.0), 70.0, i < stars)
+			var ps := _back_out(clampf((res_t - (0.30 + 0.16 * i)) / 0.40, 0.0, 1.0))
+			if ps > 0.02:
+				_draw_award("star", Vector2(w / 2 + (i - 1) * 190.0, cy - 60.0), 70.0 * ps, i < stars)
 		for i in 3:
-			_draw_award("crown", Vector2(w / 2 + (i - 1) * 190.0, cy + 120.0), 62.0, i < crowns)
+			var pc := _back_out(clampf((res_t - (0.80 + 0.16 * i)) / 0.40, 0.0, 1.0))
+			if pc > 0.02:
+				_draw_award("crown", Vector2(w / 2 + (i - 1) * 190.0, cy + 120.0), 62.0 * pc, i < crowns)
 	else:
-		_text_centered(RANKS[run_rank], w / 2, cy + 90.0, 340, RANK_COLORS[run_rank])
+		var rk := _back_out(clampf((res_t - 0.25) / 0.55, 0.0, 1.0))
+		var rcol: Color = RANK_COLORS[run_rank]
+		rcol.a = clampf(rk * 1.6, 0.0, 1.0)
+		if rk > 0.02:
+			_text_centered(RANKS[run_rank], w / 2, cy + 90.0, maxi(8, int(340.0 * rk)), rcol)
 	# Puntaje y mejor.
-	_text_centered(str(score), w / 2, 840, 190, Color.WHITE)
+	var shown_score := roundi(float(score) * _ease_out(clampf((res_t - 0.45) / 1.1, 0.0, 1.0)))   # el puntaje sube contando
+	_text_centered(str(shown_score), w / 2, 840, 190, Color.WHITE)
+	muted = Color(muted.r, muted.g, muted.b, muted.a * clampf((res_t - 1.0) / 0.45, 0.0, 1.0))   # los detalles aparecen al final
 	var best_txt := ""
 	if infinite_run:
 		var ib: Dictionary = bests.get(_song_key(current_song) + "|inf", {})
@@ -4110,6 +4187,7 @@ func _draw_results_screen() -> void:
 		note_txt = T("Espectador: no se guarda récord")
 	if note_txt != "":
 		_text_centered(_fit(note_txt, w - 100.0, 26), w / 2, 1020, 26, muted)
+	draw_set_transform(Vector2(0, ui_off + (1.0 - _ease_out(clampf((res_t - 1.1) / 0.45, 0.0, 1.0))) * 90.0))   # los botones suben suavemente
 	# Botones: canciones (círculo) a la izquierda y repetir (píldora) al lado.
 	var by := 1290.0
 	var bh := 150.0
@@ -4192,3 +4270,278 @@ func _text(value: String, pos: Vector2, size: int, color: Color) -> void:
 func _text_fixed(value: String, pos: Vector2, size: int, color: Color) -> void:
 	draw_string(_font(), pos, value, HORIZONTAL_ALIGNMENT_LEFT, -1, size, color)
 func _font() -> Font: return ThemeDB.fallback_font
+
+# --- Animaciones suaves ------------------------------------------------------
+
+func _ease_out(t: float) -> float:
+	var u := 1.0 - clampf(t, 0.0, 1.0)
+	return 1.0 - u * u * u
+
+## Llega a 1 con un pequeño rebote al final (suave: casi no se pasa).
+func _back_out(t: float) -> float:
+	t = clampf(t, 0.0, 1.0)
+	var c1 := 1.70158 * 0.8
+	var u := t - 1.0
+	return 1.0 + (c1 + 1.0) * u * u * u + c1 * u * u
+
+## Se llama cada fotograma desde _process: detecta cambios de pantalla y mueve todos los progresos.
+func _anim_tick(delta: float) -> void:
+	var sub := (music_tab * 100 + open_playlist) if screen == Screen.LIBRARY and tab == TAB_MUSIC else -1
+	var changed_screen := screen != last_screen
+	var changed_tab := screen == Screen.LIBRARY and tab != last_tab
+	if changed_screen or changed_tab or sub != last_sub:
+		trans_t = 0.0
+		if screen == Screen.GAME and changed_screen:
+			trans_len = 0.2
+		elif changed_screen or changed_tab:
+			trans_len = 0.26
+		else:
+			trans_len = 0.18
+		if changed_screen or changed_tab:
+			ov_p = 0.0
+			ov_group_p = 0.0
+		if changed_screen and screen == Screen.RESULTS:
+			res_t = 0.0
+		last_screen = screen
+		last_tab = tab
+		last_sub = sub
+	trans_t = minf(1.0, trans_t + delta / maxf(trans_len, 0.01))
+	if screen == Screen.RESULTS:
+		res_t += delta
+	var act := _nav_active()
+	if act != last_nav:
+		nav_pop[act] = 1.0
+		last_nav = act
+	var kf := 1.0 - exp(-14.0 * delta)
+	for i in 4:
+		nav_anim[i] = lerpf(float(nav_anim[i]), 1.0 if i == act else 0.0, kf)
+		nav_pop[i] = maxf(0.0, float(nav_pop[i]) - delta / 0.4)
+	if not open_group.is_empty():
+		ov_group_last = open_group
+	ov_group_p = move_toward(ov_group_p, 0.0 if open_group.is_empty() else 1.0, delta / 0.22)
+	var ov_open := overlay != "" and (screen == Screen.LIBRARY or screen == Screen.PREPARE)
+	if ov_open:
+		ov_last = overlay
+	ov_p = move_toward(ov_p, 1.0 if ov_open else 0.0, delta / 0.2)
+	mode_menu_p = move_toward(mode_menu_p, 1.0 if mode_menu else 0.0, delta / 0.18)
+	if cal_pulse > 0.0:
+		cal_pulse = maxf(0.0, cal_pulse - delta * 4.0)
+
+## Fundido desde el color de fondo al entrar a una pantalla. En Inicio/Música/Archivos/Ajustes no tapa la barra inferior.
+func _draw_trans_cover() -> void:
+	if trans_t >= 1.0:
+		return
+	var col := acol(pcol("bg"), (1.0 - _ease_out(trans_t)) * 0.92)
+	var w := viewport_size.x
+	if screen == Screen.LIBRARY or screen == Screen.SETTINGS:
+		var pts := PackedVector2Array([Vector2(0, 0), Vector2(w, 0)])
+		var steps := 36
+		for k in range(steps, -1, -1):
+			var x := w * k / float(steps)
+			pts.append(Vector2(x, _nav_curve_y(x)))
+		draw_colored_polygon(pts, col)
+	else:
+		draw_rect(Rect2(Vector2.ZERO, viewport_size), col)
+
+# --- Deslizadores de Ajustes -------------------------------------------------
+
+func _slider_value(i: int) -> float:
+	match i:
+		0:
+			return bg_vis
+		1:
+			return music_vol
+		2:
+			return sfx_vol
+		3:
+			return note_len
+	return audio_delay_ms
+
+func _slider_hit(p: Vector2) -> int:
+	for i in SLIDERS.size():
+		if i == 0 and not show_bg:
+			continue
+		var s: Dictionary = SLIDERS[i]
+		if Rect2(SLIDER_X - 50.0, float(s["y"]) + 120.0, viewport_size.x - 2.0 * SLIDER_X + 100.0, 170.0).has_point(p):
+			return i
+	return -1
+
+func _slider_apply(i: int, x: float) -> void:
+	var s: Dictionary = SLIDERS[i]
+	var t := clampf((x - SLIDER_X) / (viewport_size.x - 2.0 * SLIDER_X), 0.0, 1.0)
+	var v := snappedf(lerpf(float(s["min"]), float(s["max"]), t), float(s["step"]))
+	v = clampf(v, float(s["min"]), float(s["max"]))
+	match i:
+		0:
+			bg_vis = v
+		1:
+			music_vol = v
+			_apply_volumes()
+		2:
+			sfx_vol = v
+			_apply_volumes()
+		3:
+			note_len = v
+		_:
+			audio_delay_ms = v
+
+func _slider_release() -> void:
+	var i := set_slider
+	set_slider = -1
+	set_slider_id = -999
+	_save_settings()
+	if i == 2:
+		_play_sfx(sfx_life)   # muestra el nuevo volumen
+
+func _draw_slider(i: int, title: String, value_text: String, a := 1.0, sub := "") -> void:
+	var w := viewport_size.x
+	var s: Dictionary = SLIDERS[i]
+	var py: float = s["y"]
+	var white := Color(1, 1, 1, a)
+	var muted := pcol("muted")
+	_panel(Rect2(80, py, w - 160, 300), acol(pcol("panel"), 0.92 * a), 34)
+	_text(title, Vector2(130, py + 85), 40, white)
+	var vw := _font().get_string_size(value_text, HORIZONTAL_ALIGNMENT_LEFT, -1, 44).x
+	_text(value_text, Vector2(w - 130.0 - vw, py + 85), 44, white)
+	if sub != "":
+		_text(_fit(sub, w - 260.0, 26), Vector2(130, py + 135), 26, Color(muted.r, muted.g, muted.b, a))
+	var t := inverse_lerp(float(s["min"]), float(s["max"]), _slider_value(i))
+	var x0 := SLIDER_X
+	var x1 := w - SLIDER_X
+	var ty := py + 200.0
+	var kx := lerpf(x0, x1, clampf(t, 0.0, 1.0))
+	var accent := pcol("accent")
+	var track := pcol("button")
+	draw_line(Vector2(x0, ty), Vector2(x1, ty), acol(track, a), 16.0, true)
+	draw_circle(Vector2(x0, ty), 8.0, acol(track, a))
+	draw_circle(Vector2(x1, ty), 8.0, acol(track, a))
+	if kx > x0:
+		draw_line(Vector2(x0, ty), Vector2(kx, ty), acol(accent, a), 16.0, true)
+		draw_circle(Vector2(x0, ty), 8.0, acol(accent, a))
+	var held := set_slider == i and set_slider_id != -999
+	var kr := 42.0 if held else 34.0
+	draw_circle(Vector2(kx, ty + 4.0), kr, Color(0, 0, 0, 0.25 * a))
+	draw_circle(Vector2(kx, ty), kr, Color(1, 1, 1, a))
+	draw_circle(Vector2(kx, ty), kr * 0.5, acol(accent, a))
+
+# --- Calibración del audio tocando al ritmo ---------------------------------------
+
+func _gen_cal_track() -> AudioStreamWAV:
+	var rate := 22050
+	var beats := 4
+	var n := int(rate * CAL_PERIOD * beats)
+	var out := PackedFloat32Array()
+	out.resize(n)
+	var clen := int(rate * 0.06)
+	for b in beats:
+		var start := int(rate * CAL_PERIOD * b)
+		for i in clen:
+			var t := float(i) / rate
+			out[start + i] = (sin(TAU * 1200.0 * t) * 0.8 + sin(TAU * 2400.0 * t) * 0.25) * exp(-t * 70.0) * minf(1.0, t * 1500.0)
+	var wav := _make_wav(out)
+	wav.loop_mode = AudioStreamWAV.LOOP_FORWARD
+	wav.loop_begin = 0
+	wav.loop_end = n
+	return wav
+
+func _open_calibration() -> void:
+	_stop_ambient()
+	cal_taps = []
+	cal_last = 0.0
+	if cal_player == null:
+		cal_player = AudioStreamPlayer.new()
+		cal_player.bus = "Master"   # no depende del volumen de música ni de efectos
+		cal_player.stream = _gen_cal_track()
+		add_child(cal_player)
+	cal_player.play()
+	screen = Screen.CALIBRATE
+
+func _close_calibration(apply: bool) -> void:
+	if apply and cal_taps.size() >= CAL_NEEDED:
+		audio_delay_ms = clampf(snappedf(_median(cal_taps) * 1000.0, 5.0), -100.0, 500.0)
+		_save_settings()
+	if cal_player != null:
+		cal_player.stop()
+	screen = Screen.SETTINGS
+
+func _median(a: Array) -> float:
+	if a.is_empty():
+		return 0.0
+	var s := a.duplicate()
+	s.sort()
+	var n := s.size()
+	if n % 2 == 1:
+		return float(s[n / 2])
+	return (float(s[n / 2 - 1]) + float(s[n / 2])) * 0.5
+
+## Dispersión de los toques (desviación absoluta mediana): si es grande, el ritmo fue irregular.
+func _cal_spread() -> float:
+	var m := _median(cal_taps)
+	var dev: Array = []
+	for d in cal_taps:
+		dev.append(absf(float(d) - m))
+	return _median(dev)
+
+func _cal_btn_rect(i: int) -> Rect2:
+	var gap := 24.0
+	var bw := (viewport_size.x - 160.0 - gap * 2.0) / 3.0
+	return Rect2(80.0 + i * (bw + gap), 1560.0, bw, 130.0)
+
+func _calibrate_pointer(pos: Vector2, pressed: bool, _input_id: int) -> void:
+	if not pressed:
+		return
+	var p := Vector2(pos.x, pos.y - ui_off)
+	if _cal_btn_rect(0).has_point(p):
+		_close_calibration(false)
+	elif _cal_btn_rect(1).has_point(p):
+		cal_taps = []
+		cal_last = 0.0
+	elif _cal_btn_rect(2).has_point(p):
+		if cal_taps.size() >= CAL_NEEDED:
+			_close_calibration(true)
+	else:
+		_cal_tap()
+
+func _cal_tap() -> void:
+	if cal_player == null or not cal_player.playing:
+		return
+	# Misma fórmula que usa la partida para saber en qué punto del audio estamos (sin la compensación).
+	var t := cal_player.get_playback_position() + AudioServer.get_time_since_last_mix() - AudioServer.get_output_latency()
+	var d := fposmod(t + CAL_PERIOD * 0.5, CAL_PERIOD) - CAL_PERIOD * 0.5   # distancia al clic más cercano (+ = tarde)
+	cal_last = d
+	cal_pulse = 1.0
+	cal_taps.append(d)
+	if cal_taps.size() > 16:
+		cal_taps.remove_at(0)
+
+func _draw_calibrate() -> void:
+	_background()
+	draw_set_transform(Vector2(0, ui_off))
+	var w := viewport_size.x
+	var muted := pcol("muted")
+	_text("CALIBRAR AUDIO", Vector2(55, 105 + top_inset), 58, Color.WHITE)
+	_text_centered(_fit("Toca la pantalla justo cuando oigas cada clic.", w - 100.0, 34), w / 2, 250, 34, Color.WHITE)
+	_text_centered(_fit("Hazlo con tus auriculares puestos y sin mirar la pantalla.", w - 100.0, 26), w / 2, 300, 26, muted)
+	var c := Vector2(w / 2, 780)
+	var accent := pcol("accent")
+	draw_circle(c, 280.0 + 22.0 * cal_pulse, acol(accent, 0.16 + 0.22 * cal_pulse))
+	draw_arc(c, 280.0, 0.0, TAU, 64, acol(accent, 0.85), 8.0, true)
+	var prog := minf(1.0, cal_taps.size() / float(CAL_NEEDED))
+	if prog > 0.0:
+		draw_arc(c, 312.0, -PI / 2.0, -PI / 2.0 + TAU * prog, 64, _ok(), 10.0, true)
+	_text_centered("%d / %d" % [mini(cal_taps.size(), CAL_NEEDED), CAL_NEEDED], c.x, c.y + 40.0, 110, Color.WHITE)
+	if cal_taps.size() >= CAL_NEEDED:
+		var est := _median(cal_taps) * 1000.0
+		_text_centered("%d ms" % roundi(est), w / 2, 1210, 100, Color.WHITE)
+		_text_centered("Retraso estimado", w / 2, 1260, 30, muted)
+		var steady := _cal_spread() <= 0.035
+		_text_centered("Ritmo estable" if steady else "Ritmo irregular: reinicia y vuelve a intentarlo", w / 2, 1330, 30, _ok() if steady else _err())
+	else:
+		_text_centered(T("Faltan %d toques") % (CAL_NEEDED - cal_taps.size()), w / 2, 1230, 40, muted)
+	if not cal_taps.is_empty():
+		_text_centered(T("Último toque: %d ms") % roundi(cal_last * 1000.0), w / 2, 1420, 28, muted)
+	var ready := cal_taps.size() >= CAL_NEEDED
+	_button(_cal_btn_rect(0), "Volver", pcol("button"))
+	_button(_cal_btn_rect(1), "Reiniciar", pcol("button"))
+	_button(_cal_btn_rect(2), "Aplicar", pcol("accent") if ready else acol(pcol("button"), 0.5))
+	draw_set_transform(Vector2.ZERO)
