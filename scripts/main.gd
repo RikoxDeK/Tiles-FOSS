@@ -809,11 +809,19 @@ func _process(delta: float) -> void:
 	_anim_tick(delta)
 	queue_redraw()
 
+## Segundos de la canción que el audio va "detrás" del reloj: latencia de salida más el retraso ajustado.
+func _audio_comp() -> float:
+	return (AudioServer.get_output_latency() + audio_delay_ms / 1000.0) * play_rate
+
+## Hora inicial del reloj: la cuenta atrás de siempre, pero nunca menos de lo que tarda el audio en llegar.
+func _start_clock(lead: float) -> float:
+	return -maxf(lead, maxf(_audio_comp(), 0.0) + 0.1)
+
 func _sync_audio() -> void:
 	if audio_stream == null:
 		return
 	if not audio_started:
-		if song_time >= 0.0:
+		if song_time >= -_audio_comp():   # se arranca antes (o después) lo que dura el retraso, así el reloj no da un salto al sincronizar
 			audio_started = true
 			player.play()
 		return
@@ -951,7 +959,7 @@ func _next_lap() -> void:
 	dying.clear()
 	active_inputs.clear()
 	player.stop(); audio_started = false
-	song_time = -(lead_in + 0.6)
+	song_time = _start_clock(lead_in + 0.6)
 	award_idx = 0
 
 ## Guarda el mejor resultado del Infinito (estrellas, coronas, vuelta y puntos) para esta
@@ -1220,7 +1228,7 @@ func _start_game() -> void:
 	first_idx = 0
 	player.stream = audio_stream
 	active_inputs.clear(); effects.clear(); dying.clear(); marks.clear()
-	song_time = -lead_in; started = false; paused = false; finished = false
+	song_time = _start_clock(lead_in); started = false; paused = false; finished = false
 	score = 0; combo = 0; max_combo = 0; hits = 0; misses = 0
 	perfects = 0; greats = 0; goods = 0; empties = 0
 	run_lives = lives_setting if game_mode == 1 else 0
@@ -1239,7 +1247,7 @@ func _try_hit(lane: int, input_id: int) -> void:
 	if not started:
 		for note in notes:
 			if note.type == "start" and note.lane == lane and not note.done:
-				note.done = true; started = true; song_time = -lead_in; audio_started = false
+				note.done = true; started = true; song_time = _start_clock(lead_in); audio_started = false
 				_hit(lane, "COMENZAR", 0, hit_y)
 				return
 		_mark(lane, input_id)
@@ -1397,7 +1405,7 @@ func _resume_with(lane: int, input_id: int) -> void:
 	grace_time = GRACE_AFTER_CONTINUE
 	_set_paused(false)
 	if audio_stream != null and audio_started:
-		player.seek(maxf(0.0, song_time))
+		player.seek(maxf(0.0, song_time + _audio_comp()))
 
 func _mod_on(id: String) -> bool:
 	match id:
