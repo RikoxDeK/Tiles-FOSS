@@ -44,6 +44,10 @@ const MSG_LIMITED := "El mirror está limitando las peticiones. Espera un moment
 
 ## Cuántos resultados crudos devolvió la última búsqueda (antes de filtrar por modo).
 var last_raw_count := 0
+## Ids de todos los sets crudos de la última búsqueda (también los que se descartan por modo) y el
+## código HTTP: sirven para saber si el mirror ya no tiene más páginas (repite la última o da 4xx).
+var last_raw_ids: Array = []
+var last_code := 0
 
 var _search_http: HTTPRequest
 var _dl_http: HTTPRequest
@@ -102,6 +106,8 @@ func search(query: String, mode: int, page: int, statuses: Array = []) -> void:
 	_search_http.cancel_request()
 	if _is_cooling(SEARCH_KEY):
 		last_raw_count = 0
+		last_raw_ids = []
+		last_code = 429
 		search_finished.emit([], MSG_LIMITED)
 		return
 	var url := "%s?q=%s&mode=%d&p=%d" % [SEARCH_URL, query.uri_encode(), mode, page]
@@ -116,6 +122,8 @@ func search(query: String, mode: int, page: int, statuses: Array = []) -> void:
 
 func _on_search_done(result: int, code: int, headers: PackedStringArray, body: PackedByteArray) -> void:
 	last_raw_count = 0
+	last_raw_ids = []
+	last_code = code if result == HTTPRequest.RESULT_SUCCESS else 0
 	if result != HTTPRequest.RESULT_SUCCESS:
 		search_finished.emit([], "Sin conexión con el mirror")
 		return
@@ -135,6 +143,9 @@ func _on_search_done(result: int, code: int, headers: PackedStringArray, body: P
 		if inner is Array:
 			raw = inner
 	last_raw_count = raw.size()
+	for d in raw:
+		if d is Dictionary:
+			last_raw_ids.append(int(d.get("id", d.get("beatmapset_id", d.get("SetID", 0)))))
 	var sets: Array = []
 	for d in raw:
 		if d is Dictionary:

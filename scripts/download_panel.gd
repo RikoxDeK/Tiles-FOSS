@@ -13,6 +13,8 @@ const Downloader = preload("res://scripts/beatmap_downloader.gd")
 const MODE_STD := 0
 const MODE_MANIA := 3
 const MODE_ALL := -1
+## Páginas seguidas que se piden solas cuando una página trae sets pero ninguno del modo elegido.
+const MAX_EMPTY_PAGES := 3
 ## Mirror principal de las descargas (se muestra como crédito bajo la lista).
 const MIRROR_NAME := "Mino (catboy.best)"
 const MIRROR_URL := "https://catboy.best"
@@ -46,6 +48,8 @@ var _page := 0
 var _sets: Array = []
 var _loading := false
 var _end := false
+var _seen_ids := {}      # ids crudos que ya devolvió el mirror (incluye los descartados por modo)
+var _empty_streak := 0   # páginas seguidas con sets nuevos pero ninguno compatible
 
 # Desplazamiento táctil propio: los botones y tarjetas se "comen" el toque y el ScrollContainer
 # solo se movía si el dedo caía en un hueco entre canciones. Aquí el arrastre vale en cualquier punto de la lista.
@@ -500,6 +504,8 @@ func _search(reset: bool) -> void:
 		_page = 0
 		_sets.clear()
 		_end = false
+		_seen_ids.clear()
+		_empty_streak = 0
 		for c in _list.get_children():
 			c.queue_free()
 		_more_btn = null
@@ -523,6 +529,12 @@ func _load_more() -> void:
 func _on_search(sets: Array, error: String) -> void:
 	_loading = false
 	if not error.is_empty():
+		# Un 4xx (salvo 429) al pedir una página más allá del final no es un fallo: ya no hay más.
+		if _page > 0 and _dl.last_code >= 400 and _dl.last_code < 500 and _dl.last_code != 429:
+			_end = true
+			_set_status(_t("No hay más resultados"), false)
+			_append_cards([])
+			return
 		_set_status(_t(error), true)
 		return
 	var fresh: Array = []
@@ -534,11 +546,30 @@ func _on_search(sets: Array, error: String) -> void:
 				break
 		if not known:
 			fresh.append(s)
+	# ¿Trajo el mirror algún set que no hubiéramos visto? Si repite la última página, se acabó.
+	var new_raw := false
+	for id in _dl.last_raw_ids:
+		if not _seen_ids.has(id):
+			_seen_ids[id] = true
+			new_raw = true
 	_sets.append_array(fresh)
 	_page += 1
-	if _dl.last_raw_count == 0:
+	if not fresh.is_empty():
+		_empty_streak = 0
+	if _dl.last_raw_count == 0 or not new_raw:
 		_end = true
-	_set_status(_t("Sin resultados") if _sets.is_empty() else "", false)
+	elif fresh.is_empty() and _empty_streak < MAX_EMPTY_PAGES:
+		# Hay sets nuevos pero ninguno del modo elegido: se sigue con la página siguiente.
+		_empty_streak += 1
+		_set_status(_t("Buscando..."), false)
+		_search.call_deferred(false)
+		return
+	if _sets.is_empty():
+		_set_status(_t("Sin resultados"), false)
+	elif _end:
+		_set_status(_t("No hay más resultados"), false)
+	else:
+		_set_status("", false)
 	_append_cards(fresh)
 
 

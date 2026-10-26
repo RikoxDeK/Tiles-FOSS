@@ -249,6 +249,7 @@ const EN := {
 	"Título, artista o creador": "Title, artist or creator",
 	"Todos": "All",
 	"Cargar más": "Load more",
+	"No hay más resultados": "No more results",
 	"por %s": "by %s",
 	"Descargar": "Download",
 	"Instalada": "Installed",
