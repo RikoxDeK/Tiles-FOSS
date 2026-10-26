@@ -8,6 +8,7 @@
 
 Prototipo visual y jugable inspirado en la estructura de los juegos de piano verticales.
 Compatibilidad con Beatmaps de OSU!.
+Este proyecto se desarrolló con asistencia de IA (Claude, de Anthropic).
 
 - Teclado de prueba: D, F, J y K.
 
@@ -22,5 +23,4 @@ Compatibilidad con Beatmaps de OSU!.
 ## Créditos
 
 - **Descarga de mapas:** [Mino](https://catboy.best) (catboy.best), mirror de beatmaps de osu!. Como respaldo se usan [Nerinyan](https://nerinyan.moe) y [osu.direct](https://osu.direct).
-- **Portadas:** CDN oficial de osu! (assets.ppy.sh).
 - **osu!** es un juego de ppy. Tiles FOSS es un proyecto independiente y **no está afiliado** a osu!, a ppy ni a Mino.
