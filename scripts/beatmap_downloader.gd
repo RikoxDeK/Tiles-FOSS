@@ -31,6 +31,17 @@ const DOWNLOAD_TIMEOUT := 600.0
 ## Un .osz real pesa mucho más; menos que esto es una página de error.
 const MIN_OSZ_BYTES := 2048
 
+## Límites de tasa: si un mirror responde 429 (demasiadas peticiones) se le deja descansar y no se le
+## vuelve a pedir nada hasta que pase el tiempo de Retry-After (o COOLDOWN_DEFAULT). Insistir hace que
+## el mirror banee a los usuarios de la app. Las descargas se controlan por host y las búsquedas aparte.
+const COOLDOWN_DEFAULT := 30.0
+const COOLDOWN_MIN := 5.0
+const COOLDOWN_MAX := 300.0
+## Si una descarga buena avisa de que no quedan peticiones (X-Ratelimit-Remaining: 0), se espera esto.
+const COOLDOWN_NO_REMAINING := 10.0
+const SEARCH_KEY := "catboy.best/search"
+const MSG_LIMITED := "El mirror está limitando las peticiones. Espera un momento y reintenta"
+
 ## Cuántos resultados crudos devolvió la última búsqueda (antes de filtrar por modo).
 var last_raw_count := 0
 
@@ -46,6 +57,8 @@ var _cover_cache := {}
 var _cur_id := 0
 var _cur_urls: Array = []
 var _cur_i := 0
+var _cur_limited := false     # algún mirror respondió 429 durante la descarga actual
+var _cooldown := {}           # clave (host o host/search) -> Time.get_ticks_msec() hasta el que descansa
 
 
 func _ready() -> void:
@@ -87,6 +100,10 @@ static func is_installed(set_id: int) -> bool:
 ## -1 WIP, -2 graveyard). Vacío = sin filtrar por estado.
 func search(query: String, mode: int, page: int, statuses: Array = []) -> void:
 	_search_http.cancel_request()
+	if _is_cooling(SEARCH_KEY):
+		last_raw_count = 0
+		search_finished.emit([], MSG_LIMITED)
+		return
 	var url := "%s?q=%s&mode=%d&p=%d" % [SEARCH_URL, query.uri_encode(), mode, page]
 	for st in statuses:
 		url += "&status=%d" % int(st)
@@ -97,10 +114,14 @@ func search(query: String, mode: int, page: int, statuses: Array = []) -> void:
 	_pending_mode = mode
 
 
-func _on_search_done(result: int, code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
+func _on_search_done(result: int, code: int, headers: PackedStringArray, body: PackedByteArray) -> void:
 	last_raw_count = 0
 	if result != HTTPRequest.RESULT_SUCCESS:
 		search_finished.emit([], "Sin conexión con el mirror")
+		return
+	if code == 429:
+		_cool_down(SEARCH_KEY, headers)
+		search_finished.emit([], MSG_LIMITED)
 		return
 	if code != 200:
 		search_finished.emit([], "El mirror respondió con error (%d)" % code)
@@ -191,6 +212,7 @@ func _next() -> void:
 	_cur_nv = bool(job.nv)
 	_cur_urls = _urls_for(_cur_id, _cur_nv)
 	_cur_i = 0
+	_cur_limited = false
 	_try_current()
 
 
@@ -208,6 +230,10 @@ func _urls_for(id: int, no_video: bool) -> Array:
 
 func _try_current() -> void:
 	while _cur_i < _cur_urls.size():
+		if _is_cooling(_host_of(_cur_urls[_cur_i])):
+			_cur_limited = true   # ese mirror pidió calma: se salta sin tocarlo
+			_cur_i += 1
+			continue
 		DirAccess.make_dir_recursive_absolute(TMP_DIR)
 		_dl_http.download_file = TMP_DIR.path_join("%d.osz" % _cur_id)
 		var headers := PackedStringArray(["User-Agent: " + USER_AGENT])
@@ -216,16 +242,50 @@ func _try_current() -> void:
 			download_progress.emit(_cur_id, 0, -1)
 			return
 		_cur_i += 1
-	_finish("No se pudo descargar desde ningún mirror")
+	_finish(MSG_LIMITED if _cur_limited else "No se pudo descargar desde ningún mirror")
 
 
-func _on_download_done(result: int, code: int, _headers: PackedStringArray, _body: PackedByteArray) -> void:
+func _on_download_done(result: int, code: int, headers: PackedStringArray, _body: PackedByteArray) -> void:
+	var host := _host_of(_cur_urls[_cur_i]) if _cur_i < _cur_urls.size() else ""
 	if result == HTTPRequest.RESULT_SUCCESS and code == 200 and _looks_like_osz(_dl_http.download_file):
+		if _header(headers, "x-ratelimit-remaining") == "0":
+			_cool_down(host, headers, COOLDOWN_NO_REMAINING)
 		_finish("")
 		return
+	if code == 429:
+		_cool_down(host, headers)   # el siguiente enlace de este mismo host también se salta
+		_cur_limited = true
 	DirAccess.remove_absolute(_dl_http.download_file)
 	_cur_i += 1
 	_try_current.call_deferred()
+
+
+## "https://catboy.best/d/123" -> "catboy.best"
+static func _host_of(url: String) -> String:
+	return url.get_slice("/", 2)
+
+
+## Valor de una cabecera HTTP (sin distinguir mayúsculas) o "" si no viene.
+static func _header(headers: PackedStringArray, header_name: String) -> String:
+	var prefix := header_name.to_lower() + ":"
+	for h in headers:
+		if h.to_lower().begins_with(prefix):
+			return h.substr(prefix.length()).strip_edges()
+	return ""
+
+
+func _is_cooling(key: String) -> bool:
+	return int(_cooldown.get(key, 0)) > Time.get_ticks_msec()
+
+
+## Deja descansar a `key` el tiempo de Retry-After (en segundos; si no viene o es una fecha, `fallback`).
+func _cool_down(key: String, headers: PackedStringArray, fallback := COOLDOWN_DEFAULT) -> void:
+	var secs := fallback
+	var ra := _header(headers, "retry-after")
+	if ra.is_valid_float():
+		secs = ra.to_float()
+	secs = clampf(secs, COOLDOWN_MIN, COOLDOWN_MAX)
+	_cooldown[key] = Time.get_ticks_msec() + int(secs * 1000.0)
 
 
 ## Un .osz es un zip: empieza por "PK\x03\x04". Algunos mirrors devuelven una página HTML con código 200.

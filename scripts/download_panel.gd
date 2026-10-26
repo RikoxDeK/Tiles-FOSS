@@ -13,6 +13,9 @@ const Downloader = preload("res://scripts/beatmap_downloader.gd")
 const MODE_STD := 0
 const MODE_MANIA := 3
 const MODE_ALL := -1
+## Mirror principal de las descargas (se muestra como crédito bajo la lista).
+const MIRROR_NAME := "Mino (catboy.best)"
+const MIRROR_URL := "https://catboy.best"
 ## Estados de osu! que se pueden filtrar: [código, nombre].
 const STATUS_LIST := [[1, "Ranked"], [2, "Approved"], [3, "Qualified"], [4, "Loved"], [0, "Pending"], [-2, "Graveyard"]]
 
@@ -308,6 +311,27 @@ func _build() -> void:
 	_list.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_list.add_theme_constant_override("separation", 18)
 	_scroll.add_child(_list)
+
+	# Créditos del mirror: siempre visibles bajo la lista.
+	var credits := VBoxContainer.new()
+	credits.add_theme_constant_override("separation", 4)
+	col.add_child(credits)
+	var crow := HFlowContainer.new()
+	crow.add_theme_constant_override("h_separation", 10)
+	credits.add_child(crow)
+	crow.add_child(_label(_t("Mapas proporcionados por"), 24, _c("muted")))
+	var link := LinkButton.new()
+	link.text = MIRROR_NAME
+	link.uri = MIRROR_URL
+	link.underline = LinkButton.UNDERLINE_MODE_ALWAYS
+	link.focus_mode = Control.FOCUS_NONE
+	link.add_theme_font_size_override("font_size", 24)
+	for cn in ["font_color", "font_hover_color", "font_pressed_color"]:
+		link.add_theme_color_override(cn, _c("accent"))
+	crow.add_child(link)
+	var note := _label(_t("Respaldo: Nerinyan y osu.direct · Portadas: osu! · Sin afiliación con osu!"), 22, _c("muted"))
+	note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	credits.add_child(note)
 
 	_append_cards(_sets)
 
