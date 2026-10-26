@@ -8,7 +8,7 @@
 
 Prototipo visual y jugable inspirado en la estructura de los juegos de piano verticales.
 Compatibilidad con Beatmaps de OSU!.
-Este proyecto se desarrolló con asistencia de IA (Claude, de Anthropic).
+> Este proyecto se desarrolló con asistencia de IA (Claude, de Anthropic).
 
 - Teclado de prueba: D, F, J y K.
 
