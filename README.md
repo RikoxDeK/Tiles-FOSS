@@ -6,8 +6,8 @@
   <img width="23%" alt="Tiles" src="https://github.com/user-attachments/assets/3de28981-7e26-4d1e-af9b-fc8c8df3af56" />
 </p>
 
-Prototipo visual y jugable inspirado en la estructura de los juegos de piano verticales.
-Compatibilidad con Beatmaps de OSU!.
+-Prototipo visual y jugable inspirado en la estructura de los juegos de piano verticales.
+-Compatibilidad con Beatmaps de OSU!.
 > Este proyecto se desarrolló con asistencia de IA (Claude, de Anthropic).
 
 - Teclado de prueba: D, F, J y K.
