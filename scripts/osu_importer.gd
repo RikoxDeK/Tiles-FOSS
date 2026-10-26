@@ -364,6 +364,11 @@ static func scan_library() -> Array:
 ## Carga una imagen (jpg/png/webp/bmp) como textura; la reduce a 1920 px como máximo.
 ## Devuelve null si no existe o no se puede leer.
 static func load_image(path: String, max_side := 1920) -> Texture2D:
+	var img := load_image_data(path, max_side)
+	return ImageTexture.create_from_image(img) if img != null else null
+
+## Igual que load_image pero devuelve la Image (sin textura): sirve para decodificar en un hilo.
+static func load_image_data(path: String, max_side := 1920) -> Image:
 	if path.is_empty() or not FileAccess.file_exists(path):
 		return null
 	var bytes := FileAccess.get_file_as_bytes(path)
@@ -384,7 +389,7 @@ static func load_image(path: String, max_side := 1920) -> Texture2D:
 	if longest > max_side:
 		var k := float(max_side) / float(longest)
 		img.resize(maxi(1, int(img.get_width() * k)), maxi(1, int(img.get_height() * k)), Image.INTERPOLATE_BILINEAR)
-	return ImageTexture.create_from_image(img)
+	return img
 
 
 ## Carga mp3/ogg desde disco. Devuelve null si no existe o el formato no sirve.

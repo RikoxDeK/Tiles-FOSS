@@ -186,8 +186,23 @@ var home_dirty := true
 var home_tex: Texture2D = null   # imagen de la última canción jugada (cabecera de Inicio)
 var home_tex_path := ""
 var favorites: Dictionary = {}   # id de canción -> true
-var thumb_cache: Dictionary = {} # ruta de imagen -> Texture2D (o null si no se pudo leer)
-var thumb_budget := 1            # miniaturas que se pueden decodificar por fotograma
+var thumb_cache: Dictionary = {} # clave "ruta|lado" -> Texture2D (o null si no se pudo leer): miniaturas
+var big_cache: Dictionary = {}   # lo mismo para imágenes grandes (cabecera de Inicio)
+var img_pending: Dictionary = {} # claves que se están decodificando en segundo plano
+var img_ready: Array = []        # resultados {key, big, img} que el hilo principal convierte en textura
+var img_mutex := Mutex.new()
+var img_fade: Dictionary = {}    # clave -> segundos desde que apareció (fundido de entrada)
+const IMG_DIR := "user://thumbs"
+const IMG_MAX_JOBS := 3          # decodificaciones simultáneas en segundo plano
+const IMG_FADE := 0.22
+# Carga de una canción en segundo plano (leer .osu, adaptar notas, decodificar audio e imagen).
+var sel_loading := false
+var sel_load_t := 0.0
+var sel_entry: Dictionary = {}
+var sel_task := -1
+var sel_ready := false
+var sel_result: Dictionary = {}
+const SEL_FADE := 0.14           # fundido de salida antes de mostrar "Preparar"
 
 # Canción actual
 var chart: Array = []
@@ -652,6 +667,7 @@ func _open_diffs() -> void:
 	overlay = "diffs"
 
 func _ready() -> void:
+	DirAccess.make_dir_recursive_absolute(IMG_DIR)
 	get_viewport().size_changed.connect(_resize)
 	_setup_buses()
 	player = AudioStreamPlayer.new()
@@ -697,6 +713,8 @@ func _notification(what: int) -> void:
 
 ## Botón "atrás" de Android: retrocede una pantalla en vez de cerrar el juego.
 func _go_back() -> void:
+	if sel_loading:
+		return
 	if download_panel != null and download_panel.visible:
 		download_panel.close()
 		return
@@ -816,6 +834,8 @@ func _process(delta: float) -> void:
 		elif dd.t >= DIE_TIME:
 			dying.remove_at(i)
 	_anim_tick(delta)
+	_images_poll(delta)
+	_select_poll(delta)
 	queue_redraw()
 
 ## Segundos de la canción que el audio va "detrás" del reloj: latencia de salida más el retraso ajustado.
@@ -1619,27 +1639,75 @@ func _toggle_favorite(id: String) -> void:
 	_clamp_scroll()
 	_save_settings()
 
-## Miniatura de una canción: la imagen de fondo de su primera dificultad que la tenga.
-## Se decodifica pequeña y de una en una por fotograma para no trabar el scroll.
-func _group_thumb(g: Dictionary) -> Texture2D:
-	var path := ""
+## Ruta de la imagen de una canción: la de fondo de su primera dificultad que la tenga.
+func _group_thumb_path(g: Dictionary) -> String:
 	for e in g.entries:
 		var bp := String(e.get("bg_path", ""))
 		if bp != "":
-			path = bp
-			break
+			return bp
+	return ""
+
+## Miniatura de una canción. Se decodifica en un hilo aparte (y se guarda ya pequeña en disco) para que
+## desplazar la lista o abrir la app no se trabe. Mientras llega devuelve null y se dibuja el recuadro de color.
+func _group_thumb(g: Dictionary) -> Texture2D:
+	return _async_tex(_group_thumb_path(g), 360)
+
+## Textura de una imagen cargada en segundo plano. Devuelve null hasta que esté lista.
+func _async_tex(path: String, max_side: int) -> Texture2D:
 	if path == "":
 		return null
-	if thumb_cache.has(path):
-		return thumb_cache[path]
-	if thumb_budget <= 0:
-		return null
-	thumb_budget -= 1
-	if thumb_cache.size() >= 60:
-		thumb_cache.erase(thumb_cache.keys()[0])
-	var tex: Texture2D = OsuImporter.load_image(path, 360)
-	thumb_cache[path] = tex
-	return tex
+	var big := max_side > 512
+	var key := "%s|%d" % [path, max_side]
+	var cache: Dictionary = big_cache if big else thumb_cache
+	if cache.has(key):
+		return cache[key]
+	if not img_pending.has(key) and img_pending.size() < IMG_MAX_JOBS:
+		img_pending[key] = true
+		WorkerThreadPool.add_task(_image_job.bind(key, path, max_side, big))
+	return null
+
+## Fundido de entrada (0..1) de una imagen recién llegada.
+func _img_alpha(path: String, max_side: int) -> float:
+	var t: float = img_fade.get("%s|%d" % [path, max_side], IMG_FADE)
+	return clampf(t / IMG_FADE, 0.0, 1.0)
+
+## Se ejecuta en un hilo: lee la imagen de la caché de disco o la decodifica y la guarda reducida.
+func _image_job(key: String, path: String, max_side: int, big: bool) -> void:
+	var cache_file := "%s/%s_%d_%d_%d.jpg" % [IMG_DIR, str(path.hash()), max_side, FileAccess.get_modified_time(path), _file_size(path)]
+	var img: Image = null
+	if FileAccess.file_exists(cache_file):
+		img = Image.load_from_file(cache_file)
+	if img == null or img.is_empty():
+		img = OsuImporter.load_image_data(path, max_side)
+		if img != null:
+			img.save_jpg(cache_file, 0.88)
+	img_mutex.lock()
+	img_ready.append({"key": key, "big": big, "img": img})
+	img_mutex.unlock()
+
+## Hilo principal: convierte en textura las imágenes terminadas (máx. 2 por fotograma) y avanza los fundidos.
+func _images_poll(delta: float) -> void:
+	img_mutex.lock()
+	var batch := img_ready.slice(0, 2)
+	img_ready = img_ready.slice(2)
+	img_mutex.unlock()
+	for d in batch:
+		img_pending.erase(d.key)
+		var tex: Texture2D = null
+		if d.img != null:
+			tex = ImageTexture.create_from_image(d.img)
+		var cache: Dictionary = big_cache if d.big else thumb_cache
+		var cap := 4 if d.big else 120
+		while cache.size() >= cap:
+			var old = cache.keys()[0]
+			cache.erase(old)
+			img_fade.erase(old)
+		cache[d.key] = tex
+		img_fade[d.key] = 0.0
+	for k in img_fade.keys():
+		img_fade[k] += delta
+		if img_fade[k] >= IMG_FADE:
+			img_fade[k] = IMG_FADE
 
 func _draw_heart(c: Vector2, sz: float, color: Color) -> void:
 	draw_circle(c + Vector2(-0.24 * sz, -0.12 * sz), 0.30 * sz, color)
@@ -2662,6 +2730,8 @@ func _clamp_scroll() -> bool:
 	return not is_equal_approx(before, scroll_y)
 
 func _library_tap(pos: Vector2) -> void:
+	if sel_loading:
+		return
 	if overlay != "":
 		_overlay_tap(pos)
 		return
@@ -2834,13 +2904,11 @@ func _draw_home() -> void:
 		draw_rect(Rect2(0, 0, w, hero_h), pcol("bg").lerp(pcol("accent"), 0.2))
 	else:
 		var path := String(le.get("bg_path", ""))
-		if path != home_tex_path:
-			home_tex_path = path
-			home_tex = OsuImporter.load_image(path, 1280) if path != "" else null
+		home_tex_path = path
+		home_tex = _async_tex(path, 1280)
+		draw_rect(Rect2(0, 0, w, hero_h), _badge_color(le).darkened(0.3))
 		if home_tex != null:
-			_draw_cover(home_tex, Rect2(0, 0, w, hero_h))
-		else:
-			draw_rect(Rect2(0, 0, w, hero_h), _badge_color(le).darkened(0.3))
+			_draw_cover(home_tex, Rect2(0, 0, w, hero_h), Color(1, 1, 1, _img_alpha(path, 1280)))
 	# Degradados: arriba para leer el título y abajo para fundir con el fondo.
 	var bands := 20
 	for k in bands:
@@ -2981,7 +3049,10 @@ func _draw_card(g: Dictionary, x: float, y: float, w: float, kind: String) -> vo
 	var count: int = g.entries.size()
 	var thumb: Texture2D = _group_thumb(g) if show_thumbs else null
 	if thumb != null:
-		_draw_cover(thumb, Rect2(x, y, 190, CARD_H))
+		var ta := _img_alpha(_group_thumb_path(g), 360)
+		if ta < 1.0:
+			draw_rect(Rect2(x, y, 190, CARD_H), _badge_color(first))
+		_draw_cover(thumb, Rect2(x, y, 190, CARD_H), Color(1, 1, 1, ta))
 		draw_rect(Rect2(x, y + CARD_H - 46, 190, 46), Color(0, 0, 0, 0.55))
 		_text_centered(T("%d dif.") % count, x + 95, y + CARD_H - 13, 28, Color.WHITE)
 	else:
@@ -3066,7 +3137,6 @@ func _draw_music() -> void:
 		_text(_fit(status_text, viewport_size.x - 110, 26), Vector2(55, 272 + top_inset), 26, _err() if status_error else _ok())
 
 func _draw_library() -> void:
-	thumb_budget = 2
 	_background()
 	if tab == TAB_HOME:
 		_draw_home()
@@ -3085,8 +3155,8 @@ func _draw_library() -> void:
 
 ## Construye el chart jugable de un mapa parseado con el nivel de dificultad actual.
 ## Devuelve {} si no queda ninguna nota.
-func _build_from_parsed(parsed: Dictionary) -> Dictionary:
-	var lvl: Dictionary = DIFFICULTY_LEVELS[diff_level]
+func _build_from_parsed(parsed: Dictionary, level := -1) -> Dictionary:
+	var lvl: Dictionary = DIFFICULTY_LEVELS[diff_level if level < 0 else level]
 	var playable: Array = OsuImporter.build_chart(parsed, OsuImporter.DEFAULT_MAX_FINGERS, float(lvl.event), float(lvl.lane))
 	if playable.is_empty():
 		return {}
@@ -3106,9 +3176,12 @@ func _build_from_parsed(parsed: Dictionary) -> Dictionary:
 ## premiar ni castigar la diferencia: todos los niveles iguales comparten el multiplicador del que
 ## esté más cerca de Normal (x1.00).
 func _compute_level_mults(parsed: Dictionary) -> void:
-	level_mults = DIFF_MULT.duplicate()
+	level_mults = _level_mults_for(parsed)
+
+func _level_mults_for(parsed: Dictionary) -> Array:
+	var out: Array = DIFF_MULT.duplicate()
 	if parsed.is_empty():
-		return
+		return out
 	var sigs: Array = []
 	for i in DIFFICULTY_LEVELS.size():
 		var lvl: Dictionary = DIFFICULTY_LEVELS[i]
@@ -3124,7 +3197,8 @@ func _compute_level_mults(parsed: Dictionary) -> void:
 			if sigs[j] == sigs[i]:
 				lo = mini(lo, j)
 				hi = maxi(hi, j)
-		level_mults[i] = DIFF_MULT[clampi(DIFF_BASE, lo, hi)]
+		out[i] = DIFF_MULT[clampi(DIFF_BASE, lo, hi)]
+	return out
 
 ## Reconstruye el chart de la canción abierta (al cambiar la dificultad en "preparar").
 func _rebuild_chart() -> bool:
@@ -3160,56 +3234,99 @@ func _adjust_diff(delta: int) -> void:
 		return
 	_save_settings()
 
+## Abrir una canción. Lo pesado (leer .osu, adaptar las notas a cada nivel, decodificar audio e imagen)
+## corre en un hilo; mientras tanto la pantalla se funde suavemente y al terminar entra "Preparar".
 func _select_song(entry: Dictionary) -> void:
+	if sel_loading:
+		return
 	_stop_ambient()
 	_stop_audio()
-	var new_chart: Array = []
-	var stream: AudioStream = null
-	var new_lead := false
-	var new_first := 0.0
-	var new_auto := 1.0
-	var new_end := 12.4
-	var dropped := 0
-	var total := 0
-	var new_parsed: Dictionary = {}
 	if entry.demo:
-		new_chart = demo_chart
+		_select_apply(entry, {"chart": demo_chart, "lead": false, "first": 0.0, "auto": 1.0, "end": 12.4,
+			"dropped": 0, "total": 0, "parsed": {}, "stream": null, "mults": DIFF_MULT.duplicate(), "bg": null, "prep": null})
+		return
+	sel_entry = entry
+	sel_loading = true
+	sel_load_t = 0.0
+	sel_ready = false
+	sel_result = {}
+	sel_task = WorkerThreadPool.add_task(_select_job.bind(entry, diff_level, show_bg))
+
+## Se ejecuta en un hilo: no toca nodos ni variables de la partida, solo calcula y deja el resultado.
+func _select_job(entry: Dictionary, level: int, want_bg: bool) -> void:
+	var res := {}
+	var parsed: Dictionary = OsuImporter.parse_osu(FileAccess.get_file_as_string(entry.osu_path))
+	if not parsed.ok:
+		res = {"error": String(parsed.error)}
 	else:
-		var parsed: Dictionary = OsuImporter.parse_osu(FileAccess.get_file_as_string(entry.osu_path))
-		if not parsed.ok:
-			_show_status(parsed.error, true)
-			return
-		_cache_stars(entry, parsed)
-		var built := _build_from_parsed(parsed)
+		var built := _build_from_parsed(parsed, level)
 		if built.is_empty():
-			_show_status("No quedaron notas jugables en este mapa", true)
-			return
-		new_chart = built.chart
-		new_lead = true
-		new_first = built.first
-		new_auto = built.auto
-		total = built.total
-		dropped = built.dropped
-		new_end = built.end
-		new_parsed = parsed
-		stream = OsuImporter.load_audio(entry.audio_path)
+			res = {"error": "No quedaron notas jugables en este mapa"}
+		else:
+			var pbg := String(entry.get("bg_path", ""))
+			var bg_img: Image = null
+			var prep_img: Image = null
+			if pbg != "":
+				# Se decodifica una sola vez: el fondo (1920) y la imagen de Preparar (1280) salen de la misma.
+				bg_img = OsuImporter.load_image_data(pbg, 1920 if want_bg else 1280)
+				if bg_img != null:
+					prep_img = bg_img.duplicate()
+					var longest := maxi(prep_img.get_width(), prep_img.get_height())
+					if longest > 1280:
+						var k := 1280.0 / float(longest)
+						prep_img.resize(maxi(1, int(prep_img.get_width() * k)), maxi(1, int(prep_img.get_height() * k)), Image.INTERPOLATE_BILINEAR)
+					if not want_bg:
+						bg_img = null
+			res = {"chart": built.chart, "lead": true, "first": built.first, "auto": built.auto, "end": built.end,
+				"dropped": built.dropped, "total": built.total, "parsed": parsed,
+				"stream": OsuImporter.load_audio(entry.audio_path), "mults": _level_mults_for(parsed),
+				"bg": bg_img, "prep": prep_img}
+	img_mutex.lock()
+	sel_result = res
+	sel_ready = true
+	img_mutex.unlock()
+
+## Cada fotograma: cuando el hilo terminó (y el fundido de salida ya se ve) entra a Preparar.
+func _select_poll(delta: float) -> void:
+	if not sel_loading:
+		return
+	sel_load_t += delta
+	img_mutex.lock()
+	var done := sel_ready
+	img_mutex.unlock()
+	if not done or sel_load_t < SEL_FADE:
+		return
+	WorkerThreadPool.wait_for_task_completion(sel_task)
+	sel_loading = false
+	var res := sel_result
+	sel_result = {}
+	if res.has("error"):
+		_show_status(String(res.error), true)
+		return
+	_select_apply(sel_entry, res)
+
+## Hilo principal: aplica lo calculado (rápido) y cambia a la pantalla Preparar.
+func _select_apply(entry: Dictionary, res: Dictionary) -> void:
+	var parsed: Dictionary = res.parsed
+	if not parsed.is_empty():
+		_cache_stars(entry, parsed)
+	var stream: AudioStream = res.stream
 	var note_count := 0
 	var hold_count := 0
-	for n in new_chart:
+	for n in res.chart:
 		if n.type == "start": continue
 		note_count += 1
 		if n.type == "hold": hold_count += 1
-	var duration := new_end - 1.06
+	var duration: float = float(res["end"]) - 1.06
 	if stream != null and stream.get_length() > 0.0:
 		duration = stream.get_length()
-	chart = new_chart; chart_end = new_end; use_lead_in = new_lead; first_note_time = new_first; auto_mult = new_auto
-	audio_stream = stream; current_song = entry; current_parsed = new_parsed
-	_compute_level_mults(new_parsed)
-	_reload_bg()
-	song_stats = {"notes": note_count, "holds": hold_count, "duration": duration, "dropped": dropped, "total": total}
+	chart = res.chart; chart_end = res["end"]; use_lead_in = res.lead; first_note_time = res.first; auto_mult = res.auto
+	audio_stream = stream; current_song = entry; current_parsed = parsed
+	level_mults = res.mults
+	bg_texture = ImageTexture.create_from_image(res.bg) if res.bg != null else null
+	prep_tex = ImageTexture.create_from_image(res.prep) if res.prep != null else null
+	song_stats = {"notes": note_count, "holds": hold_count, "duration": duration, "dropped": res.dropped, "total": res.total}
 	screen = Screen.PREPARE
-	var pbg := String(entry.get("bg_path", ""))
-	prep_tex = OsuImporter.load_image(pbg, 1280) if pbg != "" else null
 	_stop_ambient()
 	_ambient_play(audio_stream, true)
 
@@ -3706,6 +3823,20 @@ func _draw() -> void:
 			_draw_overlay(ov_p)
 			overlay = ""
 	_draw_trans_cover()
+	_draw_sel_cover()
+
+## Fundido hacia el color de fondo mientras se carga la canción (continúa en el fundido de entrada de Preparar).
+func _draw_sel_cover() -> void:
+	if not sel_loading:
+		return
+	var a := _ease_out(sel_load_t / SEL_FADE) * 0.92
+	draw_rect(Rect2(Vector2.ZERO, viewport_size), acol(pcol("bg"), a))
+	# Tres puntitos que se encienden uno a uno (sin texto, así no depende del idioma).
+	var c := viewport_size / 2.0
+	var active := int(sel_load_t * 5.0) % 3
+	for i in 3:
+		var da := minf(1.0, a * 1.2) * (1.0 if i == active else 0.35)
+		draw_circle(c + Vector2((i - 1) * 48.0, 0.0), 11.0, acol(Color.WHITE, da))
 
 func _draw_game() -> void:
 	var lane_w := viewport_size.x / LANES
