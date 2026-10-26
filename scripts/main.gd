@@ -80,6 +80,8 @@ var set_scroll := 0.0    # desplazamiento de Ajustes
 var set_press_id := -999
 var set_press_pos := Vector2.ZERO
 var set_dragged := false
+var set_vel := 0.0        # inercia del desplazamiento de Ajustes (px/s)
+var set_drag_ms := 0
 const SETTINGS_END := 3330.0   # fin del contenido de Ajustes (unidades de 1080 px)
 var prep_tex: Texture2D = null   # imagen del mapa en Preparar
 var input_y: Dictionary = {}   # altura (y) del dedo de cada toque, para dibujar la larga donde lo pones
@@ -551,6 +553,10 @@ func _drag_any(pos: Vector2, relative: Vector2, input_id: int) -> void:
 			if not set_dragged and pos.distance_to(set_press_pos) > 24.0:
 				set_dragged = true
 			if set_dragged:
+				var now := Time.get_ticks_msec()
+				var dt := maxf(0.004, float(now - set_drag_ms) / 1000.0)
+				set_drag_ms = now
+				set_vel = clampf(lerpf(set_vel, -relative.y / dt, 0.4), -7000.0, 7000.0)
 				set_scroll = clampf(set_scroll - relative.y, 0.0, _settings_max_scroll())
 		return
 	if screen == Screen.GAME and input_id in active_inputs:
@@ -785,6 +791,14 @@ func _process(delta: float) -> void:
 		_update_notes()
 	if previewing and (screen != Screen.PREPARE or not player.playing):
 		previewing = false
+	if screen != Screen.SETTINGS:
+		set_vel = 0.0
+	elif set_press_id == -999 and absf(set_vel) > 12.0:
+		var before := set_scroll
+		set_scroll = clampf(set_scroll + set_vel * delta, 0.0, _settings_max_scroll())
+		set_vel *= exp(-3.0 * delta)   # frena poco a poco, igual que en Música
+		if is_equal_approx(before, set_scroll):
+			set_vel = 0.0   # tocó un borde
 	if screen == Screen.LIBRARY and tab == TAB_MUSIC and press_id == -999 and absf(scroll_vel) > 12.0:
 		scroll_y += scroll_vel * delta
 		scroll_vel *= exp(-3.0 * delta)   # frena poco a poco: desplazamiento con inercia
@@ -1107,6 +1121,8 @@ func _settings_pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
 		set_press_id = input_id
 		set_press_pos = pos
 		set_dragged = false
+		set_vel = 0.0
+		set_drag_ms = Time.get_ticks_msec()
 	elif input_id == set_slider_id:
 		_slider_release()
 	elif input_id == set_press_id:
@@ -1114,6 +1130,8 @@ func _settings_pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
 		if not set_dragged:
 			pos.y += set_scroll - ui_off
 			_settings_tap(pos)
+		elif Time.get_ticks_msec() - set_drag_ms > 90:
+			set_vel = 0.0   # soltó el dedo parado: sin inercia
 
 func _settings_tap(pos: Vector2) -> void:
 	var w := viewport_size.x

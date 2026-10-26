@@ -44,6 +44,14 @@ var _sets: Array = []
 var _loading := false
 var _end := false
 
+# Desplazamiento táctil propio: los botones y tarjetas se "comen" el toque y el ScrollContainer
+# solo se movía si el dedo caía en un hueco entre canciones. Aquí el arrastre vale en cualquier punto de la lista.
+const DRAG_START := 18.0          # píxeles que hay que mover el dedo para que cuente como arrastre y no como toque
+var _drag_on := false
+var _drag_moved := false          # el gesto actual fue un arrastre: se ignoran los botones al soltar
+var _drag_start := Vector2.ZERO
+var _vel := 0.0                   # velocidad de la inercia (px/s)
+
 
 func _ready() -> void:
 	layer = 60
@@ -54,6 +62,44 @@ func _ready() -> void:
 	_dl.download_progress.connect(_on_progress)
 	_dl.download_finished.connect(_on_download)
 	_dl.cover_loaded.connect(_on_cover)
+
+
+func _input(event: InputEvent) -> void:
+	if not visible or _scroll == null or not is_instance_valid(_scroll):
+		return
+	var rect := _scroll.get_global_rect()
+	if event is InputEventMouseButton:
+		var mb := event as InputEventMouseButton
+		if mb.button_index == MOUSE_BUTTON_LEFT:
+			if mb.pressed:
+				_vel = 0.0
+				_drag_moved = false
+				_drag_on = rect.has_point(mb.position)
+				_drag_start = mb.position
+			else:
+				_drag_on = false
+		elif mb.pressed and rect.has_point(mb.position):
+			if mb.button_index == MOUSE_BUTTON_WHEEL_UP:
+				_scroll.scroll_vertical -= 140
+			elif mb.button_index == MOUSE_BUTTON_WHEEL_DOWN:
+				_scroll.scroll_vertical += 140
+	elif event is InputEventMouseMotion and _drag_on:
+		var mm := event as InputEventMouseMotion
+		if not _drag_moved and mm.position.distance_to(_drag_start) > DRAG_START:
+			_drag_moved = true
+			if _edit != null:
+				_edit.release_focus()
+		if _drag_moved:
+			_scroll.scroll_vertical -= int(mm.relative.y)
+			_vel = lerpf(_vel, mm.velocity.y, 0.5)
+			get_viewport().set_input_as_handled()
+
+
+func _process(delta: float) -> void:
+	if not visible or _scroll == null or _drag_on or absf(_vel) < 30.0:
+		return
+	_scroll.scroll_vertical -= int(_vel * delta)
+	_vel *= exp(-4.0 * delta)
 
 
 func open(palette: Dictionary, inset: float, translate: Callable) -> void:
@@ -228,6 +274,7 @@ func _build() -> void:
 	_scroll = ScrollContainer.new()
 	_scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	_scroll.mouse_filter = Control.MOUSE_FILTER_IGNORE   # el arrastre lo maneja _input (ver arriba)
 	col.add_child(_scroll)
 	_list = VBoxContainer.new()
 	_list.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -415,6 +462,8 @@ func _search(reset: bool) -> void:
 
 
 func _load_more() -> void:
+	if _drag_moved:
+		return
 	if not _loading and not _end:
 		_search(false)
 
@@ -442,6 +491,8 @@ func _on_search(sets: Array, error: String) -> void:
 
 
 func _on_card_pressed(sid: int) -> void:
+	if _drag_moved:
+		return   # fue un arrastre para desplazar, no un toque
 	_states[sid] = "queued"
 	_apply_state(sid)
 	_set_status("", false)
