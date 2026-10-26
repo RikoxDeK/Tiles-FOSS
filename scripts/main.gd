@@ -1,6 +1,6 @@
 extends Node2D
 
-enum Screen { LIBRARY, PREPARE, GAME, RESULTS, SETTINGS, PALETTE, CALIBRATE }
+enum Screen { LIBRARY, PREPARE, GAME, RESULTS, SETTINGS, PALETTE, CALIBRATE, VOLUME }
 const LANES := 4
 const NORMAL_HEIGHT := 455.0
 const BASE_SPEED := 760.0
@@ -77,13 +77,15 @@ var amb_retry := 0.0    # espera antes de volver a intentar arrancar la música 
 var amb_enabled := true  # ajuste: música de fondo en menús
 var music_vol := 1.0     # ajuste: volumen de la música (0 - 1)
 var sfx_vol := 1.0       # ajuste: volumen de los efectos (0 - 1)
+var amb_vol := 0.6       # ajuste: volumen de la música de menú (0 - 1; 0.6 = el nivel de siempre, unos -16 dB)
+var amb_muffle := true   # ajuste: la música de menú suena "tapada" (filtro de agudos)
 var set_scroll := 0.0    # desplazamiento de Ajustes
 var set_press_id := -999
 var set_press_pos := Vector2.ZERO
 var set_dragged := false
 var set_vel := 0.0        # inercia del desplazamiento de Ajustes (px/s)
 var set_drag_ms := 0
-const SETTINGS_END := 3330.0   # fin del contenido de Ajustes (unidades de 1080 px)
+const SETTINGS_END := 2960.0   # fin del contenido de Ajustes (unidades de 1080 px)
 var prep_tex: Texture2D = null   # imagen del mapa en Preparar
 var input_y: Dictionary = {}   # altura (y) del dedo de cada toque, para dibujar la larga donde lo pones
 var effects: Array = []
@@ -253,10 +255,11 @@ var res_t := 0.0            # segundos desde que se muestran los resultados
 const SLIDER_X := 130.0
 const SLIDERS := [
 	{"y": 540.0, "min": 0.1, "max": 0.7, "step": 0.05},
-	{"y": 1920.0, "min": 0.0, "max": 1.0, "step": 0.05},
-	{"y": 2210.0, "min": 0.0, "max": 1.0, "step": 0.05},
-	{"y": 2500.0, "min": 0.5, "max": 1.5, "step": 0.05},
-	{"y": 2790.0, "min": -600.0, "max": 600.0, "step": 5.0},
+	{"y": 200.0, "min": 0.0, "max": 1.0, "step": 0.05},    # 1: música de las canciones (pantalla Volumen)
+	{"y": 840.0, "min": 0.0, "max": 1.0, "step": 0.05},    # 2: efectos (pantalla Volumen)
+	{"y": 2130.0, "min": 0.5, "max": 1.5, "step": 0.05},   # 3: largo de las notas
+	{"y": 2420.0, "min": -600.0, "max": 600.0, "step": 5.0},   # 4: retraso del audio
+	{"y": 520.0, "min": 0.0, "max": 1.0, "step": 0.05},    # 5: música de menú (pantalla Volumen)
 ]
 var set_slider := -1
 var set_slider_id := -999
@@ -547,6 +550,10 @@ func _drag_any(pos: Vector2, relative: Vector2, input_id: int) -> void:
 		return
 	if screen == Screen.CALIBRATE:
 		return
+	if screen == Screen.VOLUME:
+		if input_id == set_slider_id:
+			_slider_apply(set_slider, pos.x)
+		return
 	if screen == Screen.SETTINGS:
 		if input_id == set_slider_id:
 			_slider_apply(set_slider, pos.x)
@@ -739,7 +746,7 @@ func _go_back() -> void:
 			screen = Screen.LIBRARY
 		Screen.SETTINGS:
 			screen = Screen.LIBRARY
-		Screen.PALETTE:
+		Screen.PALETTE, Screen.VOLUME:
 			screen = Screen.SETTINGS
 		Screen.CALIBRATE:
 			_close_calibration(false)
@@ -1153,7 +1160,8 @@ func _settings_tap(pos: Vector2) -> void:
 			amb_retry = 0.0
 		else:
 			_stop_ambient()
-	elif Rect2(80, 3120, w - 160, 180).has_point(pos): _open_calibration()
+	elif Rect2(80, 1920, w - 160, 180).has_point(pos): screen = Screen.VOLUME
+	elif Rect2(80, 2750, w - 160, 180).has_point(pos): _open_calibration()
 
 func _key_lane(event: InputEventKey) -> int:
 	var key: Key = event.physical_keycode
@@ -1172,6 +1180,9 @@ func _pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
 		return
 	if screen == Screen.PALETTE:
 		_palette_pointer(pos, pressed, input_id)
+		return
+	if screen == Screen.VOLUME:
+		_volume_pointer(pos, pressed, input_id)
 		return
 	if screen == Screen.LIBRARY:
 		_library_pointer(pos, pressed, input_id)
@@ -2154,7 +2165,7 @@ func _nav_rect(i: int) -> Rect2:
 	return Rect2(i * cw, viewport_size.y - NAV_H, cw, NAV_H)
 
 func _nav_active() -> int:
-	return 3 if screen == Screen.SETTINGS or screen == Screen.PALETTE or screen == Screen.CALIBRATE else tab
+	return 3 if screen == Screen.SETTINGS or screen == Screen.PALETTE or screen == Screen.CALIBRATE or screen == Screen.VOLUME else tab
 
 func _mode_btn_center() -> Vector2:
 	return Vector2(viewport_size.x / 2.0, _nav_curve_y(viewport_size.x / 2.0) + 58.0)
@@ -3385,6 +3396,9 @@ func _load_settings() -> void:
 	note_len = clampf(float(cfg.get_value("display", "note_len", 1.0)), 0.5, 1.5)
 	music_vol = clampf(float(cfg.get_value("display", "music_vol", 1.0)), 0.0, 1.0)
 	sfx_vol = clampf(float(cfg.get_value("display", "sfx_vol", 1.0)), 0.0, 1.0)
+	amb_vol = clampf(float(cfg.get_value("display", "amb_vol", 0.6)), 0.0, 1.0)
+	amb_muffle = bool(cfg.get_value("display", "amb_muffle", true))
+	_apply_ambient_filter()
 	audio_delay_ms = clampf(float(cfg.get_value("display", "audio_delay_ms", 0.0)), -600.0, 600.0)
 	_apply_volumes()
 	sort_mode = clampi(int(cfg.get_value("library", "sort", 0)), 0, SORT_MODES.size() - 1)
@@ -3516,6 +3530,8 @@ func _save_settings() -> void:
 	cfg.set_value("display", "note_len", note_len)
 	cfg.set_value("display", "music_vol", music_vol)
 	cfg.set_value("display", "sfx_vol", sfx_vol)
+	cfg.set_value("display", "amb_vol", amb_vol)
+	cfg.set_value("display", "amb_muffle", amb_muffle)
 	cfg.set_value("display", "audio_delay_ms", audio_delay_ms)
 	cfg.set_value("profile", "current", profile_id)
 	cfg.set_value("library", "sort", sort_mode)
@@ -3644,7 +3660,7 @@ func _adjust_sfx_vol(delta: float) -> void:
 
 ## Música de menú: vuelve sola al salir de Preparar, de la partida o de los resultados.
 func _ambient_tick(delta: float) -> void:
-	var menu := screen == Screen.LIBRARY or screen == Screen.SETTINGS or screen == Screen.PALETTE
+	var menu := screen == Screen.LIBRARY or screen == Screen.SETTINGS or screen == Screen.PALETTE or screen == Screen.VOLUME
 	if not menu or not amb_enabled or previewing:
 		if amb_on and not amb_song and not amb_enabled:
 			_stop_ambient()
@@ -3661,7 +3677,7 @@ func _setup_ambient() -> void:
 		AudioServer.add_bus()
 		var bi := AudioServer.bus_count - 1
 		AudioServer.set_bus_name(bi, "Ambient")
-		AudioServer.set_bus_send(bi, "Music")
+		AudioServer.set_bus_send(bi, "Master")   # volumen propio (ajuste "Música de menú"), no depende del de las canciones
 		var lp := AudioEffectLowPassFilter.new()
 		lp.cutoff_hz = 1800.0
 		AudioServer.add_bus_effect(bi, lp)
@@ -3714,9 +3730,24 @@ func _ambient_play(stream: AudioStream, from_song: bool) -> void:
 		start = stream.get_length() * 0.25
 	nw.play(start)
 	amb_cur = nw
-	_amb_fade(nw, -17.0, 2.2, false)
+	_amb_fade(nw, _amb_db(), 2.2, false)
 	if old != null and old.playing:
 		_amb_fade(old, -60.0, 2.2, true)
+
+## Decibelios de la música de menú según el ajuste (0.6 = -16 dB, casi lo de siempre; 1.0 = 0 dB).
+func _amb_db() -> float:
+	return -60.0 if amb_vol <= 0.01 else lerpf(-40.0, 0.0, amb_vol)
+
+## Aplica al instante el ajuste a la música de menú que esté sonando.
+func _apply_ambient_volume() -> void:
+	if amb_on and amb_cur != null and amb_cur.playing:
+		_amb_fade(amb_cur, _amb_db(), 0.08, false)
+
+## Enciende o apaga el filtro que hace sonar "tapada" la música de menú.
+func _apply_ambient_filter() -> void:
+	var bi := AudioServer.get_bus_index("Ambient")
+	if bi >= 0 and AudioServer.get_bus_effect_count(bi) > 0:
+		AudioServer.set_bus_effect_enabled(bi, 0, amb_muffle)
 
 func _amb_fade(p: AudioStreamPlayer, to_db: float, dur: float, stop_after: bool) -> void:
 	var prev = amb_tweens.get(p, null)
@@ -3907,6 +3938,7 @@ func _draw() -> void:
 	elif screen == Screen.GAME: _draw_game()
 	elif screen == Screen.SETTINGS: _draw_settings()
 	elif screen == Screen.PALETTE: _draw_palette()
+	elif screen == Screen.VOLUME: _draw_volume()
 	elif screen == Screen.CALIBRATE: _draw_calibrate()
 	else: _draw_results()
 	draw_set_transform(Vector2.ZERO)
@@ -4330,14 +4362,16 @@ func _draw_settings() -> void:
 	_text("Música de fondo", Vector2(130, 1795), 40, Color.WHITE)
 	_text("Suena en el inicio y los menús", Vector2(130, 1845), 26, muted)
 	_button(Rect2(w - 330, 1755, 200, 90), "SÍ" if amb_enabled else "NO", on_col if amb_enabled else off_col)
-	_draw_slider(1, "Volumen de la música", "%d %%" % roundi(music_vol * 100.0))
-	_draw_slider(2, "Volumen de los efectos", "%d %%" % roundi(sfx_vol * 100.0))
+	_panel(Rect2(80, 1920, w - 160, 180), panel_col, 34)
+	_text("Volumen", Vector2(130, 2005), 40, Color.WHITE)
+	_text("Música, música de menú y efectos", Vector2(130, 2055), 26, muted)
+	_button(Rect2(w - 330, 1965, 200, 90), "Ajustar", on_col)
 	_draw_slider(3, "Largo de las notas", "%d %%" % roundi(note_len * 100.0))
 	_draw_slider(4, "Retraso del audio", "%d ms" % roundi(audio_delay_ms), 1.0, "Súbelo si el sonido llega tarde; bájalo si llega antes")
-	_panel(Rect2(80, 3120, w - 160, 180), panel_col, 34)
-	_text("Calibrar tocando al ritmo", Vector2(130, 3205), 40, Color.WHITE)
-	_text("Toca al compás de los clics y se ajusta solo", Vector2(130, 3255), 26, muted)
-	_button(Rect2(w - 330, 3165, 200, 90), "Calibrar", on_col)
+	_panel(Rect2(80, 2750, w - 160, 180), panel_col, 34)
+	_text("Calibrar tocando al ritmo", Vector2(130, 2835), 40, Color.WHITE)
+	_text("Toca al compás de los clics y se ajusta solo", Vector2(130, 2885), 26, muted)
+	_button(Rect2(w - 330, 2795, 200, 90), "Calibrar", on_col)
 	if status_time > 0.0:
 		_text(_fit(status_text, w - 160, 26), Vector2(80, 270), 26, _err() if status_error else _ok())
 	_draw_nav()
@@ -4614,10 +4648,16 @@ func _slider_value(i: int) -> float:
 			return sfx_vol
 		3:
 			return note_len
+		5:
+			return amb_vol
 	return audio_delay_ms
 
+## Qué deslizadores hay en cada pantalla: Ajustes (fondo, largo de notas, retraso) o Volumen.
+func _slider_ids() -> Array:
+	return [1, 5, 2] if screen == Screen.VOLUME else [0, 3, 4]
+
 func _slider_hit(p: Vector2) -> int:
-	for i in SLIDERS.size():
+	for i in _slider_ids():
 		if i == 0 and not show_bg:
 			continue
 		var s: Dictionary = SLIDERS[i]
@@ -4641,6 +4681,9 @@ func _slider_apply(i: int, x: float) -> void:
 			_apply_volumes()
 		3:
 			note_len = v
+		5:
+			amb_vol = v
+			_apply_ambient_volume()
 		_:
 			audio_delay_ms = v
 
@@ -4682,6 +4725,44 @@ func _draw_slider(i: int, title: String, value_text: String, a := 1.0, sub := ""
 	draw_circle(Vector2(kx, ty + 4.0), kr, Color(0, 0, 0, 0.25 * a))
 	draw_circle(Vector2(kx, ty), kr, Color(1, 1, 1, a))
 	draw_circle(Vector2(kx, ty), kr * 0.5, acol(accent, a))
+
+# --- Pantalla de volumen ---------------------------------------------------
+
+func _draw_volume() -> void:
+	_background(); draw_set_transform(Vector2(0, ui_off))
+	var w := viewport_size.x
+	_button(Rect2(35, 45, 180, 95), "< Volver", pcol("button"))
+	_text("VOLUMEN", Vector2(245, 118), 46, Color.WHITE)
+	_draw_slider(1, "Música de las canciones", "%d %%" % roundi(music_vol * 100.0), 1.0, "Cuando juegas y al reproducir una canción")
+	_draw_slider(5, "Música de menú", "%d %%" % roundi(amb_vol * 100.0), 1.0, "La que suena de fondo en el inicio y los menús")
+	_draw_slider(2, "Efectos de sonido", "%d %%" % roundi(sfx_vol * 100.0))
+	_panel(Rect2(80, 1160, w - 160, 180), acol(pcol("panel"), 0.92), 34)
+	_text("Música de menú tapada", Vector2(130, 1245), 40, Color.WHITE)
+	_text("Con NO suena clara, como la de las canciones", Vector2(130, 1295), 26, pcol("muted"))
+	_button(Rect2(w - 330, 1205, 200, 90), "SÍ" if amb_muffle else "NO", pcol("accent") if amb_muffle else pcol("button"))
+	_draw_nav()
+
+func _volume_pointer(pos: Vector2, pressed: bool, input_id: int) -> void:
+	if not pressed:
+		if input_id == set_slider_id:
+			_slider_release()
+		return
+	if _nav_tap(pos):
+		return
+	pos.y -= ui_off
+	if Rect2(35, 45, 180, 95).has_point(pos):
+		screen = Screen.SETTINGS
+		return
+	var sl := _slider_hit(pos)
+	if sl >= 0:
+		set_slider = sl
+		set_slider_id = input_id
+		_slider_apply(sl, pos.x)
+		return
+	if Rect2(80, 1160, viewport_size.x - 160.0, 180).has_point(pos):
+		amb_muffle = not amb_muffle
+		_apply_ambient_filter()
+		_save_settings()
 
 # --- Calibración del audio tocando al ritmo ---------------------------------------
 
