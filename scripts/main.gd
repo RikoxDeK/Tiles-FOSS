@@ -5,6 +5,7 @@ const LANES := 4
 const NORMAL_HEIGHT := 455.0
 const BASE_SPEED := 760.0
 const SETTINGS_PATH := "user://settings.cfg"
+const PROFILE_DIR := "user://profiles"   # un archivo por perfil: récords, favoritas, listas y última canción
 const SPEED_MIN := 0.5
 const SPEED_MAX := 5.0
 const SPEED_STEP := 0.1
@@ -107,6 +108,7 @@ var empties := 0
 var run_rank := 0
 var run_accuracy := 0.0
 var run_record := false
+var profile_id := "default"   # perfil activo (todavía sin pantalla de login: siempre "default")
 var bests: Dictionary = {}   # clave de mapa -> {"score", "rank", "acc"}
 var last_judgement := ""
 var judgement_time := 0.0
@@ -3361,7 +3363,9 @@ func _adjust_speed(delta: float) -> void:
 func _load_settings() -> void:
 	var cfg := ConfigFile.new()
 	if cfg.load(SETTINGS_PATH) != OK:
+		_load_profile()
 		return
+	profile_id = _safe_profile_id(String(cfg.get_value("profile", "current", "default")))
 	speed_auto = cfg.get_value("speed", "auto", false)
 	speed_mult = clampf(float(cfg.get_value("speed", "mult", 3.0)), SPEED_MIN, SPEED_MAX)
 	game_mode = clampi(int(cfg.get_value("mods", "game_mode", 1 if bool(cfg.get_value("mods", "infinite", false)) else 0)), 0, 1)
@@ -3383,20 +3387,7 @@ func _load_settings() -> void:
 	sfx_vol = clampf(float(cfg.get_value("display", "sfx_vol", 1.0)), 0.0, 1.0)
 	audio_delay_ms = clampf(float(cfg.get_value("display", "audio_delay_ms", 0.0)), -600.0, 600.0)
 	_apply_volumes()
-	var fav_list = cfg.get_value("library", "favorites", [])
-	if fav_list is Array:
-		for fid in fav_list:
-			favorites[String(fid)] = true
 	sort_mode = clampi(int(cfg.get_value("library", "sort", 0)), 0, SORT_MODES.size() - 1)
-	last_played = {
-		"id": String(cfg.get_value("library", "last_id", "")), "version": String(cfg.get_value("library", "last_version", "")),
-		"id_inf": String(cfg.get_value("library", "last_id_inf", "")), "version_inf": String(cfg.get_value("library", "last_version_inf", "")),
-	}
-	var pl = cfg.get_value("library", "playlists", [])
-	if pl is Array:
-		for p in pl:
-			if p is Dictionary and p.has("name") and p.get("refs") is Array:
-				playlists.append({"name": String(p.name), "refs": (p.refs as Array).duplicate()})
 	show_bg = bool(cfg.get_value("display", "show_bg", true))
 	var saved_lang := String(cfg.get_value("display", "lang", lang))
 	if saved_lang == "es" or saved_lang == "en":
@@ -3411,11 +3402,98 @@ func _load_settings() -> void:
 		sc = {}   # escala distinta: se recalculan las categorías
 	if sc is Dictionary:
 		star_cache = (sc as Dictionary).duplicate()
+	_load_profile(cfg)
+
+# --- Perfiles ------------------------------------------------------------
+# Todo lo que es "de la persona" (récords, favoritas, listas, última canción) vive en su propio archivo
+# user://profiles/<id>.cfg; settings.cfg solo guarda los ajustes del dispositivo y cuál perfil está activo.
+# Todavía no hay pantalla de login: se usa siempre el perfil "default". Para el futuro login basta con:
+#   _switch_profile("riko")   -> carga (o crea vacío) el perfil de ese nombre y lo deja activo
+#   _wipe_profile("default")  -> borra los datos del perfil viejo para que empiecen de cero con su nombre
+
+## Deja el nombre como id de archivo válido (minúsculas, números, _ y -).
+static func _safe_profile_id(pname: String) -> String:
+	var out := ""
+	for ch in pname.strip_edges().to_lower():
+		if (ch >= "a" and ch <= "z") or (ch >= "0" and ch <= "9") or ch == "_" or ch == "-":
+			out += ch
+	return out if out != "" else "default"
+
+func _profile_path(id := "") -> String:
+	return PROFILE_DIR.path_join(_safe_profile_id(profile_id if id == "" else id) + ".cfg")
+
+## Carga los datos del perfil activo. "legacy" es el settings.cfg viejo: si todavía no existe el archivo del
+## perfil "default", los datos se toman de ahí UNA vez (así nadie pierde récords al actualizar).
+func _load_profile(legacy: ConfigFile = null) -> void:
+	var cfg := ConfigFile.new()
+	var migrated := false
+	if cfg.load(_profile_path()) != OK:
+		if profile_id == "default" and legacy != null:
+			cfg = legacy
+			migrated = true
+		else:
+			return
+	bests.clear()
+	favorites.clear()
+	playlists.clear()
+	last_played = {
+		"id": String(cfg.get_value("library", "last_id", "")), "version": String(cfg.get_value("library", "last_version", "")),
+		"id_inf": String(cfg.get_value("library", "last_id_inf", "")), "version_inf": String(cfg.get_value("library", "last_version_inf", "")),
+	}
+	var fav_list = cfg.get_value("library", "favorites", [])
+	if fav_list is Array:
+		for fid in fav_list:
+			favorites[String(fid)] = true
+	var pl = cfg.get_value("library", "playlists", [])
+	if pl is Array:
+		for p in pl:
+			if p is Dictionary and p.has("name") and p.get("refs") is Array:
+				playlists.append({"name": String(p.name), "refs": (p.refs as Array).duplicate()})
 	if cfg.has_section("best"):
 		for key in cfg.get_section_keys("best"):
 			var v = cfg.get_value("best", key)
 			if v is Dictionary:
 				bests[key] = v
+	if migrated:
+		_save_profile()   # ya quedan en su archivo; settings.cfg deja de guardarlos
+
+func _save_profile() -> void:
+	DirAccess.make_dir_recursive_absolute(PROFILE_DIR)
+	var cfg := ConfigFile.new()
+	cfg.set_value("info", "name", profile_id)
+	cfg.set_value("library", "favorites", favorites.keys())
+	cfg.set_value("library", "last_id", String(last_played.get("id", "")))
+	cfg.set_value("library", "last_version", String(last_played.get("version", "")))
+	cfg.set_value("library", "last_id_inf", String(last_played.get("id_inf", "")))
+	cfg.set_value("library", "last_version_inf", String(last_played.get("version_inf", "")))
+	cfg.set_value("library", "playlists", playlists)
+	for key in bests:
+		cfg.set_value("best", key, bests[key])
+	cfg.save(_profile_path())
+
+## (Para el login futuro, aún sin usar.) Guarda el perfil actual y pasa a otro; si no existe, empieza vacío.
+func _switch_profile(pname: String) -> void:
+	_save_profile()
+	profile_id = _safe_profile_id(pname)
+	bests.clear()
+	favorites.clear()
+	playlists.clear()
+	last_played = {}
+	_load_profile()
+	_save_settings()
+	home_dirty = true
+
+## (Para el login futuro, aún sin usar.) Borra el archivo de datos de un perfil.
+func _wipe_profile(id: String) -> void:
+	var path := _profile_path(id)
+	if FileAccess.file_exists(path):
+		DirAccess.remove_absolute(path)
+	if _safe_profile_id(id) == profile_id:
+		bests.clear()
+		favorites.clear()
+		playlists.clear()
+		last_played = {}
+		home_dirty = true
 
 func _save_settings() -> void:
 	home_dirty = true
@@ -3439,13 +3517,8 @@ func _save_settings() -> void:
 	cfg.set_value("display", "music_vol", music_vol)
 	cfg.set_value("display", "sfx_vol", sfx_vol)
 	cfg.set_value("display", "audio_delay_ms", audio_delay_ms)
-	cfg.set_value("library", "favorites", favorites.keys())
+	cfg.set_value("profile", "current", profile_id)
 	cfg.set_value("library", "sort", sort_mode)
-	cfg.set_value("library", "last_id", String(last_played.get("id", "")))
-	cfg.set_value("library", "last_version", String(last_played.get("version", "")))
-	cfg.set_value("library", "last_id_inf", String(last_played.get("id_inf", "")))
-	cfg.set_value("library", "last_version_inf", String(last_played.get("version_inf", "")))
-	cfg.set_value("library", "playlists", playlists)
 	cfg.set_value("display", "show_bg", show_bg)
 	cfg.set_value("display", "lang", lang)
 	cfg.set_value("library", "stars", star_cache)
@@ -3453,9 +3526,8 @@ func _save_settings() -> void:
 	for pk in pal:
 		cfg.set_value("palette", pk, (pal[pk] as Color).to_html(false))
 	cfg.set_value("display", "bg_vis", bg_vis)
-	for key in bests:
-		cfg.set_value("best", key, bests[key])
 	cfg.save(SETTINGS_PATH)
+	_save_profile()
 
 # --- Puntaje y rangos ----------------------------------------------------
 
@@ -3478,12 +3550,17 @@ func _accuracy() -> float:
 	var pts := perfects * 100.0 + greats * 80.0 + goods * 50.0 - empties * 25.0
 	return clampf(pts / (total * 100.0) * 100.0, 0.0, 100.0)
 
+## Rango de la partida. La precisión sola no basta: los fallos (notas perdidas, largas soltadas y toques
+## en vacío) ponen un tope. S y SS no admiten ni un fallo; de A hacia abajo se tolera un % de las notas.
+##   SS: 98 %+ y 0 fallos   S: 95 %+ y 0 fallos   A: 90 %+ y fallos <= 2 %
+##   B: 80 %+ y fallos <= 5 %   C: 70 %+ y fallos <= 10 %   D: el resto
 func _rank_for(acc: float, miss_count: int) -> int:
-	if acc >= 98.0 and miss_count == 0: return 5   # SS
-	if acc >= 95.0: return 4                       # S
-	if acc >= 90.0: return 3                       # A
-	if acc >= 80.0: return 2                       # B
-	if acc >= 70.0: return 1                       # C
+	var miss_rate := float(miss_count) / maxf(1.0, float(song_stats.notes))
+	if miss_count == 0 and acc >= 98.0: return 5   # SS
+	if miss_count == 0 and acc >= 95.0: return 4   # S
+	if acc >= 90.0 and miss_rate <= 0.02: return 3 # A
+	if acc >= 80.0 and miss_rate <= 0.05: return 2 # B
+	if acc >= 70.0 and miss_rate <= 0.10: return 1 # C
 	return 0                                       # D
 
 func _finish_run() -> void:
