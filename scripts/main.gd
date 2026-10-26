@@ -12,6 +12,8 @@ const HIT_MARGIN := 340.0   # distancia de la línea de golpeo al borde inferior
 const OsuImporter = preload("res://scripts/osu_importer.gd")
 const TilesLang = preload("res://scripts/i18n.gd")
 const TilesPalette = preload("res://scripts/palette.gd")
+const DownloadPanel = preload("res://scripts/download_panel.gd")
+const BeatmapDownloader = preload("res://scripts/beatmap_downloader.gd")
 const START_TIME := -100.0
 const LIST_TOP := 320.0
 const RANKS := ["D", "C", "B", "A", "S", "SS"]
@@ -256,6 +258,7 @@ var search_open := false
 var search_query := ""
 var search_edit: LineEdit
 var file_dialog: FileDialog
+var download_panel: Variant = null   # DownloadPanel: pantalla "Descargar mapas" (mirror online)
 var scroll_y := 0.0
 var press_id := -999
 var press_ms := 0
@@ -673,6 +676,9 @@ func _ready() -> void:
 	folder_dialog.use_native_dialog = true
 	folder_dialog.dir_selected.connect(_set_library_dir)
 	add_child(folder_dialog)
+	download_panel = DownloadPanel.new()
+	download_panel.osz_ready.connect(_on_download_ready)
+	add_child(download_panel)
 	get_window().files_dropped.connect(_on_files_dropped)
 	_setup_search()
 	_setup_name_edit()
@@ -691,6 +697,9 @@ func _notification(what: int) -> void:
 
 ## Botón "atrás" de Android: retrocede una pantalla en vez de cerrar el juego.
 func _go_back() -> void:
+	if download_panel != null and download_panel.visible:
+		download_panel.close()
+		return
 	if overlay != "":
 		_close_overlay()
 		return
@@ -1026,6 +1035,8 @@ func _ghost_visible(note: Dictionary) -> bool:
 	return song_time < float(note.time) + float(note.duration) + (viewport_size.y - hit_y) / speed + 0.1
 
 func _unhandled_input(event: InputEvent) -> void:
+	if download_panel != null and download_panel.visible:
+		return   # la pantalla de descargas maneja sus propios toques
 	# En Android cada toque llega dos veces: como InputEventScreenTouch y como un
 	# clic de ratón emulado (device = -1). Nos quedamos solo con el toque real.
 	# En móvil no hay ratón real: se ignora todo evento de ratón (son copias emuladas del toque).
@@ -1699,18 +1710,29 @@ func _badge_color(e: Dictionary) -> Color:
 		return Color(0.18, 0.66, 0.92)
 	return Color(0.95, 0.55, 0.2) if e.badge == "STD" else Color(0.93, 0.36, 0.62)
 
-func _import_osz(path: String) -> void:
-	var result: Dictionary = OsuImporter.import_osz(path)
+## forced_id: carpeta fija para el set (descargas del mirror), así no se duplica ni cambia el respaldo.
+func _import_osz(path: String, forced_id := "") -> Dictionary:
+	var result: Dictionary = OsuImporter.import_osz(path, forced_id)
 	if result.ok:
 		if library_dir != "":   # copia de respaldo en la carpeta de canciones
 			var bdir := library_dir.path_join(BACKUP_NAME)
 			DirAccess.make_dir_recursive_absolute(bdir)
-			var bid := FileAccess.get_md5(path).substr(0, 10)
+			var bid := forced_id if forced_id != "" else FileAccess.get_md5(path).substr(0, 10)
 			_backup_copy(path, bdir, bid, "%s [%s].osz" % [OsuImporter.safe_name(String(result.title)), bid])
 		_refresh_library()
 		_show_status(T("Importado: %s (%d dificultades)") % [result.title, result.count], false)
 	else:
 		_show_status(result.error, true)
+	return result
+
+## Un .osz bajado del mirror: se importa con id fijo por set y se borra el temporal.
+func _on_download_ready(path: String, set_id: int) -> void:
+	var result := _import_osz(path, BeatmapDownloader.local_id(set_id))
+	DirAccess.remove_absolute(path)
+	download_panel.set_import_result(set_id, result)
+
+func _open_downloads() -> void:
+	download_panel.open(pal, top_inset, T)
 
 # --- Carpeta de canciones (respaldo y recarga) -----------------------------
 # <carpeta>/Por importar : se dejan aquí los .osz; al recargar se importan y se mueven.
@@ -2888,8 +2910,10 @@ func _files_tap(pos: Vector2) -> void:
 	var x := 55.0
 	var cw := viewport_size.x - 110.0
 	var half := _files_half()
-	if Rect2(x + 40, 370, cw - 80, 100).has_point(pos):
+	if Rect2(x + 40, 370, half, 100).has_point(pos):
 		file_dialog.popup_centered_ratio(0.85)
+	elif Rect2(x + 80 + half, 370, half, 100).has_point(pos):
+		_open_downloads()
 	elif Rect2(x + 40, 810, half, 100).has_point(pos):
 		folder_dialog.popup_centered_ratio(0.85)
 	elif Rect2(x + 80 + half, 810, half, 100).has_point(pos):
@@ -2909,8 +2933,9 @@ func _draw_files() -> void:
 	_text("ARCHIVOS", Vector2(55, 105), 58, Color.WHITE)
 	_panel(Rect2(x, 200, cw, 300), panel_col, 34)
 	_text("Importar mapa", Vector2(x + 40, 285), 40, Color.WHITE)
-	_text("Elige un archivo .osz de osu! de tu móvil.", Vector2(x + 40, 335), 26, muted)
-	_button(Rect2(x + 40, 370, cw - 80, 100), "Importar .osz", accent)
+	_text(_fit("Elige un .osz de tu móvil o descarga mapas de internet.", cw - 80, 26), Vector2(x + 40, 335), 26, muted)
+	_button(Rect2(x + 40, 370, half, 100), "Importar .osz", accent)
+	_button(Rect2(x + 80 + half, 370, half, 100), "Descargar mapas", pcol("nav_music"))
 	_panel(Rect2(x, 540, cw, 420), panel_col, 34)
 	_text("Carpeta de canciones", Vector2(x + 40, 625), 40, Color.WHITE)
 	var shown_dir := library_dir if library_dir != "" else "Sin configurar (por defecto: Documentos/TilesFOSS)"
