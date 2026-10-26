@@ -1,6 +1,7 @@
 # Tiles FOSS
 
 Prototipo visual y jugable inspirado en la estructura de los juegos de piano verticales.
+Compatibilidad con Beatmaps de OSU!.
 
 - Teclado de prueba: D, F, J y K.
 
