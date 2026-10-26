@@ -24,4 +24,3 @@ Compatibilidad con Beatmaps de OSU!.
 - **Descarga de mapas:** [Mino](https://catboy.best) (catboy.best), mirror de beatmaps de osu!. Como respaldo se usan [Nerinyan](https://nerinyan.moe) y [osu.direct](https://osu.direct).
 - **Portadas:** CDN oficial de osu! (assets.ppy.sh).
 - **osu!** es un juego de ppy. Tiles FOSS es un proyecto independiente y **no está afiliado** a osu!, a ppy ni a Mino.
-- Cada beatmap pertenece a su creador y la música a sus artistas; el juego solo los descarga a petición del usuario para uso personal.
