@@ -51,6 +51,8 @@ var _drag_on := false
 var _drag_moved := false          # el gesto actual fue un arrastre: se ignoran los botones al soltar
 var _drag_start := Vector2.ZERO
 var _vel := 0.0                   # velocidad de la inercia (px/s)
+var _fpos := 0.0                  # posición con decimales (scroll_vertical solo admite enteros y se atascaba)
+var _drag_ms := 0
 
 
 func _ready() -> void:
@@ -62,6 +64,18 @@ func _ready() -> void:
 	_dl.download_progress.connect(_on_progress)
 	_dl.download_finished.connect(_on_download)
 	_dl.cover_loaded.connect(_on_cover)
+
+
+func _scroll_max() -> float:
+	return maxf(0.0, _list.size.y - _scroll.size.y)
+
+
+## Mueve la lista con decimales; devuelve true si chocó con un borde.
+func _scroll_by(dy: float) -> bool:
+	var want := _fpos + dy
+	_fpos = clampf(want, 0.0, _scroll_max())
+	_scroll.scroll_vertical = roundi(_fpos)
+	return not is_equal_approx(want, _fpos)
 
 
 func _input(event: InputEvent) -> void:
@@ -76,30 +90,44 @@ func _input(event: InputEvent) -> void:
 				_drag_moved = false
 				_drag_on = rect.has_point(mb.position)
 				_drag_start = mb.position
+				_drag_ms = Time.get_ticks_msec()
+				_fpos = float(_scroll.scroll_vertical)
 			else:
+				if _drag_on and _drag_moved and Time.get_ticks_msec() - _drag_ms > 90:
+					_vel = 0.0   # soltó el dedo parado: sin inercia
 				_drag_on = false
 		elif mb.pressed and rect.has_point(mb.position):
+			_fpos = float(_scroll.scroll_vertical)
 			if mb.button_index == MOUSE_BUTTON_WHEEL_UP:
-				_scroll.scroll_vertical -= 140
+				_scroll_by(-140.0)
 			elif mb.button_index == MOUSE_BUTTON_WHEEL_DOWN:
-				_scroll.scroll_vertical += 140
+				_scroll_by(140.0)
 	elif event is InputEventMouseMotion and _drag_on:
 		var mm := event as InputEventMouseMotion
 		if not _drag_moved and mm.position.distance_to(_drag_start) > DRAG_START:
 			_drag_moved = true
+			_drag_ms = Time.get_ticks_msec()
 			if _edit != null:
 				_edit.release_focus()
+			# El primer tramo (hasta pasar el umbral) también se aplica, para que no "salte" ni se sienta pegajoso.
+			_scroll_by(-(mm.position.y - _drag_start.y))
+		elif _drag_moved:
+			var now := Time.get_ticks_msec()
+			var dt := maxf(0.004, float(now - _drag_ms) / 1000.0)
+			_drag_ms = now
+			_vel = clampf(lerpf(_vel, -mm.relative.y / dt, 0.4), -7000.0, 7000.0)
+			_scroll_by(-mm.relative.y)
 		if _drag_moved:
-			_scroll.scroll_vertical -= int(mm.relative.y)
-			_vel = lerpf(_vel, mm.velocity.y, 0.5)
 			get_viewport().set_input_as_handled()
 
 
 func _process(delta: float) -> void:
-	if not visible or _scroll == null or _drag_on or absf(_vel) < 30.0:
+	if not visible or _scroll == null or _drag_on or absf(_vel) < 12.0:
 		return
-	_scroll.scroll_vertical -= int(_vel * delta)
-	_vel *= exp(-4.0 * delta)
+	if _scroll_by(_vel * delta):
+		_vel = 0.0   # tocó un borde
+		return
+	_vel *= exp(-3.0 * delta)   # igual que en Música y Ajustes
 
 
 func open(palette: Dictionary, inset: float, translate: Callable) -> void:
