@@ -367,7 +367,7 @@ func _append_cards(sets: Array) -> void:
 		_more_btn = null
 	for s in sets:
 		_add_card(s)
-	if not _sets.is_empty() and not _end:
+	if (not _sets.is_empty() or _page > 0) and not _end:
 		_more_btn = _btn(_t("Cargar más"), _c("button"))
 		_more_btn.custom_minimum_size = Vector2(0, 96)
 		_more_btn.pressed.connect(_load_more)
@@ -516,6 +516,9 @@ func _search(reset: bool) -> void:
 			_edit.release_focus()
 	_loading = true
 	_set_status(_t("Buscando..."), false)
+	if _more_btn != null and is_instance_valid(_more_btn):
+		_more_btn.disabled = true
+		_more_btn.text = "..."
 	_dl.search(_query, _mode, _page, _statuses)
 
 
@@ -536,6 +539,7 @@ func _on_search(sets: Array, error: String) -> void:
 			_append_cards([])
 			return
 		_set_status(_t(error), true)
+		_restore_more_btn()
 		return
 	var fresh: Array = []
 	for s in sets:
@@ -571,6 +575,13 @@ func _on_search(sets: Array, error: String) -> void:
 	else:
 		_set_status("", false)
 	_append_cards(fresh)
+
+
+## Tras un error al cargar más, el botón vuelve a poder pulsarse.
+func _restore_more_btn() -> void:
+	if _more_btn != null and is_instance_valid(_more_btn):
+		_more_btn.disabled = false
+		_more_btn.text = _t("Cargar más")
 
 
 func _on_card_pressed(sid: int) -> void:

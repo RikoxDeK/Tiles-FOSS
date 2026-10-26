@@ -61,7 +61,8 @@ var _cover_cache := {}
 var _cur_id := 0
 var _cur_urls: Array = []
 var _cur_i := 0
-var _cur_limited := false     # algún mirror respondió 429 durante la descarga actual
+var _cur_limited := false     # algún mirror respondió 429 (o estaba descansando) durante la descarga actual
+var _cur_other_fail := false  # algún mirror falló por otra causa (404, red, archivo inválido...)
 var _cooldown := {}           # clave (host o host/search) -> Time.get_ticks_msec() hasta el que descansa
 
 
@@ -224,16 +225,17 @@ func _next() -> void:
 	_cur_urls = _urls_for(_cur_id, _cur_nv)
 	_cur_i = 0
 	_cur_limited = false
+	_cur_other_fail = false
 	_try_current()
 
 
-## Mino primero (la "n" final = sin video; si fallara se prueba el enlace normal) y, si falla, otros mirrors.
+## Mino primero (la "n" final = sin video) y, si falla, otros mirrors. NO se repite en el mismo host:
+## si catboy.best/d/IDn falla, reintentar catboy.best/d/ID solo duplicaría peticiones justo cuando
+## el mirror pide calma, así que se salta directo a Nerinyan y osu.direct.
 ## Los mirrors de respaldo se piden sin opciones: pueden traer video, el importador lo ignora.
 func _urls_for(id: int, no_video: bool) -> Array:
 	var urls: Array = []
-	if no_video:
-		urls.append("https://catboy.best/d/%dn" % id)
-	urls.append("https://catboy.best/d/%d" % id)
+	urls.append("https://catboy.best/d/%dn" % id if no_video else "https://catboy.best/d/%d" % id)
 	urls.append("https://api.nerinyan.moe/d/%d" % id)
 	urls.append("https://osu.direct/api/d/%d" % id)
 	return urls
@@ -252,8 +254,10 @@ func _try_current() -> void:
 			set_process(true)
 			download_progress.emit(_cur_id, 0, -1)
 			return
+		_cur_other_fail = true
 		_cur_i += 1
-	_finish(MSG_LIMITED if _cur_limited else "No se pudo descargar desde ningún mirror")
+	# Mensaje de "limitando" solo si TODOS los mirrors están limitando; un fallo normal es otro mensaje.
+	_finish(MSG_LIMITED if _cur_limited and not _cur_other_fail else "No se pudo descargar desde ningún mirror")
 
 
 func _on_download_done(result: int, code: int, headers: PackedStringArray, _body: PackedByteArray) -> void:
@@ -264,8 +268,10 @@ func _on_download_done(result: int, code: int, headers: PackedStringArray, _body
 		_finish("")
 		return
 	if code == 429:
-		_cool_down(host, headers)   # el siguiente enlace de este mismo host también se salta
+		_cool_down(host, headers)   # ese host descansa: no se le vuelve a pedir nada
 		_cur_limited = true
+	else:
+		_cur_other_fail = true
 	DirAccess.remove_absolute(_dl_http.download_file)
 	_cur_i += 1
 	_try_current.call_deferred()

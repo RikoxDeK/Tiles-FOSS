@@ -50,6 +50,7 @@ const TAB_HOME := 0
 const TAB_MUSIC := 1
 const TAB_FILES := 2
 const SORT_MODES := ["Título", "Artista", "Recientes", "Dificultades"]
+const SORT_DIFFS := 3   # índice de "Dificultades" en SORT_MODES (abre el selector de categorías)
 const CARD_H := 190.0
 const CARD_GAP := 24.0
 const DEMO_ENTRY := {"demo": true, "title": "Tiles FOSS Demo", "artist": "Mapa de prueba", "version": "Normal", "badge": "DEMO"}
@@ -179,6 +180,8 @@ var tab := TAB_HOME          # pestaña de la barra inferior (0 Inicio, 1 Músic
 var music_tab := 0           # dentro de Música: 0 Todas, 1 Favoritas, 2 Listas
 var open_playlist := -1      # lista abierta (-1 = se ven todas las listas)
 var sort_mode := 0           # índice en SORT_MODES
+var diff_filter := ""        # con orden "Dificultades": solo canciones con alguna dificultad de esta categoría (Beginner...Master); "" = todas
+var sortdiff_tiers: Array = []   # categorías que existen en la biblioteca (índices de STAR_TIERS), calculadas al abrir el selector
 var playlists: Array = []    # [{"name": String, "refs": ["set_id|version", ...]}]
 var last_played: Dictionary = {}
 var overlay := ""            # ventana abierta: "sort", "addto" o "newlist"
@@ -1631,10 +1634,43 @@ func _apply_filter() -> void:
 			base = groups.filter(func(g): return favorites.has(g.id))
 		if not words.is_empty():
 			base = base.filter(func(g): return _group_matches(g, words))
+		if sort_mode == SORT_DIFFS and diff_filter != "":
+			var want := _tier_index(diff_filter)
+			if want < 0:
+				diff_filter = ""
+			else:
+				base = base.filter(func(g): return _group_has_tier(g, want))
 		view_groups = _sorted(base)
 	scroll_y = 0.0
 	scroll_vel = 0.0
 	_clamp_scroll()
+
+## Índice en STAR_TIERS de una categoría por su nombre (-1 si no existe).
+func _tier_index(tier_name: String) -> int:
+	for i in STAR_TIERS.size():
+		if String(STAR_TIERS[i].name) == tier_name:
+			return i
+	return -1
+
+## Categorías por estrellas (Beginner...Master) que tiene alguna dificultad de la biblioteca, de fácil a difícil.
+## Calcula (y guarda en caché) las estrellas que falten; por eso solo se llama al abrir el selector.
+func _library_tiers() -> Array:
+	var seen := {}
+	for g in groups:
+		for e in g.entries:
+			var st := _stars_of(e)
+			if st >= 0.0:
+				seen[_tier_of(st)] = true
+	var out: Array = seen.keys()
+	out.sort()
+	return out
+
+func _group_has_tier(g: Dictionary, tier: int) -> bool:
+	for e in g.entries:
+		var st := _stars_of(e)
+		if st >= 0.0 and _tier_of(st) == tier:
+			return true
+	return false
 
 func _sorted(base: Array) -> Array:
 	var out: Array = base.duplicate()
@@ -2545,6 +2581,12 @@ func _overlay_layout() -> Dictionary:
 		py = (viewport_size.y - h) / 2.0
 		for i in n_sort:
 			rows.append(Rect2(px + 30, py + 140 + i * 114.0, pw - 60, 100))
+	elif overlay == "sortdiff":
+		var n_opt := mini(sortdiff_tiers.size(), 7) + 1   # "Todas" + las categorías que hay
+		h = 160.0 + n_opt * 114.0 + 10.0
+		py = (viewport_size.y - h) / 2.0
+		for i in n_opt:
+			rows.append(Rect2(px + 30, py + 140 + i * 114.0, pw - 60, 100))
 	elif overlay == "diffs":
 		var gd := _group_of(String(current_song.get("set_id", "")))
 		var nd: int = gd.entries.size() if not gd.is_empty() else 0
@@ -2604,12 +2646,31 @@ func _draw_overlay(p := 1.0) -> void:
 		title = "Eliminar canciones"
 	elif overlay == "diffs":
 		title = "Elegir dificultad"
+	elif overlay == "sortdiff":
+		title = "Mostrar solo dificultad"
 	_text(title, Vector2(panel.position.x + 40, panel.position.y + 86), 44, ink)
 	if overlay == "sort":
 		for i in lay.rows.size():
 			var r: Rect2 = lay.rows[i]
 			_panel(r, accent if i == sort_mode else soft, 22)
 			_text(SORT_MODES[i], Vector2(r.position.x + 36, r.get_center().y + 13), 36, Color.WHITE if i == sort_mode else ink)
+	elif overlay == "sortdiff":
+		for i in lay.rows.size():
+			var ro: Rect2 = lay.rows[i]
+			var opt_label := "Todas"
+			var tx := ro.position.x + 36.0
+			if i > 0:
+				var tier: Dictionary = STAR_TIERS[int(sortdiff_tiers[i - 1])]
+				opt_label = String(tier.name)
+				var on_tier: bool = diff_filter == opt_label
+				_panel(ro, accent if on_tier else soft, 22)
+				draw_circle(Vector2(ro.position.x + 50, ro.get_center().y), 18.0, tier.color)
+				tx = ro.position.x + 90.0
+				_text(opt_label, Vector2(tx, ro.get_center().y + 13), 36, Color.WHITE if on_tier else ink)
+				continue
+			var on: bool = diff_filter == ""
+			_panel(ro, accent if on else soft, 22)
+			_text(T(opt_label), Vector2(tx, ro.get_center().y + 13), 36, Color.WHITE if on else ink)
 	elif overlay == "diffs":
 		var gd2 := _group_of(String(current_song.get("set_id", "")))
 		for i in lay.rows.size():
@@ -2676,7 +2737,22 @@ func _overlay_tap(pos: Vector2) -> void:
 	if overlay == "sort":
 		for i in lay.rows.size():
 			if lay.rows[i].has_point(pos):
+				if i == SORT_DIFFS:
+					sortdiff_tiers = _library_tiers()
+					overlay = "sortdiff"   # elegir qué categoría mostrar
+					return
 				sort_mode = i
+				_save_settings()
+				_apply_filter()
+				overlay = ""
+				return
+		if not panel.has_point(pos):
+			overlay = ""
+	elif overlay == "sortdiff":
+		for i in lay.rows.size():
+			if lay.rows[i].has_point(pos):
+				sort_mode = SORT_DIFFS
+				diff_filter = "" if i == 0 else String(STAR_TIERS[int(sortdiff_tiers[i - 1])].name)
 				_save_settings()
 				_apply_filter()
 				overlay = ""
@@ -3052,10 +3128,9 @@ func _draw_files() -> void:
 	_text(_fit(T("Guarda un .osz de cada canción en \"Importadas\" (%d en la biblioteca).") % n_songs, cw - 80, 24), Vector2(x + 40, 1135), 24, muted)
 	_text(_fit("Así no las pierdes si desinstalas la app.", cw - 80, 24), Vector2(x + 40, 1175), 24, muted)
 	_button(Rect2(x + 40, 1200, cw - 80, 100), "Exportando..." if syncing else "Exportar canciones", accent)
-	_text(_fit(T("Récords, listas y favoritas se guardan en %s dentro de la carpeta.") % PROGRESS_FILE, cw, 22), Vector2(55, 1375), 22, muted)
-	_text(_fit("Los mapas importados antes de los fondos hay que importarlos otra vez.", cw, 22), Vector2(55, 1415), 22, muted)
+	_text(_fit("Los mapas importados antes de los fondos hay que importarlos otra vez.", cw, 22), Vector2(55, 1375), 22, muted)
 	if status_time > 0.0:
-		_text(_fit(status_text, cw, 26), Vector2(55, 1460), 26, _err() if status_error else _ok())
+		_text(_fit(status_text, cw, 26), Vector2(55, 1420), 26, _err() if status_error else _ok())
 	draw_set_transform(Vector2.ZERO)
 
 # --- Música ----------------------------------------------------------------------
@@ -3158,7 +3233,7 @@ func _draw_music() -> void:
 		_button(Rect2(195, 150, 205, 95), "Favoritas", pcol("fav") if music_tab == 1 else dark)
 		_button(Rect2(410, 150, 160, 95), "Listas", pcol("violet") if music_tab == 2 else dark)
 		if music_tab != 2:
-			_button(Rect2(viewport_size.x - 440, 150, 385, 95), T("Orden: %s") % T(SORT_MODES[sort_mode]), dark)
+			_button(Rect2(viewport_size.x - 440, 150, 385, 95), T("Orden: %s") % (diff_filter if sort_mode == SORT_DIFFS and diff_filter != "" else T(SORT_MODES[sort_mode])), dark)
 		elif open_playlist < 0:
 			_button(Rect2(viewport_size.x - 440, 150, 385, 95), "+ Nueva lista", pcol("accent"))
 		else:
@@ -3402,6 +3477,7 @@ func _load_settings() -> void:
 	audio_delay_ms = clampf(float(cfg.get_value("display", "audio_delay_ms", 0.0)), -600.0, 600.0)
 	_apply_volumes()
 	sort_mode = clampi(int(cfg.get_value("library", "sort", 0)), 0, SORT_MODES.size() - 1)
+	diff_filter = String(cfg.get_value("library", "diff_filter", ""))
 	show_bg = bool(cfg.get_value("display", "show_bg", true))
 	var saved_lang := String(cfg.get_value("display", "lang", lang))
 	if saved_lang == "es" or saved_lang == "en":
@@ -3535,6 +3611,7 @@ func _save_settings() -> void:
 	cfg.set_value("display", "audio_delay_ms", audio_delay_ms)
 	cfg.set_value("profile", "current", profile_id)
 	cfg.set_value("library", "sort", sort_mode)
+	cfg.set_value("library", "diff_filter", diff_filter)
 	cfg.set_value("display", "show_bg", show_bg)
 	cfg.set_value("display", "lang", lang)
 	cfg.set_value("library", "stars", star_cache)
